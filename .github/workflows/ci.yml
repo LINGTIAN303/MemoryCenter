@@ -179,6 +179,30 @@ jobs:
         run: cargo test -p hippocampus-server --all-targets --verbose
 
   # ============================================================================
+  # MCP 集成测试（MCP server 5 个 tools 全链路）
+  # ============================================================================
+  mcp-integration-test:
+    name: MCP Integration Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-mcp-test-cargo-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Run MCP integration tests
+        run: cargo test -p hippocampus-mcp --all-targets --verbose
+
+  # ============================================================================
   # Python 集成测试（PyO3 绑定全链路）
   # ============================================================================
   python-integration-test:

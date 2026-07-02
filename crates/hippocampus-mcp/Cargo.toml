@@ -1,0 +1,32 @@
+[package]
+name = "hippocampus-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hippocampus MCP server - Model Context Protocol 接口"
+
+[lib]
+name = "hippocampus_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hippocampus-mcp"
+path = "src/main.rs"
+
+[dependencies]
+hippocampus-core = { path = "../hippocampus-core" }
+rmcp = { workspace = true }
+tokio = { version = "1.0", features = ["full"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.0"
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio = { version = "1.0", features = ["rt", "macros", "time"] }

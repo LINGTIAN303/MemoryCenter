@@ -5,7 +5,43 @@
 ## [Unreleased]
 
 ### 计划中
-- v2.3：WASM 组件（待生态成熟）+ Node/Go/Java 绑定
+- v2.4：WASM 组件（待生态成熟）+ Node/Go/Java 绑定
+
+## [0.3.0] - 2026-07-03
+
+### v2.3 接口层扩展 + 差异化定位。新增 MCP server + 明确市场定位文档。
+
+### 新增
+
+#### v2.3 - MCP Server（Model Context Protocol 接口）
+- 新增 `hippocampus-mcp` crate（rmcp 1.8 + tokio，stdio 传输）
+- 5 个 MCP tools（供 Claude Code / Cursor / Trae / Codex CLI 调用）：
+  - `archive`：归档对话轮次为记忆文件，返回摘要（含 hook_id）
+  - `retrieve`：按 hook_id 检索完整记忆文件
+  - `summaries`：获取所有周期摘要列表
+  - `prompt`：渲染 system prompt 文本
+  - `compaction`：触发周期任务（period: "weekly"/"monthly"）
+- 每个 tool 内部创建 LocalStorage，无状态设计
+- 错误映射：Core Error → `McpError::invalid_params` / `McpError::internal_error`
+- stdio 传输入口（main.rs），通过环境变量 `HIPPOCAMPUS_ROOT` 配置存储根目录
+- 11 个 MCP 集成测试（archive/retrieve/summaries/prompt/compaction 全链路 + 会话隔离 + 完整工作流 + 错误处理）
+- CI 新增 `mcp-integration-test` job
+
+#### 差异化定位文档（动作 3）
+- 新增 `docs/POSITIONING.md`：竞品对比矩阵 + 蓝海象限图 + 四大护城河分析
+- 覆盖 12 个主流竞品全景对标（agentmemory/Zep/Letta/Mem0 等）
+- 三个直接竞品深度对比（agentmemory ~23k stars / Zep-Graphiti / Letta-MemGPT）
+- 明确放弃方向：不做 RAG 向量库、不做角色记忆、不做知识图谱
+- README.md 首屏新增定位章节，突出"强时序+极简部署"蓝海象限
+
+### 变更
+- workspace `rust-version` 从 1.83 升至 1.85（rmcp 1.7+ 要求 edition 2024）
+- workspace 新增依赖：`rmcp = { version = "1.7", features = ["schemars", "transport-io"] }`
+- workspace members 新增 `crates/hippocampus-mcp`
+
+### 测试
+- 总计 120 测试全部通过（51 单元 + 6 集成 + 17 FFI + 14 HTTP + 1 server 单元 + 11 MCP + 20 Python）
+- clippy 0 警告
 
 ## [0.2.0] - 2026-07-03
 

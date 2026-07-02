@@ -9,12 +9,13 @@ members = [
     "crates/hippocampus-ffi",
     "crates/hippocampus-server",
     "crates/hippocampus-python",
+    "crates/hippocampus-mcp",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.85"  # rmcp 1.7 (edition 2024) 要求
 authors = ["lingtian303"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/LINGTIAN303/Hippocampus"
@@ -45,6 +46,8 @@ tower-http = { version = "0.7", features = ["trace", "cors", "compression-gzip"]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Python 绑定（v2.2 PyO3）
 pyo3 = { version = "0.29", features = ["extension-module"] }
+# MCP 协议（v2.3 rmcp）
+rmcp = { version = "1.7", features = ["schemars", "transport-io"] }
 
 [profile.release]
 opt-level = 3

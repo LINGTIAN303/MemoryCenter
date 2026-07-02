@@ -8,12 +8,13 @@
 ┌─────────────────────────────────────────────────────────────────┐
 │ Layer 3: Bindings                                               │
 │   ① Python 原生绑定 (v2.2 ✅, hippocampus-python, PyO3 0.29)   │
-│   ② Node/Go/Java (v2.3+, 待实现)                                │
+│   ② Node/Go/Java (v2.4+, 待实现)                                │
 ├─────────────────────────────────────────────────────────────────┤
 │ Layer 2: Interface                                              │
 │   ① C ABI 动态库 (MVP ✅, hippocampus-ffi)                     │
 │   ② Axum HTTP REST (v2.1 ✅, hippocampus-server)               │
-│   ③ WASM 组件 (v2.3, 待生态成熟)                               │
+│   ③ MCP Server (v2.3 ✅, hippocampus-mcp, rmcp 1.7+)           │
+│   ④ WASM 组件 (v2.4, 待生态成熟)                               │
 ├─────────────────────────────────────────────────────────────────┤
 │ Layer 1: Core (hippocampus-core, 纯 Rust)                       │
 │   ┌──────────┬──────────┬──────────┬──────────┬──────────┐    │
@@ -27,20 +28,20 @@
 ### 分层原则
 
 - **Layer 1 纯逻辑**：不依赖 IO（文件系统/网络/时钟），所有副作用通过 trait 注入
-- **Layer 2 接口层**：将 Core 的异步 Rust API 转换为各语言可调用的形式（C ABI / HTTP / WASM）
+- **Layer 2 接口层**：将 Core 的异步 Rust API 转换为各语言可调用的形式（C ABI / HTTP / MCP / WASM）
 - **Layer 3 绑定层**：提供各语言的原生 SDK（自动释放/类型安全/异常映射）
 
 ### 接口层对比
 
-| 维度 | C ABI (FFI) | HTTP REST (server) | Python 原生 (python) |
-|------|-------------|--------------------|-----------------------|
-| crate | hippocampus-ffi | hippocampus-server | hippocampus-python |
-| 调用方式 | C 函数 + JSON 字符串 | HTTP 端点 + JSON body | Python 方法 + dict |
-| 状态 | 有状态（handle） | 无状态（每请求独立） | 有状态（实例） |
-| 并发 | 单线程，调用方加锁 | 天然并发（tokio） | GIL 约束，单实例串行 |
-| Runtime | current_thread | rt-multi-thread | current_thread |
-| 错误处理 | HippocampusResult | {error:{code,message}} | PyValueError |
-| 适合场景 | C/C++/嵌入式 | 远程访问 / 多语言 | Python 应用 / 数据科学 |
+| 维度 | C ABI (FFI) | HTTP REST (server) | Python 原生 (python) | MCP Server (mcp) |
+|------|-------------|--------------------|-----------------------|------------------|
+| crate | hippocampus-ffi | hippocampus-server | hippocampus-python | hippocampus-mcp |
+| 调用方式 | C 函数 + JSON 字符串 | HTTP 端点 + JSON body | Python 方法 + dict | MCP tool + JSON 参数 |
+| 状态 | 有状态（handle） | 无状态（每请求独立） | 有状态（实例） | 无状态（每 tool 调用独立） |
+| 并发 | 单线程，调用方加锁 | 天然并发（tokio） | GIL 约束，单实例串行 | 单线程 stdio（rmcp） |
+| Runtime | current_thread | rt-multi-thread | current_thread | current_thread |
+| 错误处理 | HippocampusResult | {error:{code,message}} | PyValueError | McpError（invalid_params/internal_error） |
+| 适合场景 | C/C++/嵌入式 | 远程访问 / 多语言 | Python 应用 / 数据科学 | AI 编程客户端（Claude Code/Cursor/Trae） |
 
 ## 2. 模块职责
 
@@ -95,6 +96,18 @@
 | 5 个方法 | archive / retrieve / summaries / prompt / compaction |
 | `version()` / `operations()` | 模块级工具函数 |
 | JSON 中间转换 | Python dict ↔ Rust struct（通过 json.dumps/loads + serde） |
+
+### Layer 2: hippocampus-mcp（MCP Server）
+
+| 组件 | 职责 |
+|------|------|
+| `HippocampusMcp` 结构体 | 持有 storage_root（无状态，每次 tool 调用创建独立 LocalStorage） |
+| 5 个参数结构体 | `ArchiveParams` / `RetrieveParams` / `SummariesParams` / `PromptParams` / `CompactionParams`（derive `JsonSchema` 自动生成参数 schema） |
+| `#[tool_router]` 宏 | rmcp 自动注册 5 个 `#[tool]` 方法为 MCP tools |
+| 5 个 MCP tools | archive / retrieve / summaries / prompt / compaction |
+| `main.rs` | stdio 传输入口（被 Claude Code / Cursor 等客户端拉起子进程） |
+| 错误映射 | Core Error → `McpError::invalid_params` / `McpError::internal_error` |
+| 传输方式 | stdio（默认），未来可在 hippocampus-server 挂 StreamableHttpService |
 
 ## 3. 数据流
 
@@ -217,6 +230,14 @@ LLM 通过 tool 调用 retrieve_memory(hook_id)
 - **内部 tokio Runtime**：`current_thread`（与 FFI 一致）
 - **上下文管理器**：`with Hippocampus(...) as hp:` 自动释放资源
 - **建议**：多会话用多实例（每会话一个 Hippocampus 对象）
+
+### Layer 2 - MCP (mcp)
+
+- **无状态设计**：每次 tool 调用创建独立 LocalStorage，无共享状态
+- **stdio 传输**：rmcp 单线程 stdio 模型，被客户端（Claude Code/Cursor）作为子进程拉起
+- **内部 tokio Runtime**：`current_thread`（与 FFI/Python 一致，轻量）
+- **会话隔离**：通过 tool 参数 `session_id` / `project_id` 区分不同会话
+- **未来扩展**：可在 hippocampus-server 上挂 `StreamableHttpService` 支持 HTTP 传输
 
 ## 6. 数据格式
 
@@ -347,3 +368,15 @@ try:
 except ValueError as e:
     print(e)  # 检索失败: 未找到钩子 ID: nonexistent-id
 ```
+
+### Layer 2 - MCP (mcp)
+
+所有错误通过 `McpError`（rmcp `ErrorData`）返回，客户端可在 tool 调用响应中读取 `isError` 字段：
+
+| 错误来源 | McpError 类型 | code | 触发条件 |
+|---------|--------------|------|---------|
+| 参数解析失败 | `invalid_params` | -32602 | `turns_json` 不是合法 JSON / turns 为空 / period 不是 weekly/monthly |
+| Core 错误 | `internal_error` | -32603 | 归档/检索/周期任务失败 |
+| 序列化失败 | `internal_error` | -32603 | Core 返回的结果序列化为 JSON 失败 |
+
+错误消息格式：`{功能描述}失败: {Core Error 详情}`，例如：`归档失败: 索引错误: 未找到钩子 ID: xxx`。
