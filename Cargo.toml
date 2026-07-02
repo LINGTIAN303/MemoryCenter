@@ -1,0 +1,47 @@
+# Hippocampus - Agent 记忆库
+# Cargo workspace 根配置
+# 工作区成员：核心库 + C ABI 动态库（MVP）
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/hippocampus-core",
+    "crates/hippocampus-ffi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["lingtian303"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lingtian303/Hippocampus"
+description = "Agent 记忆库依赖库 - 持久化高效完整记忆法"
+keywords = ["agent", "memory", "llm", "ai", "context"]
+categories = ["data-structures", "filesystem", "api-bindings"]
+
+# 工作区共享依赖（统一版本管理）
+[workspace.dependencies]
+# 序列化（MVP 用 JSON，可调试优先）
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# 时间处理
+chrono = { version = "0.4", features = ["serde"] }
+# 唯一 ID
+uuid = { version = "1.0", features = ["v4", "serde"] }
+# 错误处理
+thiserror = "1.0"
+# 日志门面
+tracing = "0.1"
+# 异步 trait
+async-trait = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

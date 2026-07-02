@@ -1,0 +1,38 @@
+# Rust
+/target
+**/target
+Cargo.lock
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 构建产物
+*.dll
+*.so
+*.dylib
+*.lib
+*.exp
+
+# 测试覆盖率
+tarpaulin-report.html
+cobertura.xml
+coverage/
+
+# 环境变量
+.env
+.env.local
+
+# 临时文件
+*.tmp
+*.bak
+*~

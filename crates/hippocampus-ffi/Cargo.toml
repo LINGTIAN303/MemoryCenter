@@ -1,0 +1,26 @@
+# hippocampus-ffi
+# C ABI 动态库 crate - 将核心库暴露为 C 接口供跨语言调用
+
+[package]
+name = "hippocampus-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hippocampus C ABI 动态库 - 供 Python/Node/Go/Java 等通过 FFI 调用"
+
+[lib]
+# 同时支持动态库（cdylib）和静态库（rlib）
+crate-type = ["cdylib", "rlib", "staticlib"]
+name = "hippocampus"
+
+[dependencies]
+hippocampus-core = { path = "../hippocampus-core", version = "0.1.0" }
+
+[features]
+default = []
+
+# 可选：启用 C++ name mangling 友好
+cpp_compat = []
