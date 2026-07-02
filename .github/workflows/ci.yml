@@ -113,6 +113,48 @@ jobs:
         continue-on-error: true  # MVP 阶段不阻断
 
   # ============================================================================
+  # C 集成测试（实际编译 C 程序加载动态库验证 ABI）
+  # ============================================================================
+  c-integration-test:
+    name: C Integration Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-c-test-cargo-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Build Rust dynamic library
+        run: cargo build --release -p hippocampus-ffi
+
+      - name: Build & Run C demo
+        run: |
+          cd examples/c
+          gcc demo.c -o demo \
+            -I ../../crates/hippocampus-ffi/include \
+            -L ../../target/release \
+            -lhippocampus -lpthread -ldl
+          LD_LIBRARY_PATH=../../target/release ./demo
+
+      - name: Build & Run C integration test
+        run: |
+          cd examples/c
+          gcc test.c -o test \
+            -I ../../crates/hippocampus-ffi/include \
+            -L ../../target/release \
+            -lhippocampus -lpthread -ldl
+          LD_LIBRARY_PATH=../../target/release ./test
+
+  # ============================================================================
   # 文档构建
   # ============================================================================
   docs:

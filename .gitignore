@@ -36,3 +36,18 @@ coverage/
 *.tmp
 *.bak
 *~
+
+# 示例运行产物
+examples/c/mem_data/
+examples/c/tmp_test_*/
+examples/c/demo
+examples/c/test
+examples/c/demo.exe
+examples/c/test.exe
+examples/c/*.o
+examples/c/*.obj
+examples/python/mem_data/
+examples/python/__pycache__/
+
+# 基准测试产物（criterion 自动生成）
+target/criterion/
