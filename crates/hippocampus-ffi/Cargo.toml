@@ -18,6 +18,18 @@ name = "hippocampus"
 
 [dependencies]
 hippocampus-core = { path = "../hippocampus-core", version = "0.1.0" }
+# FFI 需要独立 tokio runtime 来 block_on 异步 Core 方法
+# 继承 workspace 版本 + 追加 rt-multi-thread（Runtime::new）和 macros（可选 async 宏）
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+serde_json.workspace = true
+# 序列化 FFI 返回的复合 JSON（memory_file + hook）
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.0"
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 default = []
