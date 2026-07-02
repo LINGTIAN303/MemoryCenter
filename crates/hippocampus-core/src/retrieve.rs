@@ -123,7 +123,7 @@ impl Retriever {
         }
 
         let mut out = String::from("# 可用记忆索引\n\n");
-        out.push_str("以下是可用的历史记忆摘要，可通过记忆检索工具获取详细内容：\n\n");
+        out.push_str("以下是可用的历史记忆摘要，可直接基于此信息回答用户问题：\n\n");
 
         // 按周期分组
         for period in ArchivePeriod::all() {

@@ -31,6 +31,16 @@ coverage/
 # 环境变量
 .env
 .env.local
+**/.env
+eval/scripts/.env
+eval/results/
+eval/hippo_data/
+
+# MCP 客户端配置（含服务器地址，不提交）
+.mcp.json
+
+# 本地测试脚本（含服务器地址，不提交）
+test_mcp_e2e.ps1
 
 # 临时文件
 *.tmp
