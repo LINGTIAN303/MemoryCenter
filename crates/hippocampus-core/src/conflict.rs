@@ -26,6 +26,7 @@
 //! 3. **立场反转（StanceReversal）**：added_facts 与历史 updates 的 added_facts 直接冲突
 
 use crate::model::{MemoryFile, MemoryUpdate};
+use crate::semantic::Embedder;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -192,7 +193,44 @@ impl ConflictDetector for NoopDetector {
 // HybridDetector（v2.11 串联检测器）
 // ============================================================================
 
-/// 混合冲突检测器（v2.11，v2.12 精确去重，v2.14 语义去重）
+/// 语义去重模式（v2.15 新增）
+///
+/// 控制 [`HybridDetector`] 在合并启发式 + LLM 报告时使用的相似度算法。
+///
+/// ## 模式对比
+///
+/// | 模式 | 算法 | 精度 | 性能 | 依赖 |
+/// |------|------|------|------|------|
+/// | [`DedupMode::Char`] | 字符集合 Jaccard（v2.14 默认） | 低 | 最快 | 无 |
+/// | [`DedupMode::Word`] | 多语言词级 Jaccard（中/拉丁/混合） | 中 | 快 | 无 |
+/// | [`DedupMode::Embedding`] | 嵌入余弦相似度 | 高 | 慢（网络） | `Embedder` |
+///
+/// ## 降级策略（v2.15）
+///
+/// `Embedding` 模式下，若未注入 `Embedder` 或嵌入失败，自动降级到 `Word` 模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupMode {
+    /// 字符集合 Jaccard（v2.14 默认行为，单字符集合，无顺序）
+    ///
+    /// 纯 std 实现，最快但精度最低（"不喜欢" vs "欢不喜" 相似度 = 1.0）。
+    Char,
+    /// 词级 Jaccard（多语言：中文 char_bigrams，拉丁 word_tokens，混合加权）
+    ///
+    /// 纯 std 实现，比 Char 精度更高（保留顺序信息），无外部依赖。
+    Word,
+    /// 嵌入余弦相似度（需注入 [`Embedder`]，失败降级到 [`DedupMode::Word`]）
+    ///
+    /// 精度最高（语义级），但需要网络调用 Embedder API。
+    Embedding,
+}
+
+impl Default for DedupMode {
+    fn default() -> Self {
+        Self::Char // 向后兼容 v2.14 行为
+    }
+}
+
+/// 混合冲突检测器（v2.11，v2.12 精确去重，v2.14 语义去重，v2.15 多模式去重）
 ///
 /// 串联两个检测器：先跑启发式（快速、无网络依赖），
 /// 再跑 LLM（语义级补充），合并两份报告。
@@ -203,30 +241,36 @@ impl ConflictDetector for NoopDetector {
 ///   启发式结果仍然保留
 /// - **去重（v2.12）**：基于 `(kind, new_fact)` 元组精确去重。启发式报告全部保留，
 ///   LLM 报告中与启发式 `(kind, new_fact)` 完全相同的冲突不重复加入
-/// - **语义去重（v2.14 新增）**：在精确去重基础上，增加字符 Jaccard 相似度比较。
+/// - **语义去重（v2.14）**：在精确去重基础上，增加字符 Jaccard 相似度比较。
 ///   当两个冲突的 `kind` 相同且 `new_fact` 相似度 >= `dedup_threshold` 时，视为重复。
 ///   默认阈值 0.7（中文短句经验值），可通过 [`with_dedup_threshold`] 配置
+/// - **多模式去重（v2.15 新增）**：[`DedupMode`] 枚举支持 Char/Word/Embedding 三种模式，
+///   可通过 [`with_dedup_mode`] 或 [`with_embedder`] 配置。默认 `Char` 向后兼容
 /// - **使用场景**：同时配置了启发式 + LLM 检测器时使用
 ///
 /// ## 语义去重示例
 ///
 /// - heuristic: `DirectContradict(new_fact="用户不喜欢咖啡")`
 /// - LLM: `DirectContradict(new_fact="用户不再喜欢咖啡了")`
-/// - 相似度 ≈ 0.78 > 0.7 → 视为重复，只保留 heuristic 的 1 条
+/// - `Char` 模式相似度 ≈ 0.78 > 0.7 → 视为重复，只保留 heuristic 的 1 条
 ///
 /// ## 示例
 ///
 /// ```rust,ignore
-/// use hippocampus_core::conflict::{ConflictDetector, HybridDetector};
+/// use hippocampus_core::conflict::{ConflictDetector, HybridDetector, DedupMode};
 /// use hippocampus_core::heuristic::HeuristicDetector;
 /// // use hippocampus_llm::HttpLlmDetector;
 ///
 /// let heuristic = std::sync::Arc::new(HeuristicDetector::new());
 /// let llm = std::sync::Arc::new(HttpLlmDetector::new(config));
-/// // 默认阈值 0.7
+/// // 默认 Char 模式 + 阈值 0.7（v2.14 行为）
 /// let hybrid = HybridDetector::new(heuristic, llm);
 /// // 自定义阈值
 /// let hybrid = HybridDetector::with_dedup_threshold(heuristic, llm, 0.8);
+/// // 词级 Jaccard 模式（v2.15）
+/// let hybrid = HybridDetector::with_dedup_mode(heuristic, llm, 0.8, DedupMode::Word);
+/// // 嵌入余弦模式（v2.15，需注入 Embedder）
+/// let hybrid = HybridDetector::with_embedder(heuristic, llm, 0.85, embedder);
 /// let report = hybrid.detect(&update, &memory).await;
 /// ```
 #[derive(Clone)]
@@ -242,10 +286,16 @@ pub struct HybridDetector {
     /// - `1.0`：严格要求完全相同（等价于精确匹配）
     /// - 默认 `0.7`：中文短句近义词替换场景经验值
     dedup_threshold: f64,
+    /// 语义去重模式（v2.15 新增，默认 `Char` 向后兼容）
+    dedup_mode: DedupMode,
+    /// 可选 Embedder（v2.15 新增，`Embedding` 模式必需，其他模式忽略）
+    embedder: Option<Arc<dyn Embedder>>,
 }
 
 impl HybridDetector {
-    /// 创建混合检测器（默认语义去重阈值 0.7）
+    /// 创建混合检测器（默认 Char 模式 + 语义去重阈值 0.7）
+    ///
+    /// 向后兼容 v2.14 行为。
     ///
     /// ## 参数
     ///
@@ -258,7 +308,9 @@ impl HybridDetector {
         Self::with_dedup_threshold(heuristic, llm, 0.7)
     }
 
-    /// 创建混合检测器（自定义语义去重阈值，v2.14 新增）
+    /// 创建混合检测器（自定义语义去重阈值，Char 模式，v2.14 新增）
+    ///
+    /// 向后兼容 v2.14 行为（`dedup_mode = Char`，`embedder = None`）。
     ///
     /// ## 参数
     ///
@@ -277,6 +329,65 @@ impl HybridDetector {
             heuristic,
             llm,
             dedup_threshold: dedup_threshold.clamp(0.0, 1.0),
+            dedup_mode: DedupMode::default(),
+            embedder: None,
+        }
+    }
+
+    /// 创建混合检测器（自定义去重模式 + 阈值，v2.15 新增）
+    ///
+    /// ## 参数
+    ///
+    /// - `heuristic`：启发式检测器
+    /// - `llm`：LLM 检测器
+    /// - `dedup_threshold`：语义去重阈值，自动 clamp 到 `[0.0, 1.0]`
+    /// - `dedup_mode`：去重模式（Char/Word/Embedding）
+    ///
+    /// ## 注意
+    ///
+    /// 若 `dedup_mode = Embedding` 但未通过 [`with_embedder`] 注入 Embedder，
+    /// 运行时自动降级到 `Word` 模式。
+    pub fn with_dedup_mode(
+        heuristic: Arc<dyn ConflictDetector>,
+        llm: Arc<dyn ConflictDetector>,
+        dedup_threshold: f64,
+        dedup_mode: DedupMode,
+    ) -> Self {
+        Self {
+            heuristic,
+            llm,
+            dedup_threshold: dedup_threshold.clamp(0.0, 1.0),
+            dedup_mode,
+            embedder: None,
+        }
+    }
+
+    /// 创建混合检测器（注入 Embedder，自动启用 Embedding 模式，v2.15 新增）
+    ///
+    /// ## 参数
+    ///
+    /// - `heuristic`：启发式检测器
+    /// - `llm`：LLM 检测器
+    /// - `dedup_threshold`：语义去重阈值，自动 clamp 到 `[0.0, 1.0]`
+    ///   - Embedding 模式推荐 `0.80 ~ 0.90`（嵌入向量相似度阈值通常高于字符 Jaccard）
+    /// - `embedder`：Embedder 实例（如 `HttpEmbedder`）
+    ///
+    /// ## 降级策略
+    ///
+    /// - Embedder 调用失败（网络/未配置）→ 降级到 `Word` 模式
+    /// - `Word` 模式失败不会发生（纯算法）
+    pub fn with_embedder(
+        heuristic: Arc<dyn ConflictDetector>,
+        llm: Arc<dyn ConflictDetector>,
+        dedup_threshold: f64,
+        embedder: Arc<dyn Embedder>,
+    ) -> Self {
+        Self {
+            heuristic,
+            llm,
+            dedup_threshold: dedup_threshold.clamp(0.0, 1.0),
+            dedup_mode: DedupMode::Embedding,
+            embedder: Some(embedder),
         }
     }
 
@@ -295,13 +406,27 @@ impl HybridDetector {
         self.dedup_threshold
     }
 
-    /// 判断 `conflict` 是否与 `existing` 列表中的某条冲突语义重复（v2.14 新增）
+    /// 语义去重模式（v2.15 新增）
+    pub fn dedup_mode(&self) -> DedupMode {
+        self.dedup_mode
+    }
+
+    /// Embedder 引用（v2.15 新增，未注入返回 None）
+    pub fn embedder(&self) -> Option<&Arc<dyn Embedder>> {
+        self.embedder.as_ref()
+    }
+
+    /// 判断 `conflict` 是否与 `existing` 列表中的某条冲突语义重复
+    /// （v2.14 新增，v2.15 多模式 + async 化）
     ///
     /// 判定规则：
     /// 1. `kind` 必须相同（不同 kind 不去重）
     /// 2. `new_fact` 精确匹配（v2.12 兼容，快速路径）
-    /// 3. `new_fact` 相似度 >= `dedup_threshold`（v2.14 语义去重，仅在阈值 > 0 时启用）
-    fn is_semantically_duplicate(
+    /// 3. `new_fact` 相似度 >= `dedup_threshold`（v2.14 语义去重，v2.15 多模式）
+    ///    - `Char`：字符集合 Jaccard
+    ///    - `Word`：多语言词级 Jaccard
+    ///    - `Embedding`：嵌入余弦，失败降级到 `Word`
+    async fn is_semantically_duplicate(
         &self,
         conflict: &ConflictRecord,
         existing: &[ConflictRecord],
@@ -317,7 +442,7 @@ impl HybridDetector {
             }
             // 3. 语义相似度比较（v2.14，仅在阈值 > 0 时启用）
             if self.dedup_threshold > 0.0 {
-                let sim = similarity(&conflict.new_fact, &existing_conflict.new_fact);
+                let sim = self.compute_similarity(&conflict.new_fact, &existing_conflict.new_fact).await;
                 if sim >= self.dedup_threshold {
                     return true;
                 }
@@ -325,9 +450,30 @@ impl HybridDetector {
         }
         false
     }
+
+    /// 根据当前 `dedup_mode` 计算相似度（v2.15 新增）
+    ///
+    /// 内部辅助方法，封装三种模式的分支与降级逻辑。
+    async fn compute_similarity(&self, a: &str, b: &str) -> f64 {
+        match self.dedup_mode {
+            DedupMode::Char => similarity_char(a, b),
+            DedupMode::Word => similarity_word(a, b),
+            DedupMode::Embedding => {
+                if let Some(embedder) = &self.embedder {
+                    match similarity_embedding(embedder, a, b).await {
+                        Some(sim) => sim,
+                        None => similarity_word(a, b), // 嵌入失败降级
+                    }
+                } else {
+                    // Embedding 模式但未注入 Embedder，降级到 Word
+                    similarity_word(a, b)
+                }
+            }
+        }
+    }
 }
 
-/// 计算两个字符串的字符 Jaccard 相似度（v2.14 新增）
+/// 计算两个字符串的字符 Jaccard 相似度（v2.14 新增，v2.15 重命名为 similarity_char）
 ///
 /// 基于字符集合的 Jaccard 系数：`|A ∩ B| / |A ∪ B|`，范围 `[0.0, 1.0]`。
 ///
@@ -340,7 +486,7 @@ impl HybridDetector {
 /// - 对中文短句效果可接受（字符级覆盖度高时判定为相似）
 /// - 局限：只看字符集合，不看顺序（"不喜欢" vs "欢不喜" 相似度 = 1.0）
 ///   但冲突去重场景下，顺序不同但字符相同的情况极少，影响可忽略
-fn similarity(a: &str, b: &str) -> f64 {
+fn similarity_char(a: &str, b: &str) -> f64 {
     // 空字符串无相似度（避免 0/0 未定义，且语义上空内容无可比较性）
     if a.is_empty() || b.is_empty() {
         return 0.0;
@@ -352,6 +498,148 @@ fn similarity(a: &str, b: &str) -> f64 {
     let set_b: std::collections::HashSet<char> = b.chars().collect();
     let intersection = set_a.intersection(&set_b).count();
     let union = set_a.union(&set_b).count();
+    if union == 0 {
+        return 0.0;
+    }
+    intersection as f64 / union as f64
+}
+
+/// 计算两个字符串的词级 Jaccard 相似度（v2.15 新增）
+///
+/// 多语言分支（参考 [`crate::heuristic`] 的 `detect_language` 逻辑）：
+///
+/// - **中文**（CJK 占比 ≥ 60%）：字符 bigram 集合 Jaccard，保留顺序信息
+///   - "用户不喜欢咖啡" → {"用户", "户不", "不喜", "喜欢", "欢咖", "咖啡"}
+/// - **拉丁**（CJK 占比 ≤ 40%）：词级集合 Jaccard，转小写
+///   - "I love coffee" → {"i", "love", "coffee"}
+/// - **混合**（40% < CJK < 60%）：按 CJK 比例加权
+///   - `avg_cjk * cn_sim + (1 - avg_cjk) * word_sim`
+///
+/// ## 与 [`similarity_char`] 的差异
+///
+/// | 维度 | similarity_char | similarity_word |
+/// |------|-----------------|-----------------|
+/// | 中文粒度 | 单字符集合 | 字符 bigram（保留顺序） |
+/// | 拉丁粒度 | 单字符集合 | 词级集合 |
+/// | 顺序敏感性 | 无 | 部分（bigram 保留局部顺序） |
+///
+/// ## 示例
+///
+/// - `similarity_word("不喜欢", "欢不喜")` ≈ 0.0（bigram 完全不同）
+/// - `similarity_char("不喜欢", "欢不喜")` = 1.0（字符集合相同）
+fn similarity_word(a: &str, b: &str) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    if a == b {
+        return 1.0;
+    }
+    let cjk_a = cjk_ratio(a);
+    let cjk_b = cjk_ratio(b);
+    let avg_cjk = (cjk_a + cjk_b) / 2.0;
+
+    if avg_cjk >= 0.6 {
+        // 中文：字符 bigram Jaccard
+        let bigrams_a = char_bigrams(a);
+        let bigrams_b = char_bigrams(b);
+        jaccard(&bigrams_a, &bigrams_b)
+    } else if avg_cjk <= 0.4 {
+        // 拉丁：词级 Jaccard
+        let words_a = word_tokens(a);
+        let words_b = word_tokens(b);
+        jaccard(&words_a, &words_b)
+    } else {
+        // 混合：按 CJK 比例动态加权
+        let cn_sim = jaccard(&char_bigrams(a), &char_bigrams(b));
+        let word_sim = jaccard(&word_tokens(a), &word_tokens(b));
+        avg_cjk * cn_sim + (1.0 - avg_cjk) * word_sim
+    }
+}
+
+/// 计算两个字符串的嵌入余弦相似度（v2.15 新增）
+///
+/// 调用 [`Embedder::embed_batch`] 批量嵌入两个文本，返回余弦相似度。
+///
+/// ## 返回
+///
+/// - `Some(f64)`：成功，返回 `[-1.0, 1.0]` 范围的相似度
+/// - `None`：失败（网络错误 / API 错误 / 向量维度不一致 / 数量不匹配）
+///
+/// ## 降级
+///
+/// 调用方应在 `None` 时降级到 [`similarity_word`]，避免阻塞去重流程。
+async fn similarity_embedding(
+    embedder: &Arc<dyn Embedder>,
+    a: &str,
+    b: &str,
+) -> Option<f64> {
+    let vecs = embedder.embed_batch(&[a, b]).await.ok()?;
+    if vecs.len() != 2 {
+        return None;
+    }
+    let sim = crate::vector::cosine_similarity(&vecs[0], &vecs[1]);
+    Some(sim as f64)
+}
+
+// ============================================================================
+// 词级相似度辅助函数（v2.15 新增，与 heuristic.rs 保持独立实现避免跨模块耦合）
+// ============================================================================
+
+/// 计算 CJK 字符占比（0.0 ~ 1.0）
+fn cjk_ratio(s: &str) -> f64 {
+    let total = s.chars().filter(|c| !c.is_whitespace()).count();
+    if total == 0 {
+        return 0.0;
+    }
+    let cjk = s
+        .chars()
+        .filter(|c| {
+            let code = *c as u32;
+            (0x4E00..=0x9FFF).contains(&code) || (0x3400..=0x4DBF).contains(&code)
+        })
+        .count();
+    cjk as f64 / total as f64
+}
+
+/// 生成字符 bigram 集合（中文场景使用，保留局部顺序）
+///
+/// 例如 "abc" → {"ab", "bc"}
+fn char_bigrams(s: &str) -> std::collections::HashSet<String> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() < 2 {
+        let mut set = std::collections::HashSet::new();
+        if !s.is_empty() {
+            set.insert(s.to_string());
+        }
+        return set;
+    }
+    (0..chars.len() - 1)
+        .map(|i| format!("{}{}", chars[i], chars[i + 1]))
+        .collect()
+}
+
+/// 拉丁字母词级分词（按空格 + 标点切分，转小写）
+///
+/// 例如 "I love coffee" → {"i", "love", "coffee"}
+fn word_tokens(s: &str) -> std::collections::HashSet<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+
+/// 计算两个 HashSet 的 Jaccard 相似度
+///
+/// `J(A, B) = |A ∩ B| / |A ∪ B|`
+fn jaccard<T: std::hash::Hash + Eq>(
+    a: &std::collections::HashSet<T>,
+    b: &std::collections::HashSet<T>,
+) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 0.0;
+    }
+    let intersection = a.intersection(b).count();
+    let union = a.union(b).count();
     if union == 0 {
         return 0.0;
     }
@@ -371,12 +659,13 @@ impl ConflictDetector for HybridDetector {
         // 2. 再跑 LLM（语义级补充，失败时返回空报告不阻塞）
         let llm_report = self.llm.detect(update, existing_memory).await;
 
-        // 3. 合并报告：语义去重（v2.12 精确匹配 + v2.14 相似度比较）
+        // 3. 合并报告：语义去重（v2.12 精确匹配 + v2.14 相似度 + v2.15 多模式）
         //    - 启发式报告全部保留
         //    - LLM 报告中与启发式冲突（kind 相同 + new_fact 精确匹配或相似度 >= 阈值）不重复加入
         //    - LLM 报告为空时（降级或无冲突）不影响启发式结果
+        //    - v2.15：is_semantically_duplicate 改为 async（Embedding 模式需 await）
         for conflict in llm_report.conflicts {
-            if !self.is_semantically_duplicate(&conflict, &report.conflicts) {
+            if !self.is_semantically_duplicate(&conflict, &report.conflicts).await {
                 report.push(conflict);
             }
         }
@@ -843,13 +1132,13 @@ mod tests {
     #[test]
     fn test_similarity_identical() {
         // 完全相同 → 1.0
-        assert_eq!(similarity("用户不喜欢咖啡", "用户不喜欢咖啡"), 1.0);
+        assert_eq!(similarity_char("用户不喜欢咖啡", "用户不喜欢咖啡"), 1.0);
     }
 
     #[test]
     fn test_similarity_completely_different() {
         // 完全不同（无共同字符）→ 0.0
-        assert_eq!(similarity("abc", "xyz"), 0.0);
+        assert_eq!(similarity_char("abc", "xyz"), 0.0);
     }
 
     #[test]
@@ -860,7 +1149,7 @@ mod tests {
         // intersection = {用,户,不,喜,欢,咖,啡} = 7
         // union = 9
         // jaccard = 7/9 ≈ 0.778
-        let sim = similarity("用户不喜欢咖啡", "用户不再喜欢咖啡了");
+        let sim = similarity_char("用户不喜欢咖啡", "用户不再喜欢咖啡了");
         assert!(
             sim > 0.77 && sim < 0.78,
             "相似度应在 0.778 附近，实际: {}",
@@ -870,8 +1159,8 @@ mod tests {
 
     #[test]
     fn test_similarity_empty_strings() {
-        assert_eq!(similarity("", ""), 0.0);
-        assert_eq!(similarity("", "abc"), 0.0);
+        assert_eq!(similarity_char("", ""), 0.0);
+        assert_eq!(similarity_char("", "abc"), 0.0);
     }
 
     #[test]
@@ -1087,5 +1376,289 @@ mod tests {
             "kind 不同时即使相似度高也不应去重，实际: {}",
             report.count()
         );
+    }
+
+    // ========================================================================
+    // v2.15 新增：多模式语义去重测试
+    // ========================================================================
+
+    #[test]
+    fn test_dedup_mode_default_is_char() {
+        // v2.15：DedupMode 默认值为 Char（向后兼容 v2.14）
+        assert_eq!(DedupMode::default(), DedupMode::Char);
+    }
+
+    #[test]
+    fn test_with_dedup_mode_sets_mode() {
+        // v2.15：with_dedup_mode 正确设置模式
+        let heuristic: Arc<dyn ConflictDetector> = Arc::new(NoopDetector::new());
+        let llm: Arc<dyn ConflictDetector> = Arc::new(NoopDetector::new());
+
+        let hybrid_word = HybridDetector::with_dedup_mode(heuristic.clone(), llm.clone(), 0.7, DedupMode::Word);
+        assert_eq!(hybrid_word.dedup_mode(), DedupMode::Word);
+        assert!(hybrid_word.embedder().is_none(), "Word 模式不应注入 Embedder");
+
+        let hybrid_emb = HybridDetector::with_dedup_mode(heuristic, llm, 0.85, DedupMode::Embedding);
+        assert_eq!(hybrid_emb.dedup_mode(), DedupMode::Embedding);
+        assert!(hybrid_emb.embedder().is_none(), "Embedding 模式未注入时 embedder 应为 None");
+    }
+
+    #[test]
+    fn test_with_embedder_sets_embedding_mode() {
+        // v2.15：with_embedder 自动启用 Embedding 模式
+        let heuristic: Arc<dyn ConflictDetector> = Arc::new(NoopDetector::new());
+        let llm: Arc<dyn ConflictDetector> = Arc::new(NoopDetector::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new_failing());
+
+        let hybrid = HybridDetector::with_embedder(heuristic, llm, 0.85, embedder);
+        assert_eq!(hybrid.dedup_mode(), DedupMode::Embedding);
+        assert!(hybrid.embedder().is_some(), "with_embedder 应注入 Embedder");
+    }
+
+    #[test]
+    fn test_similarity_word_chinese_bigram() {
+        // v2.15：中文词级相似度（char_bigrams Jaccard）
+        // "用户喜欢咖啡" → {用户, 户喜, 喜欢, 欢咖, 咖啡}
+        // "用户喜欢茶叶" → {用户, 户喜, 喜欢, 欢茶, 茶叶}
+        // intersection = {用户, 户喜, 喜欢} = 3
+        // union = 7
+        // jaccard = 3/7 ≈ 0.429
+        let sim = similarity_word("用户喜欢咖啡", "用户喜欢茶叶");
+        assert!(
+            sim > 0.42 && sim < 0.44,
+            "中文 bigram 相似度应在 0.429 附近，实际: {}",
+            sim
+        );
+    }
+
+    #[test]
+    fn test_similarity_word_latin_tokens() {
+        // v2.15：拉丁词级相似度（word_tokens Jaccard）
+        // "I love coffee" → {i, love, coffee}
+        // "I love tea" → {i, love, tea}
+        // intersection = {i, love} = 2
+        // union = 4
+        // jaccard = 0.5
+        let sim = similarity_word("I love coffee", "I love tea");
+        assert!(
+            sim > 0.49 && sim < 0.51,
+            "拉丁词级相似度应在 0.5 附近，实际: {}",
+            sim
+        );
+    }
+
+    #[test]
+    fn test_similarity_word_order_sensitive() {
+        // v2.15：词级相似度保留顺序信息（与 similarity_char 的关键差异）
+        // "不喜欢" → {不喜, 喜欢}
+        // "欢不喜" → {欢不, 不喜}
+        // intersection = {不喜} = 1
+        // union = 3
+        // jaccard = 1/3 ≈ 0.333
+        let sim_word = similarity_word("不喜欢", "欢不喜");
+        let sim_char = similarity_char("不喜欢", "欢不喜");
+        assert!(
+            sim_word < sim_char,
+            "Word 模式相似度 {} 应低于 Char 模式 {}（顺序不同应被识别）",
+            sim_word,
+            sim_char
+        );
+        assert_eq!(sim_char, 1.0, "Char 模式不区分顺序，字符集合相同应为 1.0");
+        assert!(
+            sim_word > 0.0 && sim_word < 0.5,
+            "Word 模式应识别顺序差异，相似度 {} 应在 (0, 0.5) 区间",
+            sim_word
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_detector_word_mode_dedup() {
+        // v2.15：Word 模式语义去重
+        // heuristic: DirectContradict("用户不喜欢咖啡")
+        // LLM: DirectContradict("用户不再喜欢咖啡了")
+        // Word 模式相似度（char_bigrams）：
+        //   "用户不喜欢咖啡" → {用户, 户不, 不喜, 喜欢, 欢咖, 咖啡} = 6
+        //   "用户不再喜欢咖啡了" → {用户, 户不, 不再, 再喜, 喜欢, 欢咖, 咖啡, 啡了} = 8
+        //   intersection = {用户, 户不, 不喜(无), 喜欢, 欢咖, 咖啡} = 5
+        //   union = 9
+        //   jaccard = 5/9 ≈ 0.556
+        // 阈值 0.4：0.556 > 0.4 → 去重
+        let heuristic: Arc<dyn ConflictDetector> =
+            Arc::new(crate::heuristic::HeuristicDetector::new());
+
+        let mut llm_report = ConflictReport::empty();
+        llm_report.push(ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "LLM 另一种表述".to_string(),
+            existing_fact: Some("用户喜欢咖啡".to_string()),
+            new_fact: "用户不再喜欢咖啡了".to_string(),
+        });
+        let llm: Arc<dyn ConflictDetector> = Arc::new(MockDetector::new(llm_report));
+
+        let hybrid = HybridDetector::with_dedup_mode(
+            heuristic,
+            llm,
+            0.4,
+            DedupMode::Word,
+        );
+
+        let (update, memory) = make_heuristic_contradiction_case();
+        let report = hybrid.detect(&update, &memory).await;
+
+        assert_eq!(
+            report.count(),
+            1,
+            "Word 模式阈值 0.4 时相似度 ≈ 0.556 > 0.4，应去重，实际: {}",
+            report.count()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_detector_embedding_mode_success() {
+        // v2.15：Embedding 模式成功场景
+        // MockEmbedder 返回高相似度向量 → 去重生效
+        let heuristic: Arc<dyn ConflictDetector> =
+            Arc::new(crate::heuristic::HeuristicDetector::new());
+
+        let mut llm_report = ConflictReport::empty();
+        llm_report.push(ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "LLM 语义级重复".to_string(),
+            existing_fact: Some("用户喜欢咖啡".to_string()),
+            new_fact: "用户不再喜欢咖啡了".to_string(),
+        });
+        let llm: Arc<dyn ConflictDetector> = Arc::new(MockDetector::new(llm_report));
+
+        // MockEmbedder 返回相同向量（cosine = 1.0）
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new_identical());
+        let hybrid = HybridDetector::with_embedder(heuristic, llm, 0.85, embedder);
+
+        let (update, memory) = make_heuristic_contradiction_case();
+        let report = hybrid.detect(&update, &memory).await;
+
+        assert_eq!(
+            report.count(),
+            1,
+            "Embedding 模式成功时 cosine=1.0 > 0.85，应去重，实际: {}",
+            report.count()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_detector_embedding_mode_fallback_on_failure() {
+        // v2.15：Embedding 模式降级场景
+        // MockEmbedder 失败 → 降级到 Word 模式
+        // 验证：降级后仍能用 Word 模式去重（相似度 0.556 > 阈值 0.4）
+        let heuristic: Arc<dyn ConflictDetector> =
+            Arc::new(crate::heuristic::HeuristicDetector::new());
+
+        let mut llm_report = ConflictReport::empty();
+        llm_report.push(ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "LLM 语义级重复".to_string(),
+            existing_fact: Some("用户喜欢咖啡".to_string()),
+            new_fact: "用户不再喜欢咖啡了".to_string(),
+        });
+        let llm: Arc<dyn ConflictDetector> = Arc::new(MockDetector::new(llm_report));
+
+        // MockEmbedder 失败 → 降级到 Word
+        let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new_failing());
+        let hybrid = HybridDetector::with_embedder(heuristic, llm, 0.4, embedder);
+
+        let (update, memory) = make_heuristic_contradiction_case();
+        let report = hybrid.detect(&update, &memory).await;
+
+        // 降级到 Word 后相似度 0.556 > 0.4 → 去重
+        assert_eq!(
+            report.count(),
+            1,
+            "Embedding 失败降级到 Word 后，相似度 0.556 > 0.4 应去重，实际: {}",
+            report.count()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_detector_embedding_mode_without_embedder_falls_back() {
+        // v2.15：Embedding 模式但未注入 Embedder → 降级到 Word
+        let heuristic: Arc<dyn ConflictDetector> =
+            Arc::new(crate::heuristic::HeuristicDetector::new());
+
+        let mut llm_report = ConflictReport::empty();
+        llm_report.push(ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "LLM 语义级重复".to_string(),
+            existing_fact: Some("用户喜欢咖啡".to_string()),
+            new_fact: "用户不再喜欢咖啡了".to_string(),
+        });
+        let llm: Arc<dyn ConflictDetector> = Arc::new(MockDetector::new(llm_report));
+
+        // with_dedup_mode 设 Embedding 但不注入 embedder
+        let hybrid = HybridDetector::with_dedup_mode(
+            heuristic,
+            llm,
+            0.4,
+            DedupMode::Embedding,
+        );
+
+        let (update, memory) = make_heuristic_contradiction_case();
+        let report = hybrid.detect(&update, &memory).await;
+
+        // 未注入 Embedder → 降级到 Word → 0.556 > 0.4 → 去重
+        assert_eq!(
+            report.count(),
+            1,
+            "Embedding 模式未注入 Embedder 应降级到 Word，相似度 0.556 > 0.4 应去重，实际: {}",
+            report.count()
+        );
+    }
+
+    /// Mock Embedder（v2.15 测试辅助）
+    ///
+    /// 两种模式：
+    /// - `Identical`：所有文本返回相同向量（cosine = 1.0）
+    /// - `Failing`：embed_batch 返回 Err（模拟网络/API 错误）
+    enum MockEmbedder {
+        Identical,
+        Failing,
+    }
+
+    impl MockEmbedder {
+        fn new_identical() -> Self {
+            Self::Identical
+        }
+        fn new_failing() -> Self {
+            Self::Failing
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for MockEmbedder {
+        fn dim(&self) -> usize {
+            3
+        }
+
+        async fn embed(&self, _text: &str) -> crate::Result<Vec<f32>> {
+            match self {
+                Self::Identical => Ok(vec![1.0, 0.0, 0.0]),
+                Self::Failing => Err(crate::Error::Storage("MockEmbedder 故意失败".into())),
+            }
+        }
+
+        async fn embed_batch(&self, texts: &[&str]) -> crate::Result<Vec<Vec<f32>>> {
+            match self {
+                Self::Identical => {
+                    let mut results = Vec::with_capacity(texts.len());
+                    for _ in 0..texts.len() {
+                        results.push(vec![1.0, 0.0, 0.0]);
+                    }
+                    Ok(results)
+                }
+                Self::Failing => Err(crate::Error::Storage("MockEmbedder batch 故意失败".into())),
+            }
+        }
     }
 }
