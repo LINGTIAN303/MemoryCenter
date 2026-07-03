@@ -38,9 +38,13 @@ pub mod archive;
 pub mod bm25;
 /// 缓存装饰器（CachedStorage<T>，moka LRU + TTL）
 pub mod cache;
+/// 记忆冲突检测（ConflictDetector trait + NoopDetector）
+pub mod conflict;
 pub mod compact;
 /// 混合检索器（HybridRetriever + RRF 融合 + 降级策略）
 pub mod hybrid;
+/// 启发式冲突检测器（HeuristicDetector，反义词词典 + 三维度检测）
+pub mod heuristic;
 /// 语义检索（Embedder / KeywordSearcher / VectorIndex / SemanticRetriever trait + RRF 融合）
 pub mod semantic;
 /// 序列化格式（JSON / MessagePack 双格式支持）

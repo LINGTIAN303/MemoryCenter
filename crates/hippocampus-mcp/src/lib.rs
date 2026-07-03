@@ -46,6 +46,7 @@ use std::sync::Arc;
 
 use hippocampus_core::archive::Archiver;
 use hippocampus_core::compact::Compactor;
+use hippocampus_core::conflict::ConflictDetector;
 use hippocampus_core::model::{ArchiveConfig, MessageTurn};
 use hippocampus_core::retrieve::{Retriever, SummaryView};
 use hippocampus_core::score::DefaultScorer;
@@ -179,6 +180,46 @@ struct BatchUpdateParams {
     /// 更新条目列表（JSON 字符串）
     #[schemars(description = "更新条目列表 JSON 字符串，每条含 hook_id/added_facts/revised_facts/deprecated_facts")]
     updates_json: String,
+    /// 项目 ID（可选）
+    #[schemars(description = "项目 ID（可选）")]
+    project_id: Option<String>,
+}
+
+/// detect_conflicts tool 参数（v2.6 批次 8）
+#[derive(Deserialize, schemars::JsonSchema)]
+struct DetectConflictsParams {
+    /// 会话 ID
+    #[schemars(description = "会话 ID")]
+    session_id: String,
+    /// 钩子 ID
+    #[schemars(description = "要检测的钩子 ID")]
+    hook_id: String,
+    /// 新增事实
+    #[schemars(default, description = "新增事实列表")]
+    #[serde(default)]
+    added_facts: Vec<String>,
+    /// 修正事实
+    #[schemars(default, description = "修正事实列表")]
+    #[serde(default)]
+    revised_facts: Vec<String>,
+    /// 废弃事实
+    #[schemars(default, description = "废弃事实列表")]
+    #[serde(default)]
+    deprecated_facts: Vec<String>,
+    /// 项目 ID（可选）
+    #[schemars(description = "项目 ID（可选）")]
+    project_id: Option<String>,
+}
+
+/// get_conflicts tool 参数（v2.6 批次 8）
+#[derive(Deserialize, schemars::JsonSchema)]
+struct GetConflictsParams {
+    /// 会话 ID
+    #[schemars(description = "会话 ID")]
+    session_id: String,
+    /// 钩子 ID
+    #[schemars(description = "要查询冲突的钩子 ID")]
+    hook_id: String,
     /// 项目 ID（可选）
     #[schemars(description = "项目 ID（可选）")]
     project_id: Option<String>,
@@ -569,6 +610,108 @@ impl HippocampusMcp {
             "total": items.len(),
             "success_count": items.iter().filter(|r| r["success"].as_bool().unwrap_or(false)).count(),
             "items": items,
+        });
+        Ok(result.to_string())
+    }
+
+    /// 检测单次记忆更新的冲突（不实际写入）。
+    ///
+    /// v2.6 批次 8：在 update 前预检测冲突，让 Agent 决策是否继续。
+    /// 返回 ConflictReport（含 conflicts 数组 + has_critical 标志）。
+    #[tool(description = "检测记忆更新的潜在冲突（不实际写入）。传入 added/revised/deprecated facts，返回检测到的冲突列表（自我矛盾/直接矛盾/立场反转）。Agent 可在 update 前调用此 tool 评估风险。")]
+    async fn detect_conflicts(
+        &self,
+        Parameters(params): Parameters<DetectConflictsParams>,
+    ) -> Result<String, McpError> {
+        let storage = self.create_storage();
+        let retriever = Retriever::new(
+            storage.clone(),
+            &params.session_id,
+            params.project_id.clone(),
+        );
+
+        // 通过 hook_id 找到 memory_id
+        let memory_id = retriever.find_memory_id_by_hook(&params.hook_id).await;
+        let memory_id = match memory_id {
+            Some(mid) => mid,
+            None => {
+                return Err(McpError::invalid_params(
+                    format!("未找到 hook_id: {}", params.hook_id),
+                    None,
+                ));
+            }
+        };
+
+        // 读取现有记忆
+        let existing = storage.read_memory(&memory_id).await.map_err(|e| {
+            McpError::internal_error(format!("读取记忆失败: {e}"), None)
+        })?;
+
+        // 构造 MemoryUpdate
+        let update = hippocampus_core::model::MemoryUpdate::new()
+            .add_fact(params.added_facts.join("\n"))
+            .revise_fact(params.revised_facts.join("\n"))
+            .deprecate_fact(params.deprecated_facts.join("\n"));
+
+        // 用 HeuristicDetector 检测
+        let detector = hippocampus_core::heuristic::HeuristicDetector::new();
+        let report = detector.detect(&update, &existing).await;
+
+        let result = serde_json::json!({
+            "total": report.count(),
+            "has_critical": report.has_critical(),
+            "conflicts": report.conflicts,
+        });
+        Ok(result.to_string())
+    }
+
+    /// 查询指定记忆的所有冲突记录（来自历史 updates）。
+    ///
+    /// v2.6 批次 8：返回持久化在 MemoryUpdateRecord.conflicts 中的所有冲突记录。
+    #[tool(description = "查询指定记忆文件的所有冲突历史记录。返回持久化的冲突列表（按 updates 时间顺序），含 total/critical_count/conflicts 字段。用于回溯 Agent 记忆演进过程中的矛盾点。")]
+    async fn get_conflicts(
+        &self,
+        Parameters(params): Parameters<GetConflictsParams>,
+    ) -> Result<String, McpError> {
+        let storage = self.create_storage();
+        let retriever = Retriever::new(
+            storage.clone(),
+            &params.session_id,
+            params.project_id.clone(),
+        );
+
+        // 通过 hook_id 找到 memory_id
+        let memory_id = retriever.find_memory_id_by_hook(&params.hook_id).await;
+        let memory_id = match memory_id {
+            Some(mid) => mid,
+            None => {
+                return Err(McpError::invalid_params(
+                    format!("未找到 hook_id: {}", params.hook_id),
+                    None,
+                ));
+            }
+        };
+
+        // 读取记忆并扁平化所有 conflicts
+        let memory = storage.read_memory(&memory_id).await.map_err(|e| {
+            McpError::internal_error(format!("读取记忆失败: {e}"), None)
+        })?;
+
+        let mut all_conflicts: Vec<hippocampus_core::conflict::ConflictRecord> = Vec::new();
+        for record in &memory.updates {
+            all_conflicts.extend(record.conflicts.iter().cloned());
+        }
+
+        let total = all_conflicts.len();
+        let critical_count = all_conflicts
+            .iter()
+            .filter(|c| c.severity == hippocampus_core::conflict::Severity::Critical)
+            .count();
+
+        let result = serde_json::json!({
+            "total": total,
+            "critical_count": critical_count,
+            "conflicts": all_conflicts,
         });
         Ok(result.to_string())
     }
@@ -974,5 +1117,152 @@ mod tests {
         let result = mcp.compaction(params).await.unwrap();
         let result: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(result["total_turns"], 6, "3 批次 × 2 turns = 6");
+    }
+
+    // ========================================================================
+    // v2.6 批次 8：冲突检测测试
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_detect_conflicts_direct_contradiction() {
+        // 归档后通过 batch_update 添加"喜欢咖啡"，再用 detect_conflicts 预检测"不喜欢咖啡" → 应检测到冲突
+        let tmp = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmp);
+
+        // 1. 归档
+        let params = Parameters(ArchiveParams {
+            session_id: "sess-cd".to_string(),
+            turns_json: make_turns_json("用户消息", "LLM 回复", 100),
+            project_id: None,
+        });
+        let result = mcp.archive(params).await.unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        let hook_id = result["hook_id"].as_str().unwrap().to_string();
+
+        // 2. 通过 batch_update 添加"用户喜欢咖啡"作为历史事实
+        let updates_json = serde_json::json!([{
+            "hook_id": hook_id,
+            "added_facts": ["用户喜欢咖啡"],
+            "revised_facts": [],
+            "deprecated_facts": [],
+        }])
+        .to_string();
+        let params = Parameters(BatchUpdateParams {
+            session_id: "sess-cd".to_string(),
+            updates_json,
+            project_id: None,
+        });
+        mcp.batch_update(params).await.unwrap();
+
+        // 3. detect_conflicts 预检测"用户不喜欢咖啡"（与历史"喜欢咖啡"直接矛盾）
+        let detect_params = Parameters(DetectConflictsParams {
+            session_id: "sess-cd".to_string(),
+            hook_id: hook_id.clone(),
+            added_facts: vec!["用户不喜欢咖啡".to_string()],
+            revised_facts: vec![],
+            deprecated_facts: vec![],
+            project_id: None,
+        });
+        let result = mcp.detect_conflicts(detect_params).await.unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+
+        assert!(result["total"].as_u64().unwrap() >= 1, "应检测到至少 1 个冲突");
+        assert_eq!(result["has_critical"], true);
+
+        let conflicts = result["conflicts"].as_array().unwrap();
+        let has_direct = conflicts.iter().any(|c| c["kind"] == "direct_contradict");
+        assert!(has_direct, "应包含 direct_contradict");
+    }
+
+    #[tokio::test]
+    async fn test_detect_conflicts_clean_update() {
+        // 无冲突的更新应返回 total=0
+        let tmp = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmp);
+
+        let params = Parameters(ArchiveParams {
+            session_id: "sess-cd-clean".to_string(),
+            turns_json: make_turns_json("用户消息", "LLM 回复", 100),
+            project_id: None,
+        });
+        let result = mcp.archive(params).await.unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        let hook_id = result["hook_id"].as_str().unwrap().to_string();
+
+        let detect_params = Parameters(DetectConflictsParams {
+            session_id: "sess-cd-clean".to_string(),
+            hook_id,
+            added_facts: vec!["用户住在上海".to_string()],
+            revised_facts: vec![],
+            deprecated_facts: vec![],
+            project_id: None,
+        });
+        let result = mcp.detect_conflicts(detect_params).await.unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(result["total"], 0);
+        assert_eq!(result["has_critical"], false);
+    }
+
+    #[tokio::test]
+    async fn test_detect_conflicts_nonexistent_hook_fails() {
+        let tmp = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmp);
+
+        let detect_params = Parameters(DetectConflictsParams {
+            session_id: "sess-x".to_string(),
+            hook_id: "nonexistent-hook-id".to_string(),
+            added_facts: vec!["测试".to_string()],
+            revised_facts: vec![],
+            deprecated_facts: vec![],
+            project_id: None,
+        });
+        let result = mcp.detect_conflicts(detect_params).await;
+        assert!(result.is_err(), "不存在的 hook_id 应返回错误");
+    }
+
+    #[tokio::test]
+    async fn test_get_conflicts_returns_persisted_records() {
+        // 验证 get_conflicts 在无冲突记忆上返回空列表
+        // 注意：MCP 的 batch_update 不集成 conflict_detector（只在 HTTP 层集成），
+        // 所以持久化冲突记录的验证在 HTTP 集成测试中完成。
+        let tmp = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmp);
+
+        let params = Parameters(ArchiveParams {
+            session_id: "sess-gc".to_string(),
+            turns_json: make_turns_json("用户消息", "LLM 回复", 100),
+            project_id: None,
+        });
+        let result = mcp.archive(params).await.unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        let hook_id = result["hook_id"].as_str().unwrap().to_string();
+
+        // 直接 get_conflicts（无 update → 无冲突）
+        let get_params = Parameters(GetConflictsParams {
+            session_id: "sess-gc".to_string(),
+            hook_id,
+            project_id: None,
+        });
+        let result = mcp.get_conflicts(get_params).await.unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(result["total"], 0);
+        assert_eq!(result["critical_count"], 0);
+        assert!(result["conflicts"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_conflicts_nonexistent_hook_fails() {
+        let tmp = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmp);
+
+        let get_params = Parameters(GetConflictsParams {
+            session_id: "sess-x".to_string(),
+            hook_id: "nonexistent".to_string(),
+            project_id: None,
+        });
+        let result = mcp.get_conflicts(get_params).await;
+        assert!(result.is_err(), "不存在的 hook_id 应返回错误");
     }
 }

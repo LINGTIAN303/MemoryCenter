@@ -177,6 +177,35 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// 更新记忆文件并携带冲突记录（v2.6 批次 8）
+    ///
+    /// 与 [`Storage::update_memory`] 相同，但额外接受 `conflicts` 参数，
+    /// 将冲突记录随 [`crate::model::MemoryUpdateRecord`] 一起持久化。
+    ///
+    /// ## 默认实现
+    ///
+    /// 忽略 `conflicts`，直接调用 [`Storage::update_memory`]。
+    /// 后端可覆写为完整实现以持久化冲突记录。
+    ///
+    /// ## 调用方
+    ///
+    /// 通常由 HTTP/MCP 层在调用 [`crate::conflict::ConflictDetector::detect`] 后调用：
+    ///
+    /// ```text,ignore
+    /// let memory = storage.read_memory(&memory_id).await?;
+    /// let report = detector.detect(&update, &memory).await;
+    /// storage.update_memory_with_conflicts(&memory_id, update, report.conflicts).await?;
+    /// ```
+    async fn update_memory_with_conflicts(
+        &self,
+        memory_id: &str,
+        updates: crate::model::MemoryUpdate,
+        _conflicts: Vec<crate::conflict::ConflictRecord>,
+    ) -> crate::Result<()> {
+        // 默认实现：忽略 conflicts，降级为普通 update_memory
+        self.update_memory(memory_id, updates).await
+    }
+
     // ========================================================================
     // 批量操作（v2.5 批次 6 新增，带默认实现：循环调用单个方法）
     // ========================================================================
@@ -801,6 +830,16 @@ impl Storage for LocalStorage {
         memory_id: &str,
         updates: crate::model::MemoryUpdate,
     ) -> crate::Result<()> {
+        // 委托给 update_memory_with_conflicts（传空 conflicts，向后兼容）
+        self.update_memory_with_conflicts(memory_id, updates, vec![]).await
+    }
+
+    async fn update_memory_with_conflicts(
+        &self,
+        memory_id: &str,
+        updates: crate::model::MemoryUpdate,
+        conflicts: Vec<crate::conflict::ConflictRecord>,
+    ) -> crate::Result<()> {
         // 空更新直接返回（幂等）
         if updates.is_empty() {
             return Ok(());
@@ -816,10 +855,11 @@ impl Storage for LocalStorage {
         let mut file = self.read_memory(memory_id).await?;
 
         // v2.4 风险点修复：将 updates 追加到独立的 updates 字段
-        // 不再修改 first_turn.user_message.text，保持原始上下文完整
+        // v2.6 批次 8：同时持久化冲突记录
         file.updates.push(crate::model::MemoryUpdateRecord {
             updated_at: chrono::Utc::now(),
             update: updates.clone(),
+            conflicts,
         });
 
         // 序列化回写（保持原格式）
@@ -836,7 +876,7 @@ impl Storage for LocalStorage {
             revised = updates.revised_facts.len(),
             deprecated = updates.deprecated_facts.len(),
             total_updates = file.updates.len(),
-            "记忆迭代更新完成（独立字段存储）"
+            "记忆迭代更新完成（含冲突记录）"
         );
 
         Ok(())
@@ -1390,6 +1430,62 @@ mod tests {
         assert_eq!(restored.updates.len(), 2, "应有 2 条独立更新记录");
         assert_eq!(restored.updates[0].update.added_facts, vec!["事实 A"]);
         assert_eq!(restored.updates[1].update.added_facts, vec!["事实 B"]);
+    }
+
+    #[tokio::test]
+    async fn test_local_update_memory_with_conflicts_persisted() {
+        // v2.6 批次 8：验证 conflicts 字段被正确持久化
+        let tmp = TempDir::new().unwrap();
+        let storage = LocalStorage::new(tmp.path());
+
+        let file = make_test_memory(ArchivePeriod::Daily, "sess-conflict");
+        let memory_id = storage.write_memory(&file).await.unwrap();
+
+        // 构造带冲突记录的更新
+        let updates = crate::model::MemoryUpdate::new().add_fact("用户不喜欢咖啡");
+        let conflicts = vec![crate::conflict::ConflictRecord {
+            kind: crate::conflict::ConflictKind::DirectContradict,
+            severity: crate::conflict::Severity::Critical,
+            description: "与历史事实直接矛盾".to_string(),
+            existing_fact: Some("用户喜欢咖啡".to_string()),
+            new_fact: "用户不喜欢咖啡".to_string(),
+        }];
+
+        storage
+            .update_memory_with_conflicts(&memory_id, updates, conflicts)
+            .await
+            .unwrap();
+
+        // 验证 conflicts 被持久化
+        let restored = storage.read_memory(&memory_id).await.unwrap();
+        assert_eq!(restored.updates.len(), 1);
+        assert_eq!(restored.updates[0].conflicts.len(), 1);
+
+        let c = &restored.updates[0].conflicts[0];
+        assert_eq!(c.kind, crate::conflict::ConflictKind::DirectContradict);
+        assert_eq!(c.severity, crate::conflict::Severity::Critical);
+        assert_eq!(c.new_fact, "用户不喜欢咖啡");
+        assert_eq!(c.existing_fact.as_deref(), Some("用户喜欢咖啡"));
+    }
+
+    #[tokio::test]
+    async fn test_local_update_memory_empty_conflicts_backward_compat() {
+        // v2.6 批次 8：空 conflicts 向后兼容（与旧 update_memory 行为一致）
+        let tmp = TempDir::new().unwrap();
+        let storage = LocalStorage::new(tmp.path());
+
+        let file = make_test_memory(ArchivePeriod::Daily, "sess-empty-c");
+        let memory_id = storage.write_memory(&file).await.unwrap();
+
+        let updates = crate::model::MemoryUpdate::new().add_fact("普通事实");
+        storage
+            .update_memory_with_conflicts(&memory_id, updates, vec![])
+            .await
+            .unwrap();
+
+        let restored = storage.read_memory(&memory_id).await.unwrap();
+        assert_eq!(restored.updates.len(), 1);
+        assert!(restored.updates[0].conflicts.is_empty(), "空 conflicts 应正确持久化");
     }
 
     // ========================================================================

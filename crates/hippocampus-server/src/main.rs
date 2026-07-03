@@ -109,10 +109,16 @@ async fn main() {
     // v2.5 批次 7：构造语义检索组件（SearchIndexer + retriever）
     let (search_indexer, retriever) = build_search_components();
 
+    // v2.6 批次 8：构造冲突检测器（默认 HeuristicDetector）
+    let conflict_detector: Option<std::sync::Arc<dyn hippocampus_core::conflict::ConflictDetector>> =
+        Some(std::sync::Arc::new(hippocampus_core::heuristic::HeuristicDetector::new()));
+    tracing::info!("冲突检测器已启用（HeuristicDetector，三维度检测）");
+
     let state = AppState {
         storage_root: config.storage_root.clone(),
         retriever,
         search_indexer,
+        conflict_detector,
     };
 
     let app = create_router(state).layer(TraceLayer::new_for_http());
@@ -127,6 +133,7 @@ async fn main() {
     tracing::info!("  GET    /api/v1/sessions/{{sid}}/prompt");
     tracing::info!("  POST   /api/v1/sessions/{{sid}}/compaction");
     tracing::info!("  POST   /api/v1/sessions/{{sid}}/search");
+    tracing::info!("  GET    /api/v1/sessions/{{sid}}/memories/{{hook_id}}/conflicts");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

@@ -316,6 +316,11 @@ impl MemoryUpdate {
 ///
 /// 设计目的：将迭代更新历史独立存储，不污染原始 `turns` 内容。
 /// 多次 PATCH 同一 memory 时，updates 追加新记录，便于追溯演进过程。
+///
+/// ## v2.6 批次 8：冲突检测
+///
+/// 新增 `conflicts` 字段记录本次更新时检测到的冲突（[`crate::conflict::ConflictRecord`]）。
+/// 通过 `#[serde(default)]` 确保旧文件（无此字段）能正常反序列化为空 Vec。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryUpdateRecord {
     /// 更新时间戳
@@ -323,6 +328,12 @@ pub struct MemoryUpdateRecord {
     /// 更新内容（added/revised/deprecated facts）
     #[serde(flatten)]
     pub update: MemoryUpdate,
+    /// 本次更新检测到的冲突记录（v2.6 批次 8）
+    ///
+    /// 由 [`crate::conflict::ConflictDetector`] 在 update 前同步检测生成，
+    /// 随更新记录一起持久化。旧文件无此字段时默认为空（向后兼容）。
+    #[serde(default)]
+    pub conflicts: Vec<crate::conflict::ConflictRecord>,
 }
 
 /// 索引文档（钩子集合）

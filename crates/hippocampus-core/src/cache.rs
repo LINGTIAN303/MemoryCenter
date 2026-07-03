@@ -366,7 +366,19 @@ impl<T: Storage> Storage for CachedStorage<T> {
         memory_id: &str,
         updates: MemoryUpdate,
     ) -> crate::Result<()> {
-        self.inner.update_memory(memory_id, updates).await?;
+        // 委托给 update_memory_with_conflicts（传空 conflicts）
+        self.update_memory_with_conflicts(memory_id, updates, vec![]).await
+    }
+
+    async fn update_memory_with_conflicts(
+        &self,
+        memory_id: &str,
+        updates: MemoryUpdate,
+        conflicts: Vec<crate::conflict::ConflictRecord>,
+    ) -> crate::Result<()> {
+        self.inner
+            .update_memory_with_conflicts(memory_id, updates, conflicts)
+            .await?;
         // 失效缓存（下次读取时从底层重新加载，确保看到 updates 字段的变化）
         self.memory_cache
             .invalidate(&CacheKey::memory(memory_id))

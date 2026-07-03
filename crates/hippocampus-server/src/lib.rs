@@ -73,6 +73,12 @@ pub struct AppState {
     /// 与 `retriever` 共享同一组 `Arc<dyn KeywordSearcher>` 和 `Arc<dyn VectorIndex>`，
     /// 确保归档后索引的数据能被检索器立即访问。
     pub search_indexer: Option<std::sync::Arc<SearchIndexer>>,
+    /// 可选的冲突检测器（未配置时 update_memory 不做冲突检测）
+    ///
+    /// v2.6 批次 8：在 PATCH /memories/{hook_id} 时同步检测冲突，
+    /// 检测结果随 MemoryUpdateRecord 一起持久化。
+    pub conflict_detector:
+        Option<std::sync::Arc<dyn hippocampus_core::conflict::ConflictDetector>>,
 }
 
 impl Default for AppState {
@@ -81,6 +87,7 @@ impl Default for AppState {
             storage_root: PathBuf::from("./data"),
             retriever: None,
             search_indexer: None,
+            conflict_detector: None,
         }
     }
 }
@@ -128,6 +135,11 @@ pub fn create_router(state: AppState) -> axum::Router {
         .route(
             "/api/v1/sessions/{sid}/search",
             post(handlers::search),
+        )
+        // v2.6 批次 8：冲突查询端点（GET 单条记忆的所有冲突记录）
+        .route(
+            "/api/v1/sessions/{sid}/memories/{hook_id}/conflicts",
+            get(handlers::get_conflicts),
         )
         .with_state(state)
 }

@@ -252,6 +252,21 @@ pub struct UpdateMemoryResponse {
     pub added: usize,
     pub revised: usize,
     pub deprecated: usize,
+    /// 检测到的冲突数量（v2.6 批次 8）
+    pub conflicts: usize,
+    /// 是否存在 Critical 级别冲突（v2.6 批次 8）
+    pub has_critical: bool,
+}
+
+/// conflicts 查询响应体（v2.6 批次 8）
+#[derive(Serialize)]
+pub struct ConflictsResponse {
+    /// 冲突总数
+    pub total: usize,
+    /// Critical 级别冲突数
+    pub critical_count: usize,
+    /// 所有冲突记录（扁平化，按 updates 时间顺序）
+    pub conflicts: Vec<hippocampus_core::conflict::ConflictRecord>,
 }
 
 /// PATCH /api/v1/sessions/{sid}/memories/{hook_id}
@@ -293,8 +308,38 @@ pub async fn update_memory(
     let revised_count = req.revised_facts.len();
     let deprecated_count = req.deprecated_facts.len();
 
-    // 执行更新
-    storage.update_memory(&memory_id, updates).await?;
+    // v2.6 批次 8：update 前同步检测冲突
+    //
+    // 配置了 conflict_detector 时：读取现有记忆 → 检测 → 持久化冲突记录
+    // 未配置时：跳过检测，直接 update_memory（向后兼容）
+    let conflicts: Vec<hippocampus_core::conflict::ConflictRecord> =
+        if let Some(detector) = &state.conflict_detector {
+            let existing = storage.read_memory(&memory_id).await?;
+            let report = detector.detect(&updates, &existing).await;
+            let conflict_count = report.count();
+            let has_critical = report.has_critical();
+            tracing::info!(
+                session = %sid,
+                hook_id = %hook_id,
+                memory_id = %memory_id,
+                conflict_count = conflict_count,
+                has_critical = has_critical,
+                "冲突检测完成"
+            );
+            report.conflicts
+        } else {
+            Vec::new()
+        };
+
+    // 执行更新（携带冲突记录）
+    storage
+        .update_memory_with_conflicts(&memory_id, updates, conflicts.clone())
+        .await?;
+
+    let conflict_count = conflicts.len();
+    let has_critical = conflicts
+        .iter()
+        .any(|c| c.severity == hippocampus_core::conflict::Severity::Critical);
 
     tracing::info!(
         session = %sid,
@@ -303,7 +348,9 @@ pub async fn update_memory(
         added = added_count,
         revised = revised_count,
         deprecated = deprecated_count,
-        "记忆迭代更新成功"
+        conflict_count = conflict_count,
+        has_critical = has_critical,
+        "记忆迭代更新成功（含冲突检测）"
     );
 
     Ok(Json(UpdateMemoryResponse {
@@ -311,6 +358,63 @@ pub async fn update_memory(
         added: added_count,
         revised: revised_count,
         deprecated: deprecated_count,
+        conflicts: conflict_count,
+        has_critical,
+    }))
+}
+
+// ============================================================================
+// v2.6 批次 8：冲突查询端点
+// ============================================================================
+
+/// GET /api/v1/sessions/{sid}/memories/{hook_id}/conflicts
+///
+/// 获取指定记忆文件的所有冲突记录（来自历史 updates 的 conflicts 字段）。
+///
+/// 返回扁平化的冲突记录列表，按时间顺序（updates 的追加顺序）。
+pub async fn get_conflicts(
+    State(state): State<AppState>,
+    Path((sid, hook_id)): Path<(String, String)>,
+    Query(query): Query<ProjectQuery>,
+) -> Result<Json<ConflictsResponse>, AppError> {
+    let storage = create_storage(&state);
+    let retriever = Retriever::new(storage, &sid, query.project_id);
+
+    // 通过 hook_id 找到 memory_id
+    let memory_id = retriever
+        .find_memory_id_by_hook(&hook_id)
+        .await
+        .ok_or_else(|| AppError::NotFound(format!("未找到钩子 ID: {}", hook_id)))?;
+
+    // 读取记忆文件
+    let storage = create_storage(&state);
+    let memory = storage.read_memory(&memory_id).await?;
+
+    // 扁平化所有 updates 中的 conflicts
+    let mut all_conflicts: Vec<hippocampus_core::conflict::ConflictRecord> = Vec::new();
+    for record in &memory.updates {
+        all_conflicts.extend(record.conflicts.iter().cloned());
+    }
+
+    let total = all_conflicts.len();
+    let critical_count = all_conflicts
+        .iter()
+        .filter(|c| c.severity == hippocampus_core::conflict::Severity::Critical)
+        .count();
+
+    tracing::info!(
+        session = %sid,
+        hook_id = %hook_id,
+        memory_id = %memory_id,
+        total = total,
+        critical = critical_count,
+        "查询冲突记录成功"
+    );
+
+    Ok(Json(ConflictsResponse {
+        total,
+        critical_count,
+        conflicts: all_conflicts,
     }))
 }
 

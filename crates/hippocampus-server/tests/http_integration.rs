@@ -44,6 +44,17 @@ impl TestServer {
         search_indexer: Option<std::sync::Arc<hippocampus_server::SearchIndexer>>,
         retriever: Option<std::sync::Arc<dyn hippocampus_core::semantic::SemanticRetriever>>,
     ) -> Self {
+        Self::start_with_all(search_indexer, retriever, None).await
+    }
+
+    /// 启动带全部可选组件的测试服务（v2.6 批次 8）
+    async fn start_with_all(
+        search_indexer: Option<std::sync::Arc<hippocampus_server::SearchIndexer>>,
+        retriever: Option<std::sync::Arc<dyn hippocampus_core::semantic::SemanticRetriever>>,
+        conflict_detector: Option<
+            std::sync::Arc<dyn hippocampus_core::conflict::ConflictDetector>,
+        >,
+    ) -> Self {
         let tmpdir = TempDir::new().expect("创建临时目录失败");
         let storage_root: PathBuf = tmpdir.path().to_path_buf();
 
@@ -51,6 +62,7 @@ impl TestServer {
             storage_root,
             retriever,
             search_indexer,
+            conflict_detector,
         };
         let app = create_router(state);
 
@@ -67,6 +79,15 @@ impl TestServer {
             base_url,
             _tmpdir: tmpdir,
         }
+    }
+
+    /// 启动带冲突检测器的测试服务（v2.6 批次 8）
+    async fn start_with_detector(
+        conflict_detector: Option<
+            std::sync::Arc<dyn hippocampus_core::conflict::ConflictDetector>,
+        >,
+    ) -> Self {
+        Self::start_with_all(None, None, conflict_detector).await
     }
 
     /// 拼接完整 URL
@@ -1454,4 +1475,245 @@ async fn test_search_without_indexer_still_works() {
         .unwrap();
     assert!(!results.is_empty());
     assert_eq!(results[0]["hook_id"].as_str().unwrap(), "manual-hook");
+}
+
+// ============================================================================
+// v2.6 批次 8：冲突检测端到端测试
+// ============================================================================
+
+/// 辅助：归档一条记忆，返回 hook_id
+async fn archive_one(server: &TestServer, client: &reqwest::Client, sid: &str) -> String {
+    let body = json!({
+        "turns": make_turns_json(2, 100),
+        "project_id": null
+    });
+    let resp = client
+        .post(server.url(&format!("/api/v1/sessions/{}/archive", sid)))
+        .json(&body)
+        .send()
+        .await
+        .expect("归档失败");
+    let summary: Value = resp.json().await.expect("解析失败");
+    summary["hook_id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn test_update_without_detector_returns_zero_conflicts() {
+    // 未配置冲突检测器时，update 响应应返回 conflicts=0, has_critical=false
+    let server = TestServer::start().await;
+    let client = reqwest::Client::new();
+
+    let hook_id = archive_one(&server, &client, "sess-no-det").await;
+
+    let body = json!({
+        "added_facts": ["用户喜欢咖啡"],
+        "revised_facts": [],
+        "deprecated_facts": [],
+        "project_id": null,
+    });
+    let url = format!("/api/v1/sessions/sess-no-det/memories/{}", hook_id);
+    let resp = client
+        .patch(server.url(&url))
+        .json(&body)
+        .send()
+        .await
+        .expect("更新失败");
+
+    assert_eq!(resp.status(), 200);
+    let result: Value = resp.json().await.expect("解析失败");
+    assert_eq!(result["success"], true);
+    assert_eq!(result["conflicts"], 0);
+    assert_eq!(result["has_critical"], false);
+}
+
+#[tokio::test]
+async fn test_update_with_detector_detects_direct_contradiction() {
+    // 配置 HeuristicDetector，添加与历史事实矛盾的新事实 → 应检测到 DirectContradict
+    let detector: std::sync::Arc<dyn hippocampus_core::conflict::ConflictDetector> =
+        std::sync::Arc::new(hippocampus_core::heuristic::HeuristicDetector::new());
+    let server = TestServer::start_with_detector(Some(detector)).await;
+    let client = reqwest::Client::new();
+
+    let hook_id = archive_one(&server, &client, "sess-detect").await;
+
+    // 第一次 update：添加"用户喜欢咖啡"
+    let body = json!({
+        "added_facts": ["用户喜欢咖啡"],
+        "project_id": null,
+    });
+    let url = format!("/api/v1/sessions/sess-detect/memories/{}", hook_id);
+    client.patch(server.url(&url)).json(&body).send().await.unwrap();
+
+    // 第二次 update：添加"用户不喜欢咖啡" → 应检测到 DirectContradict
+    let body = json!({
+        "added_facts": ["用户不喜欢咖啡"],
+        "project_id": null,
+    });
+    let resp = client
+        .patch(server.url(&url))
+        .json(&body)
+        .send()
+        .await
+        .expect("更新失败");
+
+    assert_eq!(resp.status(), 200);
+    let result: Value = resp.json().await.expect("解析失败");
+    assert_eq!(result["success"], true);
+    assert!(result["conflicts"].as_u64().unwrap() >= 1, "应检测到至少 1 个冲突");
+    assert_eq!(result["has_critical"], true);
+}
+
+#[tokio::test]
+async fn test_update_with_detector_clean_update() {
+    // 无冲突的更新应返回 conflicts=0
+    let detector: std::sync::Arc<dyn hippocampus_core::conflict::ConflictDetector> =
+        std::sync::Arc::new(hippocampus_core::heuristic::HeuristicDetector::new());
+    let server = TestServer::start_with_detector(Some(detector)).await;
+    let client = reqwest::Client::new();
+
+    let hook_id = archive_one(&server, &client, "sess-clean").await;
+
+    let body = json!({
+        "added_facts": ["用户住在上海"],
+        "project_id": null,
+    });
+    let url = format!("/api/v1/sessions/sess-clean/memories/{}", hook_id);
+    let resp = client
+        .patch(server.url(&url))
+        .json(&body)
+        .send()
+        .await
+        .expect("更新失败");
+
+    assert_eq!(resp.status(), 200);
+    let result: Value = resp.json().await.expect("解析失败");
+    assert_eq!(result["conflicts"], 0);
+    assert_eq!(result["has_critical"], false);
+}
+
+#[tokio::test]
+async fn test_get_conflicts_returns_persisted_records() {
+    // 验证 GET /conflicts 端点能返回持久化的冲突记录
+    let detector: std::sync::Arc<dyn hippocampus_core::conflict::ConflictDetector> =
+        std::sync::Arc::new(hippocampus_core::heuristic::HeuristicDetector::new());
+    let server = TestServer::start_with_detector(Some(detector)).await;
+    let client = reqwest::Client::new();
+
+    let hook_id = archive_one(&server, &client, "sess-get-conf").await;
+
+    // 添加"用户喜欢咖啡"
+    let url = format!("/api/v1/sessions/sess-get-conf/memories/{}", hook_id);
+    client
+        .patch(server.url(&url))
+        .json(&json!({ "added_facts": ["用户喜欢咖啡"], "project_id": null }))
+        .send()
+        .await
+        .unwrap();
+
+    // 添加"用户不喜欢咖啡"（产生冲突）
+    client
+        .patch(server.url(&url))
+        .json(&json!({ "added_facts": ["用户不喜欢咖啡"], "project_id": null }))
+        .send()
+        .await
+        .unwrap();
+
+    // GET 查询冲突
+    let conflicts_url = format!(
+        "/api/v1/sessions/sess-get-conf/memories/{}/conflicts",
+        hook_id
+    );
+    let resp = client
+        .get(server.url(&conflicts_url))
+        .send()
+        .await
+        .expect("查询失败");
+
+    assert_eq!(resp.status(), 200);
+    let result: Value = resp.json().await.expect("解析失败");
+    assert!(result["total"].as_u64().unwrap() >= 1, "应有至少 1 个冲突");
+    assert!(result["critical_count"].as_u64().unwrap() >= 1, "应有至少 1 个 Critical");
+
+    let conflicts = result["conflicts"].as_array().unwrap();
+    let has_direct = conflicts
+        .iter()
+        .any(|c| c["kind"] == "direct_contradict");
+    assert!(has_direct, "应包含 direct_contradict 类型冲突");
+}
+
+#[tokio::test]
+async fn test_get_conflicts_nonexistent_hook_returns_404() {
+    let server = TestServer::start().await;
+    let client = reqwest::Client::new();
+
+    let fake_id = uuid::Uuid::new_v4().to_string();
+    let url = format!("/api/v1/sessions/sess-x/memories/{}/conflicts", fake_id);
+    let resp = client.get(server.url(&url)).send().await.expect("请求失败");
+
+    assert_eq!(resp.status(), 404);
+    let err: Value = resp.json().await.expect("解析失败");
+    assert_eq!(err["error"]["code"].as_str().unwrap(), "NOT_FOUND");
+}
+
+#[tokio::test]
+async fn test_get_conflicts_no_conflicts_returns_empty() {
+    // 无冲突的记忆，GET /conflicts 应返回 total=0
+    let server = TestServer::start().await;
+    let client = reqwest::Client::new();
+
+    let hook_id = archive_one(&server, &client, "sess-empty-conf").await;
+
+    // 添加无冲突的事实
+    let url = format!("/api/v1/sessions/sess-empty-conf/memories/{}", hook_id);
+    client
+        .patch(server.url(&url))
+        .json(&json!({ "added_facts": ["普通事实"], "project_id": null }))
+        .send()
+        .await
+        .unwrap();
+
+    let conflicts_url = format!(
+        "/api/v1/sessions/sess-empty-conf/memories/{}/conflicts",
+        hook_id
+    );
+    let resp = client
+        .get(server.url(&conflicts_url))
+        .send()
+        .await
+        .expect("查询失败");
+
+    assert_eq!(resp.status(), 200);
+    let result: Value = resp.json().await.expect("解析失败");
+    assert_eq!(result["total"], 0);
+    assert_eq!(result["critical_count"], 0);
+    assert!(result["conflicts"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_update_with_self_contradiction() {
+    // 同一批 update 中 added 和 deprecated 包含相同事实 → SelfContradict
+    let detector: std::sync::Arc<dyn hippocampus_core::conflict::ConflictDetector> =
+        std::sync::Arc::new(hippocampus_core::heuristic::HeuristicDetector::new());
+    let server = TestServer::start_with_detector(Some(detector)).await;
+    let client = reqwest::Client::new();
+
+    let hook_id = archive_one(&server, &client, "sess-self-c").await;
+
+    let body = json!({
+        "added_facts": ["用户喜欢咖啡"],
+        "deprecated_facts": ["用户喜欢咖啡"],
+        "project_id": null,
+    });
+    let url = format!("/api/v1/sessions/sess-self-c/memories/{}", hook_id);
+    let resp = client
+        .patch(server.url(&url))
+        .json(&body)
+        .send()
+        .await
+        .expect("更新失败");
+
+    assert_eq!(resp.status(), 200);
+    let result: Value = resp.json().await.expect("解析失败");
+    assert!(result["conflicts"].as_u64().unwrap() >= 1, "应检测到自我矛盾");
+    assert_eq!(result["has_critical"], true);
 }

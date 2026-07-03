@@ -635,6 +635,16 @@ impl Storage for SqliteStorage {
         memory_id: &str,
         updates: MemoryUpdate,
     ) -> crate::Result<()> {
+        // 委托给 update_memory_with_conflicts（传空 conflicts，向后兼容）
+        self.update_memory_with_conflicts(memory_id, updates, vec![]).await
+    }
+
+    async fn update_memory_with_conflicts(
+        &self,
+        memory_id: &str,
+        updates: MemoryUpdate,
+        conflicts: Vec<crate::conflict::ConflictRecord>,
+    ) -> crate::Result<()> {
         // 空更新直接返回（幂等）
         if updates.is_empty() {
             return Ok(());
@@ -648,6 +658,7 @@ impl Storage for SqliteStorage {
         let update_record = crate::model::MemoryUpdateRecord {
             updated_at: chrono::Utc::now(),
             update: updates,
+            conflicts,
         };
 
         // v2.4 并发修复：用 BEGIN IMMEDIATE 事务包装「读取-修改-写入」全流程
@@ -839,6 +850,7 @@ impl Storage for SqliteStorage {
                     let update_record = crate::model::MemoryUpdateRecord {
                         updated_at: chrono::Utc::now(),
                         update: upd.clone(),
+                        conflicts: vec![],
                     };
                     conn.execute_batch("BEGIN IMMEDIATE")
                         .map_err(|e| crate::Error::Storage(format!("BEGIN 失败: {}", e)))?;
