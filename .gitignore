@@ -71,3 +71,11 @@ __pycache__/
 .pytest_cache/
 target/wheels/
 *.egg-info/
+
+# Go（v2.15-b cgo 绑定）
+# mingw gendef/dlltool 生成的 import library 与 def 文件
+*.def
+*.dll.a
+# go test 临时产物
+crates/hippocampus-go/hippocampus.dll
+crates/hippocampus-go/hippocampus.lib
