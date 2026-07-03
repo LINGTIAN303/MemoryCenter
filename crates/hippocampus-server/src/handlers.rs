@@ -96,8 +96,12 @@ pub async fn archive(
     let (_, hook) = archiver.archive().await?;
     let summary = SummaryView::from(&hook);
 
-    // v2.5 批次 7：归档后触发搜索索引（关键词 + 向量）
-    if let Some(indexer) = &state.search_indexer {
+    // v2.8：归档后触发搜索索引（按 session 隔离）
+    // 优先使用 session_search（session 级隔离），降级到全局 search_indexer
+    #[allow(deprecated)]
+    if let Some(router) = &state.session_search {
+        router.index_hook(&sid, &hook).await;
+    } else if let Some(indexer) = &state.search_indexer {
         indexer.index_hook(&hook).await;
     }
 
@@ -804,18 +808,22 @@ pub async fn search(
 
     let top_k = req.top_k.unwrap_or(5);
 
-    // 检查是否配置了 SemanticRetriever
-    let retriever = match &state.retriever {
-        Some(r) => r.clone(),
-        None => {
-            return Err(AppError::NotImplemented(
-                "语义检索未配置：请通过环境变量配置 Embedder API 后重启服务".to_string(),
-            ));
-        }
+    // v2.8：优先使用 session_search（session 级隔离），降级到全局 retriever
+    #[allow(deprecated)]
+    let results = if let Some(router) = &state.session_search {
+        router.search(&sid, &query, top_k).await?
+    } else {
+        // 降级：全局 retriever（v2.5 旧行为，不区分 session）
+        let retriever = match &state.retriever {
+            Some(r) => r.clone(),
+            None => {
+                return Err(AppError::NotImplemented(
+                    "语义检索未配置：请通过环境变量配置 Embedder API 后重启服务".to_string(),
+                ));
+            }
+        };
+        retriever.search(&query, top_k).await?
     };
-
-    // 调用检索器
-    let results = retriever.search(&query, top_k).await?;
 
     // 推断检索模式
     let mode = if results.is_empty() {

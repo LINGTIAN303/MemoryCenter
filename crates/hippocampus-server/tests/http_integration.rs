@@ -48,6 +48,7 @@ impl TestServer {
     }
 
     /// 启动带全部可选组件的测试服务（v2.6 批次 8）
+    #[allow(deprecated)]
     async fn start_with_all(
         search_indexer: Option<std::sync::Arc<hippocampus_server::SearchIndexer>>,
         retriever: Option<std::sync::Arc<dyn hippocampus_core::semantic::SemanticRetriever>>,
@@ -62,11 +63,46 @@ impl TestServer {
             storage_root,
             retriever,
             search_indexer,
+            session_search: None,
             conflict_detector,
         };
         let app = create_router(state);
 
         // 绑定到随机端口，避免测试间冲突
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("绑定端口失败");
+        let addr = listener.local_addr().expect("获取地址失败");
+        let base_url = format!("http://{}", addr);
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("服务异常退出");
+        });
+
+        Self {
+            base_url,
+            _tmpdir: tmpdir,
+        }
+    }
+
+    /// 启动带 session_search 的测试服务（v2.8）
+    async fn start_with_session_search(
+        session_search: Option<std::sync::Arc<hippocampus_server::SessionSearchRouter>>,
+        conflict_detector: Option<
+            std::sync::Arc<dyn hippocampus_core::conflict::ConflictDetector>,
+        >,
+    ) -> Self {
+        let tmpdir = TempDir::new().expect("创建临时目录失败");
+        let storage_root: PathBuf = tmpdir.path().to_path_buf();
+
+        #[allow(deprecated)]
+        let state = AppState {
+            storage_root,
+            retriever: None,
+            search_indexer: None,
+            session_search,
+            conflict_detector,
+        };
+        let app = create_router(state);
+
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("绑定端口失败");
         let addr = listener.local_addr().expect("获取地址失败");
         let base_url = format!("http://{}", addr);
@@ -1716,4 +1752,166 @@ async fn test_update_with_self_contradiction() {
     let result: Value = resp.json().await.expect("解析失败");
     assert!(result["conflicts"].as_u64().unwrap() >= 1, "应检测到自我矛盾");
     assert_eq!(result["has_critical"], true);
+}
+
+// ============================================================================
+// v2.8 批次：Session 级索引隔离端到端测试
+// ============================================================================
+
+#[tokio::test]
+async fn test_session_search_isolation_e2e() {
+    // 核心端到端：不同 session 归档不同内容，/search 只返回本 session 结果
+    use hippocampus_server::SessionSearchRouter;
+    use std::sync::Arc;
+
+    // 启动带 SessionSearchRouter 的服务（降级模式：仅关键词）
+    let router = Arc::new(SessionSearchRouter::new(None, 0));
+    let server = TestServer::start_with_session_search(Some(router), None).await;
+    let client = reqwest::Client::new();
+
+    // session-A 归档含 "Rust" 的内容
+    let body_a = json!({
+        "turns": [{
+            "id": uuid::Uuid::new_v4().to_string(),
+            "user_message": {"text": "讲讲 Rust 编程", "attachments": [], "tool_calls": [], "thinking": null},
+            "llm_message": {"text": "Rust 是系统编程语言", "attachments": [], "tool_calls": [], "thinking": null},
+            "tags": [{"kind": "Text"}],
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "token_count": 100
+        }],
+        "project_id": null
+    });
+    let resp = client
+        .post(server.url("/api/v1/sessions/sess-a/archive"))
+        .json(&body_a)
+        .send()
+        .await
+        .expect("归档 A 失败");
+    assert_eq!(resp.status(), 200);
+
+    // session-B 归档含 "Python" 的内容
+    let body_b = json!({
+        "turns": [{
+            "id": uuid::Uuid::new_v4().to_string(),
+            "user_message": {"text": "讲讲 Python 编程", "attachments": [], "tool_calls": [], "thinking": null},
+            "llm_message": {"text": "Python 是脚本语言", "attachments": [], "tool_calls": [], "thinking": null},
+            "tags": [{"kind": "Text"}],
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "token_count": 100
+        }],
+        "project_id": null
+    });
+    let resp = client
+        .post(server.url("/api/v1/sessions/sess-b/archive"))
+        .json(&body_b)
+        .send()
+        .await
+        .expect("归档 B 失败");
+    assert_eq!(resp.status(), 200);
+
+    // session-A 搜索 "Rust" → 应有结果
+    let body = json!({ "query": "Rust", "top_k": 5 });
+    let resp = client
+        .post(server.url("/api/v1/sessions/sess-a/search"))
+        .json(&body)
+        .send()
+        .await
+        .expect("搜索 A 失败");
+    assert_eq!(resp.status(), 200);
+    let result: Value = resp.json().await.expect("解析失败");
+    let results_a = result["results"].as_array().unwrap();
+    assert!(!results_a.is_empty(), "sess-a 搜 Rust 应有结果");
+
+    // session-A 搜索 "Python" → 应无结果（隔离）
+    let body = json!({ "query": "Python", "top_k": 5 });
+    let resp = client
+        .post(server.url("/api/v1/sessions/sess-a/search"))
+        .json(&body)
+        .send()
+        .await
+        .expect("搜索 A Python 失败");
+    assert_eq!(resp.status(), 200);
+    let result: Value = resp.json().await.expect("解析失败");
+    let results_a_py = result["results"].as_array().unwrap();
+    assert!(
+        results_a_py.is_empty(),
+        "sess-a 搜 Python 应无结果（session 隔离）"
+    );
+
+    // session-B 搜索 "Python" → 应有结果
+    let body = json!({ "query": "Python", "top_k": 5 });
+    let resp = client
+        .post(server.url("/api/v1/sessions/sess-b/search"))
+        .json(&body)
+        .send()
+        .await
+        .expect("搜索 B 失败");
+    assert_eq!(resp.status(), 200);
+    let result: Value = resp.json().await.expect("解析失败");
+    let results_b = result["results"].as_array().unwrap();
+    assert!(!results_b.is_empty(), "sess-b 搜 Python 应有结果");
+}
+
+#[tokio::test]
+async fn test_session_search_no_router_returns_501() {
+    // 未配置 session_search 也未配置 retriever → /search 返回 501
+    let server = TestServer::start().await;
+    let client = reqwest::Client::new();
+
+    let body = json!({ "query": "test", "top_k": 5 });
+    let resp = client
+        .post(server.url("/api/v1/sessions/sess-x/search"))
+        .json(&body)
+        .send()
+        .await
+        .expect("请求失败");
+
+    assert_eq!(resp.status(), 501);
+}
+
+#[tokio::test]
+async fn test_session_search_multiple_hooks_same_session() {
+    // 同 session 归档多个 hook，搜索应返回多个结果
+    use hippocampus_server::SessionSearchRouter;
+    use std::sync::Arc;
+
+    let router = Arc::new(SessionSearchRouter::new(None, 0));
+    let server = TestServer::start_with_session_search(Some(router), None).await;
+    let client = reqwest::Client::new();
+
+    // 归档 3 个含 "文档" 的轮次
+    for i in 0..3 {
+        let body = json!({
+            "turns": [{
+                "id": uuid::Uuid::new_v4().to_string(),
+                "user_message": {"text": format!("文档 {}", i), "attachments": [], "tool_calls": [], "thinking": null},
+                "llm_message": {"text": format!("文档 {} 的内容", i), "attachments": [], "tool_calls": [], "thinking": null},
+                "tags": [{"kind": "Text"}],
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "token_count": 50
+            }],
+            "project_id": null
+        });
+        let resp = client
+            .post(server.url("/api/v1/sessions/sess-multi/archive"))
+            .json(&body)
+            .send()
+            .await
+            .expect("归档失败");
+        assert_eq!(resp.status(), 200);
+    }
+
+    // 搜索 "文档" → 应找到 3 个
+    let body = json!({ "query": "文档", "top_k": 10 });
+    let resp = client
+        .post(server.url("/api/v1/sessions/sess-multi/search"))
+        .json(&body)
+        .send()
+        .await
+        .expect("搜索失败");
+
+    assert_eq!(resp.status(), 200);
+    let result: Value = resp.json().await.expect("解析失败");
+    let results = result["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3, "应找到 3 个文档");
 }

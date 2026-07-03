@@ -23,6 +23,8 @@ serde_json.workspace = true
 # v2.4: HttpLlmScorer 需要 reqwest + async_trait
 reqwest = { version = "0.12", features = ["json"] }
 async-trait.workspace = true
+# v2.8: SessionSearchRouter 需要 dashmap 做 session 级索引隔离
+dashmap.workspace = true
 
 [dev-dependencies]
 tempfile = "3.0"

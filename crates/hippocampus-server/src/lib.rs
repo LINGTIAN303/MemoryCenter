@@ -27,11 +27,14 @@ mod handlers;
 pub mod llm;
 /// v2.5 批次 7: 搜索索引器（归档后自动索引到 BM25 + 向量索引）
 pub mod search;
+/// v2.8: Session 级索引隔离路由器
+pub mod session_search;
 
 pub use embedding::{EmbedderConfig, HttpEmbedder};
 pub use error::AppError;
 pub use llm::HttpLlmScorer;
 pub use search::SearchIndexer;
+pub use session_search::SessionSearchRouter;
 
 use std::path::PathBuf;
 
@@ -67,12 +70,22 @@ pub struct AppState {
     /// 存储根目录（每次请求创建 LocalStorage 时使用）
     pub storage_root: PathBuf,
     /// 可选的语义检索器（未配置时 /search 返回 501 Not Implemented）
+    ///
+    /// v2.5 批次 7：全局单例，所有 session 共享索引（已废弃，保留向后兼容）
+    /// v2.8：优先使用 `session_search`，未配置时降级到此字段
+    #[deprecated(note = "v2.8 起优先使用 session_search 字段实现 session 隔离")]
     pub retriever: Option<std::sync::Arc<dyn hippocampus_core::semantic::SemanticRetriever>>,
     /// 可选的搜索索引器（归档后自动索引到 BM25 + 向量索引）
     ///
-    /// 与 `retriever` 共享同一组 `Arc<dyn KeywordSearcher>` 和 `Arc<dyn VectorIndex>`，
-    /// 确保归档后索引的数据能被检索器立即访问。
+    /// v2.5 批次 7：全局单例（已废弃，保留向后兼容）
+    /// v2.8：优先使用 `session_search`，未配置时降级到此字段
+    #[deprecated(note = "v2.8 起优先使用 session_search 字段实现 session 隔离")]
     pub search_indexer: Option<std::sync::Arc<SearchIndexer>>,
+    /// v2.8：Session 级索引隔离路由器
+    ///
+    /// 按 session_id 路由到独立的子索引器，实现 session 间完全隔离。
+    /// 配置后优先使用此字段；未配置时降级到全局 `retriever` + `search_indexer`。
+    pub session_search: Option<std::sync::Arc<SessionSearchRouter>>,
     /// 可选的冲突检测器（未配置时 update_memory 不做冲突检测）
     ///
     /// v2.6 批次 8：在 PATCH /memories/{hook_id} 时同步检测冲突，
@@ -87,6 +100,7 @@ impl Default for AppState {
             storage_root: PathBuf::from("./data"),
             retriever: None,
             search_indexer: None,
+            session_search: None,
             conflict_detector: None,
         }
     }

@@ -20,38 +20,27 @@ use hippocampus_server::{create_router, AppState, Config};
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 
-/// 从环境变量读取 Embedder 配置并构造 SearchIndexer + retriever
+/// 从环境变量读取 Embedder 配置并构造 SessionSearchRouter
 ///
-/// 返回 (search_indexer, retriever)：
-/// - 配置完整：HybridRetriever（关键词 + 向量 + RRF 融合）
-/// - 未配置或失败：KeywordOnlyRetriever（仅关键词，降级模式）
-fn build_search_components() -> (
-    Option<Arc<hippocampus_server::SearchIndexer>>,
-    Option<Arc<dyn hippocampus_core::semantic::SemanticRetriever>>,
-) {
-    use hippocampus_core::bm25::Bm25Searcher;
-    use hippocampus_core::hybrid::{HybridRetriever, KeywordOnlyRetriever};
-    use hippocampus_core::semantic::{Embedder, KeywordSearcher, SemanticRetriever, VectorIndex};
-    use hippocampus_core::vector::InMemoryVectorIndex;
-    use hippocampus_server::{EmbedderConfig, HttpEmbedder, SearchIndexer};
-
-    // 关键词索引器（必填，降级模式也启用）
-    let keyword: Arc<dyn KeywordSearcher> = Arc::new(Bm25Searcher::new());
+/// v2.8：替代 v2.5 的全局单例 build_search_components
+///
+/// - 配置完整：每 session 独立 HybridRetriever（关键词 + 向量 + RRF 融合）
+/// - 未配置或失败：每 session 独立 KeywordOnlyRetriever（仅关键词，降级模式）
+fn build_session_search() -> Option<Arc<hippocampus_server::SessionSearchRouter>> {
+    use hippocampus_core::semantic::Embedder;
+    use hippocampus_server::{EmbedderConfig, HttpEmbedder, SessionSearchRouter};
 
     // 读取 Embedder 配置
     let api_url = std::env::var("HIPPOCAMPUS_EMBEDDER_API_URL").unwrap_or_default();
     let api_key = std::env::var("HIPPOCAMPUS_EMBEDDER_API_KEY").unwrap_or_default();
 
     if api_url.is_empty() || api_key.is_empty() {
-        // 降级模式：仅关键词检索
-        tracing::info!("未配置 Embedder API，降级为仅关键词检索（KeywordOnlyRetriever）");
-        let indexer = Arc::new(SearchIndexer::new(keyword.clone(), None, None));
-        let retriever: Arc<dyn SemanticRetriever> =
-            Arc::new(KeywordOnlyRetriever::new(keyword));
-        return (Some(indexer), Some(retriever));
+        // 降级模式：仅关键词检索（每 session 独立）
+        tracing::info!("未配置 Embedder API，降级为仅关键词检索（KeywordOnlyRetriever，session 级隔离）");
+        return Some(Arc::new(SessionSearchRouter::new(None, 0)));
     }
 
-    // 完整模式：构造 HttpEmbedder + InMemoryVectorIndex + HybridRetriever
+    // 完整模式：构造 HttpEmbedder + SessionSearchRouter
     let dim: usize = std::env::var("HIPPOCAMPUS_EMBEDDER_DIM")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -73,22 +62,11 @@ fn build_search_components() -> (
         api_url = %embedder_config.api_url,
         model = %embedder_config.model,
         dim = embedder_config.dim,
-        "Embedder 已配置，启用混合检索（HybridRetriever）"
+        "Embedder 已配置，启用 session 级混合检索（HybridRetriever）"
     );
 
     let embedder: Arc<dyn Embedder> = Arc::new(HttpEmbedder::new(embedder_config));
-    let vector_index: Arc<dyn VectorIndex> = Arc::new(InMemoryVectorIndex::new(dim));
-
-    let indexer = Arc::new(SearchIndexer::new(
-        keyword.clone(),
-        Some(embedder.clone()),
-        Some(vector_index.clone()),
-    ));
-
-    let retriever: Arc<dyn SemanticRetriever> =
-        Arc::new(HybridRetriever::new(keyword, embedder, vector_index));
-
-    (Some(indexer), Some(retriever))
+    Some(Arc::new(SessionSearchRouter::new(Some(embedder), dim)))
 }
 
 #[tokio::main]
@@ -106,8 +84,8 @@ async fn main() {
     // 确保存储目录存在
     std::fs::create_dir_all(&config.storage_root).expect("创建存储目录失败");
 
-    // v2.5 批次 7：构造语义检索组件（SearchIndexer + retriever）
-    let (search_indexer, retriever) = build_search_components();
+    // v2.8：构造 Session 级索引隔离路由器（替代 v2.5 全局单例）
+    let session_search = build_session_search();
 
     // v2.6 批次 8：构造冲突检测器（默认 HeuristicDetector）
     let conflict_detector: Option<std::sync::Arc<dyn hippocampus_core::conflict::ConflictDetector>> =
@@ -116,8 +94,9 @@ async fn main() {
 
     let state = AppState {
         storage_root: config.storage_root.clone(),
-        retriever,
-        search_indexer,
+        retriever: None,            // v2.8 起由 session_search 替代
+        search_indexer: None,       // v2.8 起由 session_search 替代
+        session_search,
         conflict_detector,
     };
 
