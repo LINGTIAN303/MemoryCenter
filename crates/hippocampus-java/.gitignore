@@ -1,0 +1,12 @@
+# Maven 构建产物
+target/
+
+# IDE
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+
+# 测试数据
+mem_data/
