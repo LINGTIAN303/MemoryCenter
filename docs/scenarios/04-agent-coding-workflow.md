@@ -797,13 +797,13 @@ tags=[Text, CodeBlock, URL, Plan, ToolCall, Thinking]
 
 ### 13.1 已记录的改进方向
 
-| 编号 | 改进点 | 当前行为 | 期望行为 | 优先级 |
-|------|-------|---------|---------|-------|
-| IMP-06 | Agent 主动判断 retrieve 时机 | LLM 识别关键词 | 提供「相关性预筛选」接口，减少 LLM 推理 | 中 |
-| IMP-07 | prompt 渲染按相关性排序 | 按时间排序 | 按当前会话主题相关性排序 | 中 |
-| IMP-08 | batch_retrieve 并发执行 | 串行循环 | tokio 并发 + 限流 | 高 |
-| IMP-09 | 冲突检测的语义级匹配 | 启发式 + LLM 可选 | 默认 LLM 语义检测 | 低 |
-| IMP-10 | 归档时 LLM 生成更丰富 summary | 从首个 user_message 提取 | LLM 生成 abstract + key_facts | 中 |
+| 编号 | 改进点 | 当前行为 | 期望行为 | 优先级 | 实现状态 |
+|------|-------|---------|---------|-------|---------|
+| IMP-06 | Agent 主动判断 retrieve 时机 | LLM 识别关键词 | 提供「相关性预筛选」接口，减少 LLM 推理 | 中 | ✅ v2.16 批次1（a92c5bd） |
+| IMP-07 | prompt 渲染按相关性排序 | 按时间排序 | 按当前会话主题相关性排序 | 中 | ✅ v2.16 批次1（a92c5bd） |
+| IMP-08 | batch_retrieve 并发执行 | 串行循环 | tokio 并发 + 限流 | 高 | ✅ v2.16 批次3（feb5f16） |
+| IMP-09 | 冲突检测的语义级匹配 | 启发式 + LLM 可选 | 默认 LLM 语义检测 | 低 | ✅ v2.14 已实现（环境变量注入，无新代码） |
+| IMP-10 | 归档时 LLM 生成更丰富 summary | 从首个 user_message 提取 | LLM 生成 abstract + key_facts | 中 | ✅ v2.16 批次2（49e63a4） |
 
 ### 13.2 风险点
 
