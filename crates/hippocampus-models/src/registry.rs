@@ -41,18 +41,23 @@ impl ModelRegistry {
     fn init() -> &'static HashMap<String, ModelVariant> {
         REGISTRY.get_or_init(|| {
             let mut map = HashMap::new();
-            // 2026 年 7 月最新主流型号
+            // 2026 年 7 月最新主流型号（已核查官方文档）
             let variants = vec![
+                // Claude 家族（5 个型号，覆盖 Opus/Sonnet/Fable/Mythos 级）
                 ("claude-opus-4.6", ModelVariant::claude_opus_4_6()),
-                ("claude-opus-4.5", ModelVariant::claude_opus_4_5()),
-                ("claude-sonnet-4.5", ModelVariant::claude_sonnet_4_5()),
+                ("claude-opus-4.8", ModelVariant::claude_opus_4_8()),
+                ("claude-sonnet-5", ModelVariant::claude_sonnet_5()),
+                ("claude-fable-5", ModelVariant::claude_fable_5()),
+                ("claude-mythos-5", ModelVariant::claude_mythos_5()),
+                // 其他家族
                 ("gpt-5.2", ModelVariant::gpt_5_2()),
                 ("gpt-5-codex", ModelVariant::gpt_5_codex()),
-                ("gemini-3-pro", ModelVariant::gemini_3_pro()),
-                ("deepseek-v3.2", ModelVariant::deepseek_v3_2()),
-                ("deepseek-r1", ModelVariant::deepseek_r1()),
-                ("qwen-3", ModelVariant::qwen_3()),
-                ("llama-4", ModelVariant::llama_4()),
+                ("gemini-3.1-pro", ModelVariant::gemini_3_1_pro()),
+                ("deepseek-v4-pro", ModelVariant::deepseek_v4_pro()),
+                ("deepseek-v4-flash", ModelVariant::deepseek_v4_flash()),
+                ("qwen-3-coder", ModelVariant::qwen_3_coder()),
+                ("llama-4-scout", ModelVariant::llama_4_scout()),
+                ("llama-4-maverick", ModelVariant::llama_4_maverick()),
                 ("grok-4.1", ModelVariant::grok_4_1()),
                 ("local-default", ModelVariant::local_default()),
             ];
@@ -65,37 +70,44 @@ impl ModelRegistry {
 
     /// 按名称查找型号
     ///
-    /// 支持的名称（2026 年 7 月）：
-    /// - `claude-opus-4.6` / `claude-opus-4.5` / `claude-sonnet-4.5`
+    /// 支持的名称（2026 年 7 月，已核查官方文档）：
+    /// - Claude 家族（5 个）：`claude-opus-4.6` / `claude-opus-4.8` / `claude-sonnet-5` / `claude-fable-5` / `claude-mythos-5`
     /// - `gpt-5.2` / `gpt-5-codex`
-    /// - `gemini-3-pro`
-    /// - `deepseek-v3.2` / `deepseek-r1`
-    /// - `qwen-3` / `llama-4` / `grok-4.1`
+    /// - `gemini-3.1-pro`
+    /// - `deepseek-v4-pro` / `deepseek-v4-flash`
+    /// - `qwen-3-coder`
+    /// - `llama-4-scout` / `llama-4-maverick`
+    /// - `grok-4.1`
     /// - `local-default`
     pub fn find(name: &str) -> Option<ModelVariant> {
         Self::init().get(name).cloned()
     }
 
-    /// 获取家族的默认型号（最新版本）
+    /// 获取家族的默认型号（最新稳定版本）
     ///
     /// 每个家族返回其最新主流型号：
-    /// - Claude → Opus 4.6
+    /// - Claude → Opus 4.8（API 普遍可用的稳定旗舰）
     /// - GPT → GPT-5.2
-    /// - Gemini → Gemini 3 Pro
-    /// - DeepSeek → V3.2
-    /// - Qwen → Qwen 3
-    /// - Llama → Llama 4
+    /// - Gemini → Gemini 3.1 Pro
+    /// - DeepSeek → V4-Pro
+    /// - Qwen → Qwen3-Coder
+    /// - Llama → Llama 4 Scout
     /// - Grok → Grok 4.1
     /// - Local → local-default
     /// - Custom → custom("custom", Custom, 32K)（中性预设）
+    ///
+    /// **说明**：Claude 默认选 Opus 4.8 而非 Fable 5/Mythos 5，原因：
+    /// - Fable 5 曾因出口管制暂停，稳定性待观察
+    /// - Mythos 5 面向特定合作方，普通用户难访问
+    /// - Opus 4.8 为 API 普遍可用的稳定旗舰
     pub fn default_variant(family: ModelFamily) -> ModelVariant {
         match family {
-            ModelFamily::Claude => ModelVariant::claude_opus_4_6(),
+            ModelFamily::Claude => ModelVariant::claude_opus_4_8(),
             ModelFamily::Gpt => ModelVariant::gpt_5_2(),
-            ModelFamily::Gemini => ModelVariant::gemini_3_pro(),
-            ModelFamily::DeepSeek => ModelVariant::deepseek_v3_2(),
-            ModelFamily::Qwen => ModelVariant::qwen_3(),
-            ModelFamily::Llama => ModelVariant::llama_4(),
+            ModelFamily::Gemini => ModelVariant::gemini_3_1_pro(),
+            ModelFamily::DeepSeek => ModelVariant::deepseek_v4_pro(),
+            ModelFamily::Qwen => ModelVariant::qwen_3_coder(),
+            ModelFamily::Llama => ModelVariant::llama_4_scout(),
             ModelFamily::Grok => ModelVariant::grok_4_1(),
             ModelFamily::Local => ModelVariant::local_default(),
             ModelFamily::Custom => ModelVariant::custom("custom", ModelFamily::Custom, 32_000),
@@ -143,7 +155,7 @@ mod tests {
     fn test_default_variant_claude() {
         let v = ModelRegistry::default_variant(ModelFamily::Claude);
         assert_eq!(v.family, ModelFamily::Claude);
-        assert_eq!(v.name, "claude-opus-4.6");
+        assert_eq!(v.name, "claude-opus-4.8");
     }
 
     #[test]
@@ -155,19 +167,49 @@ mod tests {
     #[test]
     fn test_default_variant_gemini() {
         let v = ModelRegistry::default_variant(ModelFamily::Gemini);
-        assert_eq!(v.name, "gemini-3-pro");
+        assert_eq!(v.name, "gemini-3.1-pro");
+    }
+
+    #[test]
+    fn test_default_variant_deepseek_v4() {
+        let v = ModelRegistry::default_variant(ModelFamily::DeepSeek);
+        assert_eq!(v.name, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn test_default_variant_qwen_coder() {
+        let v = ModelRegistry::default_variant(ModelFamily::Qwen);
+        assert_eq!(v.name, "qwen-3-coder");
+    }
+
+    #[test]
+    fn test_default_variant_llama_4_scout() {
+        let v = ModelRegistry::default_variant(ModelFamily::Llama);
+        assert_eq!(v.name, "llama-4-scout");
     }
 
     #[test]
     fn test_all_variants_count() {
         let count = ModelRegistry::all_variants().count();
-        assert_eq!(count, 12, "应内置 12 个型号");
+        assert_eq!(count, 15, "应内置 15 个型号");
     }
 
     #[test]
     fn test_variants_by_family() {
         let claude_variants = ModelRegistry::variants_by_family(ModelFamily::Claude);
-        assert_eq!(claude_variants.len(), 3); // opus-4.6, opus-4.5, sonnet-4.5
+        assert_eq!(claude_variants.len(), 5); // opus-4.6, opus-4.8, sonnet-5, fable-5, mythos-5
+    }
+
+    #[test]
+    fn test_variants_by_family_deepseek() {
+        let deepseek_variants = ModelRegistry::variants_by_family(ModelFamily::DeepSeek);
+        assert_eq!(deepseek_variants.len(), 2); // v4-pro, v4-flash
+    }
+
+    #[test]
+    fn test_variants_by_family_llama() {
+        let llama_variants = ModelRegistry::variants_by_family(ModelFamily::Llama);
+        assert_eq!(llama_variants.len(), 2); // scout, maverick
     }
 
     #[test]

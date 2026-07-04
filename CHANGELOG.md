@@ -7,6 +7,63 @@
 ### 计划中
 - v2.4：WASM 组件（待生态成熟）+ Node/Go/Java 绑定
 
+### 型号库更新（2026-07-04 核查官方文档）
+
+#### 背景
+核查 Anthropic / OpenAI / Google / DeepSeek / Alibaba / Meta / xAI 官方文档与 API 公告，发现内置型号库存在 3 个过期型号，其中 1 个**紧急**（DeepSeek V3/V3.2 将于 2026-07-24 停服）。同时新增 Anthropic 2026 年 5-6 月发布的 3 个新型号（Opus 4.8 / Fable 5 / Mythos 5）。
+
+#### 删除（7 个旧型号）
+- `claude_opus_4_5`（被 Opus 4.6 / Opus 4.8 替代）
+- `claude_sonnet_4_5`（被 Sonnet 5 替代）
+- `gemini_3_pro`（被 Gemini 3.1 Pro 替代，2026-02-20 发布）
+- `deepseek_v3_2`（**2026-07-24 停服**，迁移至 V4）
+- `deepseek_r1`（被 V4-Pro 思考链模式替代）
+- `qwen_3`（被 Qwen3-Coder 替代，编程优化版）
+- `llama_4`（拆分为 Scout / Maverick 两个变体）
+
+#### 新增（10 个新型号）
+- `claude_opus_4_8`：2026-05 发布，200K 上下文，Opus 级稳定旗舰，API 普遍可用
+- `claude_fable_5`：2026-06-10 发布，200K 上下文，Mythos 级防护版，7-02 全球恢复可用
+- `claude_mythos_5`：2026-06-10 发布，200K 上下文，Mythos 级未防护版，面向特定合作方（与 Fable 5 共享底层模型）
+- `claude_sonnet_5`：2026-06-30 发布，200K 上下文，Agent 默认模型，思考链
+- `gemini_3_1_pro`：2026-02-20 发布，1M 上下文，推理能力 2x，ARC-AGI-2 77.1%
+- `deepseek_v4_pro`：2026-04-24 发布预览版，1M 上下文，MoE 1.6T/49B 激活，MIT 开源
+- `deepseek_v4_flash`：2026-04-24 发布预览版，1M 上下文，MoE 284B/13B 激活，轻量高效
+- `qwen_3_coder`：2025-07-23 开源，256K 上下文（YaRN 可扩 1M），358 种编程语言
+- `llama_4_scout`：2025-04 发布，1M 上下文（理论 10M），MoE 109B，轻量化
+- `llama_4_maverick`：2025-04 发布，1M 上下文，MoE 400B，旗舰级
+
+#### default_variant 映射变更
+| 家族 | 旧默认 | 新默认 | 原因 |
+|---|---|---|---|
+| Claude | claude-opus-4.6 | **claude-opus-4.8** | API 普遍可用的稳定旗舰；Fable 5 曾因出口管制暂停，Mythos 5 面向合作方 |
+| Gemini | gemini-3-pro | **gemini-3.1-pro** | 推理能力 2x |
+| DeepSeek | deepseek-v3.2 | **deepseek-v4-pro** | V3.2 即将停服 |
+| Qwen | qwen-3 | **qwen-3-coder** | 编程优化版 |
+| Llama | llama-4 | **llama-4-scout** | 拆分变体，Scout 为轻量版 |
+
+#### Claude 家族层级（2026-07 最新）
+```text
+Mythos 级（最高）: Fable 5（防护版）/ Mythos 5（未防护版）—— 共享底层模型
+Opus 级（旗舰） : Opus 4.8（当前默认） / Opus 4.6
+Sonnet 级（主力）: Sonnet 5
+```
+
+#### 破坏性变更
+- **不向后兼容**：删除 7 个旧型号构造器，已使用旧型号的用户需迁移至新型号
+- 迁移指引：
+  - `claude_opus_4_5()` → `claude_opus_4_8()`（推荐）或 `claude_opus_4_6()`
+  - `claude_sonnet_4_5()` → `claude_sonnet_5()`
+  - `gemini_3_pro()` → `gemini_3_1_pro()`
+  - `deepseek_v3_2()` / `deepseek_r1()` → `deepseek_v4_pro()`（思考链）或 `deepseek_v4_flash()`（轻量）
+  - `qwen_3()` → `qwen_3_coder()`
+  - `llama_4()` → `llama_4_scout()`（轻量）或 `llama_4_maverick()`（旗舰）
+
+#### 测试
+- variant.rs：15 个新型号测试，删除 4 个旧型号测试
+- registry.rs：新增 3 个家族默认型号测试（DeepSeek V4 / Qwen Coder / Llama Scout）
+- 总型号数：12 → 15（Claude 家族从 2 个扩展到 5 个）
+
 ## [0.3.0] - 2026-07-03
 
 ### v2.3 接口层扩展 + 差异化定位。新增 MCP server + 明确市场定位文档。

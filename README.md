@@ -4,6 +4,20 @@
 
 命名取自大脑海马体（Hippocampus），负责记忆巩固（短期→长期）的核心结构。本项目将「天/周/月」三级索引周期映射到工程实现，为 Agent 提供生物学节律般的记忆机制。
 
+> ⚠️ **破坏性变更通知（2026-07-04）**
+>
+> 型号库已更新至 2026 年 7 月最新官方版本。**7 个旧型号构造器被删除**，已使用旧型号的代码需迁移至新型号。详见 [CHANGELOG.md](CHANGELOG.md#型号库更新2026-07-04-核查官方文档)。
+>
+> 快速迁移：
+> - `claude_opus_4_5()` → `claude_opus_4_8()`（推荐）
+> - `claude_sonnet_4_5()` → `claude_sonnet_5()`
+> - `gemini_3_pro()` → `gemini_3_1_pro()`
+> - `deepseek_v3_2()` / `deepseek_r1()` → `deepseek_v4_pro()` 或 `deepseek_v4_flash()`
+> - `qwen_3()` → `qwen_3_coder()`
+> - `llama_4()` → `llama_4_scout()` 或 `llama_4_maverick()`
+>
+> **紧急**：DeepSeek V3/V3.2 将于 2026-07-24 停服，请尽快迁移至 V4。
+
 ## 定位：Agent 的时序记忆基础设施
 
 **向量库做语义检索（找"像什么"），Hippocampus 做时序归档（找"之前发生过什么"）——两者互补不替代。**
