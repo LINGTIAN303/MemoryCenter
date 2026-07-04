@@ -34,3 +34,4 @@ tempfile = "3.0"
 uuid = { workspace = true }
 chrono = { workspace = true }
 tokio = { version = "1.0", features = ["rt", "macros", "time"] }
+async-trait = "0.1"

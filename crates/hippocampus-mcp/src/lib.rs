@@ -47,6 +47,7 @@ use std::sync::Arc;
 use hippocampus_core::archive::Archiver;
 use hippocampus_core::compact::Compactor;
 use hippocampus_core::conflict::ConflictDetector;
+use hippocampus_core::generate::SummaryGenerator;
 use hippocampus_core::model::{ArchiveConfig, MessageTurn};
 use hippocampus_core::retrieve::{Retriever, SummaryView};
 use hippocampus_core::score::DefaultScorer;
@@ -72,17 +73,25 @@ pub struct HippocampusMcp {
     ///   （首次访问 session 时从 storage 自动重建索引 + 关键词/向量混合检索）
     /// - `None`：`semantic_search` 工具不可用（返回 501 错误，向后兼容）
     session_search: Option<Arc<SessionSearchRouter>>,
+    /// 可注入的 LLM 摘要生成器（v2.21 批次 8c）
+    ///
+    /// - `Some`：`archive` 工具调用 LLM 生成结构化摘要填入 IndexHook
+    ///   （title + abstract + key_facts + key_entities）
+    /// - `None`：使用启发式 `Summary::from_title`（首条消息前 80 字符，向后兼容）
+    /// - LLM 调用失败：降级为启发式，归档主流程不中断
+    summary_generator: Option<Arc<dyn SummaryGenerator>>,
 }
 
 impl HippocampusMcp {
     /// 创建新的 MCP server 实例（无冲突检测器，无语义检索，向后兼容）
     ///
-    /// 等价于 `with_conflict_detector(None)` + `with_session_search(None)`。
+    /// 等价于 `with_conflict_detector(None)` + `with_session_search(None)` + `with_summary_generator(None)`。
     pub fn new(storage_root: PathBuf) -> Self {
         Self {
             storage_root,
             conflict_detector: None,
             session_search: None,
+            summary_generator: None,
         }
     }
 
@@ -103,6 +112,7 @@ impl HippocampusMcp {
             storage_root,
             conflict_detector,
             session_search: None,
+            summary_generator: None,
         }
     }
 
@@ -125,6 +135,36 @@ impl HippocampusMcp {
     /// - `session_search`：注入的路由器，传 `None` 禁用 `semantic_search` 工具
     pub fn with_session_search(mut self, session_search: Option<Arc<SessionSearchRouter>>) -> Self {
         self.session_search = session_search;
+        self
+    }
+
+    /// 链式注入 LLM 摘要生成器（v2.21 批次 8c builder 模式）
+    ///
+    /// 启用后 `archive` 工具归档时调用 LLM 生成结构化摘要
+    /// （title + abstract + key_facts + key_entities）填入 IndexHook。
+    /// 未注入时使用启发式 `Summary::from_title`（首条消息前 80 字符）。
+    ///
+    /// ## 降级策略
+    ///
+    /// - LLM 调用失败：降级为 `Summary::from_title`，归档主流程不中断
+    /// - 未注入：使用 `Summary::from_title`（向后兼容）
+    ///
+    /// ## 使用示例
+    ///
+    /// ```rust,ignore
+    /// let gen: Arc<dyn SummaryGenerator> = Arc::new(HttpSummaryGenerator::new(config));
+    /// let mcp = HippocampusMcp::with_conflict_detector(root, detector)
+    ///     .with_summary_generator(Some(gen));
+    /// ```
+    ///
+    /// ## 参数
+    ///
+    /// - `summary_generator`：注入的生成器，传 `None` 使用启发式摘要
+    pub fn with_summary_generator(
+        mut self,
+        summary_generator: Option<Arc<dyn SummaryGenerator>>,
+    ) -> Self {
+        self.summary_generator = summary_generator;
         self
     }
 
@@ -342,6 +382,11 @@ impl HippocampusMcp {
         let storage = self.create_storage();
         let config = ArchiveConfig::default();
         let mut archiver = Archiver::new(config, storage, &params.session_id, params.project_id);
+
+        // v2.21 批次 8c：若注入了 summary_generator，注入到 Archiver
+        if let Some(gen) = &self.summary_generator {
+            archiver = archiver.with_summary_generator(gen.clone());
+        }
 
         for turn in turns {
             archiver.push_turn(turn);
@@ -975,6 +1020,44 @@ mod tests {
         let router = SessionSearchRouter::new(None, 0).with_storage(storage);
         HippocampusMcp::with_conflict_detector(tmpdir.path().to_path_buf(), None)
             .with_session_search(Some(Arc::new(router)))
+    }
+
+    /// 创建一个注入 Mock 摘要生成器的 MCP 实例（v2.21 批次 8c 测试用）
+    ///
+    /// Mock 生成器返回固定的结构化摘要，用于验证 archive tool 注入链路。
+    fn make_mcp_with_summary_generator(tmpdir: &TempDir, fail: bool) -> HippocampusMcp {
+        use async_trait::async_trait;
+        use hippocampus_core::generate::SummaryGenerator;
+        use hippocampus_core::model::{MemoryFile, Summary};
+
+        struct MockSummaryGenerator {
+            fail: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl SummaryGenerator for MockSummaryGenerator {
+            async fn generate_summary(
+                &self,
+                _file: &MemoryFile,
+            ) -> hippocampus_core::Result<Summary> {
+                if self.fail {
+                    return Err(hippocampus_core::Error::Storage(
+                        "Mock 摘要生成失败".into(),
+                    ));
+                }
+                Ok(Summary {
+                    title: "Mock LLM 摘要标题".into(),
+                    abstract_text: Some("Mock 摘要内容".into()),
+                    key_facts: vec!["事实1".into(), "事实2".into()],
+                    key_entities: vec!["实体A".into()],
+                    clue_anchors: Vec::new(),
+                })
+            }
+        }
+
+        let gen: Arc<dyn SummaryGenerator> = Arc::new(MockSummaryGenerator { fail });
+        HippocampusMcp::with_conflict_detector(tmpdir.path().to_path_buf(), None)
+            .with_summary_generator(Some(gen))
     }
 
     /// 构造一个最小合法 MessageTurn JSON 字符串
@@ -1860,6 +1943,77 @@ mod tests {
         assert!(
             result["total"].as_u64().unwrap_or(0) >= 1,
             "应至少返回 1 条结果"
+        );
+    }
+
+    // ========================================================================
+    // v2.21 批次 8c：summary_generator 注入测试
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_archive_with_summary_generator_uses_llm_summary() {
+        // 注入 Mock 成功生成器：archive 后 summaries 应返回 Mock 的标题
+        let tmp = TempDir::new().unwrap();
+        let mcp = make_mcp_with_summary_generator(&tmp, false);
+        let session_id = "sess-sum-gen";
+
+        let turns_json = make_turns_json("用户原始消息", "LLM 原始回复", 100);
+        let params = Parameters(ArchiveParams {
+            session_id: session_id.to_string(),
+            turns_json,
+            project_id: None,
+        });
+        let result = mcp.archive(params).await.expect("归档失败");
+        let result: Value = serde_json::from_str(&result).unwrap();
+        let hook_id = result["hook_id"].as_str().unwrap().to_string();
+
+        // summaries 应返回 Mock LLM 摘要标题（而非启发式的"用户原始消息"）
+        let params = Parameters(SummariesParams {
+            session_id: session_id.to_string(),
+            project_id: None,
+        });
+        let result = mcp.summaries(params).await.unwrap();
+        let summaries: Vec<Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(summaries.len(), 1);
+
+        let title = summaries[0]["summary_title"].as_str().unwrap_or("");
+        assert_eq!(
+            title, "Mock LLM 摘要标题",
+            "应使用 LLM 生成的标题，而非启发式首条消息前 80 字符"
+        );
+        // hook_id 应一致
+        assert_eq!(summaries[0]["hook_id"].as_str().unwrap(), hook_id);
+    }
+
+    #[tokio::test]
+    async fn test_archive_summary_generator_failure_degrades_gracefully() {
+        // 注入 Mock 失败生成器：archive 应成功（降级为启发式 Summary::from_title）
+        let tmp = TempDir::new().unwrap();
+        let mcp = make_mcp_with_summary_generator(&tmp, true);
+        let session_id = "sess-sum-fail";
+
+        let turns_json = make_turns_json("降级测试用户消息", "降级 LLM 回复", 100);
+        let params = Parameters(ArchiveParams {
+            session_id: session_id.to_string(),
+            turns_json,
+            project_id: None,
+        });
+        // archive 应成功（LLM 失败时降级，不中断主流程）
+        mcp.archive(params).await.expect("LLM 失败时应降级为启发式，归档应成功");
+
+        // summaries 应返回启发式标题（首条消息前 80 字符 = "降级测试用户消息"）
+        let params = Parameters(SummariesParams {
+            session_id: session_id.to_string(),
+            project_id: None,
+        });
+        let result = mcp.summaries(params).await.unwrap();
+        let summaries: Vec<Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(summaries.len(), 1);
+
+        let title = summaries[0]["summary_title"].as_str().unwrap_or("");
+        assert!(
+            title.contains("降级测试用户消息"),
+            "降级后应使用启发式标题（首条消息前 80 字符），实际: {title}"
         );
     }
 }

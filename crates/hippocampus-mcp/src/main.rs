@@ -37,6 +37,22 @@
 //! - 配置完整：每 session 独立 `HybridRetriever`（关键词 + 向量 + RRF 融合）
 //! - **MCP 进程重启后索引丢失**：SessionSearchRouter 注入了 storage 引用，
 //!   首次访问 session 时自动从 storage 批量重建索引（用 `embed_batch` 优化 API 调用）
+//!
+//! ## 摘要生成器配置（v2.21 批次 8c）
+//!
+//! 通过环境变量配置 LLM API 后，`archive` 工具归档时自动生成结构化摘要填入 IndexHook：
+//!
+//! | 环境变量 | 说明 | 默认值 |
+//! |---------|------|--------|
+//! | `HIPPOCAMPUS_GENERATOR_API_URL` | LLM API 地址（OpenAI 兼容 `/v1/chat/completions`） | 空（降级为启发式） |
+//! | `HIPPOCAMPUS_GENERATOR_API_KEY` | API Key | 空 |
+//! | `HIPPOCAMPUS_GENERATOR_MODEL` | 模型名 | `gpt-5.5-instant` |
+//! | `HIPPOCAMPUS_GENERATOR_TIMEOUT` | 超时秒数 | `60` |
+//! | `HIPPOCAMPUS_GENERATOR_MAX_TOKENS` | LLM 最大输出 token | `500` |
+//!
+//! - 未配置 `API_URL`：使用启发式 `Summary::from_title`（首条消息前 80 字符）
+//! - 配置完整：使用 `HttpSummaryGenerator`（LLM 生成 title + abstract + key_facts + key_entities）
+//! - LLM 调用失败：降级为启发式，归档主流程不中断
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -122,6 +138,44 @@ fn build_session_search(storage_root: &Path) -> Option<Arc<hippocampus_search::S
     Some(Arc::new(router))
 }
 
+/// 从环境变量构造 LLM 摘要生成器（v2.21 批次 8c）
+///
+/// 与 server 端 `build_summary_generator` 行为一致：
+///
+/// | 环境变量 | 说明 | 默认值 |
+/// |---------|------|--------|
+/// | `HIPPOCAMPUS_GENERATOR_API_URL` | LLM API 地址（OpenAI 兼容 `/v1/chat/completions`） | 空（降级为启发式） |
+/// | `HIPPOCAMPUS_GENERATOR_API_KEY` | API Key | 空 |
+/// | `HIPPOCAMPUS_GENERATOR_MODEL` | 模型名 | `gpt-5.5-instant` |
+/// | `HIPPOCAMPUS_GENERATOR_TIMEOUT` | 超时秒数 | `60` |
+/// | `HIPPOCAMPUS_GENERATOR_MAX_TOKENS` | LLM 最大输出 token | `500` |
+///
+/// - 未配置 `API_URL`：返回 None（使用启发式 `Summary::from_title`）
+/// - 配置完整：返回 `HttpSummaryGenerator`（归档时生成结构化摘要）
+fn build_summary_generator() -> Option<Arc<dyn hippocampus_core::generate::SummaryGenerator>> {
+    use hippocampus_core::generate::LlmGeneratorConfig;
+    use hippocampus_llm::HttpSummaryGenerator;
+
+    let config = match LlmGeneratorConfig::from_env() {
+        Some(config) => config,
+        None => {
+            tracing::info!(
+                "摘要生成器：未配置 LLM API（HIPPOCAMPUS_GENERATOR_API_URL），使用启发式 Summary::from_title"
+            );
+            return None;
+        }
+    };
+
+    tracing::info!(
+        api_url = %config.api_url,
+        model = %config.model,
+        max_tokens = config.max_tokens,
+        "摘要生成器：LLM API 已配置，启用 HttpSummaryGenerator（归档时生成结构化摘要）"
+    );
+
+    Some(Arc::new(HttpSummaryGenerator::new(config)))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 初始化日志
@@ -143,6 +197,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // v2.18：构造 SessionSearchRouter（注入 storage 支持懒重建）
     let session_search = build_session_search(&storage_root);
 
+    // v2.21 批次 8c：构造 LLM 摘要生成器（环境变量驱动：未配置时返回 None，使用启发式）
+    let summary_generator = build_summary_generator();
+
     tracing::info!(
         root = %storage_root.display(),
         "启动 Hippocampus MCP server (stdio 传输)"
@@ -154,6 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Some(conflict_detector),
     )
     .with_session_search(session_search)
+    .with_summary_generator(summary_generator)
     .serve(stdio())
     .await?;
 
