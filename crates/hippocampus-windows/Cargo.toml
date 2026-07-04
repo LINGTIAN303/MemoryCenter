@@ -1,0 +1,12 @@
+[package]
+name = "hippocampus-windows"
+version.workspace = true
+edition.workspace = true
+description = "Hippocampus 上下文窗口特配库 - Agent 工具压缩方式适配"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hippocampus-core = { path = "../hippocampus-core", version = "0.1.0" }
