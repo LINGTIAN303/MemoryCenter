@@ -360,6 +360,10 @@ impl ConflictDetector for HttpLlmDetector {
             ],
             "max_tokens": self.config.max_tokens,
             "temperature": 0.0,
+            // v2.24：关闭思考模式（DeepSeek V4 Flash 默认启用思考模式，
+            // 输出会进入 reasoning_content 而 content 为空，导致解析失败）
+            // 此参数对不支持 thinking 的 API（如 OpenAI/SenseNova）无害，会被忽略
+            "thinking": {"type": "disabled"},
         });
 
         let resp = match self

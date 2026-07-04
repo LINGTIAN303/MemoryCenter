@@ -575,6 +575,29 @@ impl Retriever {
         None
     }
 
+    /// 按 hook_id 查找完整的 IndexHook（v2.25 新增）
+    ///
+    /// 与 `find_memory_id_by_hook` 类似，但返回完整的 IndexHook（含 summary.key_facts）。
+    /// 用于 detect_conflicts 场景：把 key_facts 作为历史事实集传给 detector。
+    ///
+    /// 返回 None 表示未找到对应钩子。
+    pub async fn find_hook_by_id(&self, hook_id: &str) -> Option<IndexHook> {
+        for period in ArchivePeriod::all() {
+            if let Ok(Some(doc)) = self
+                .storage
+                .read_index(&self.session_id, self.project_id.as_deref(), period)
+                .await
+            {
+                for hook in &doc.hooks {
+                    if hook.id.to_string() == hook_id {
+                        return Some(hook.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// 按 session + period 获取索引文档（高级接口）
     ///
     /// 供调用方需要直接操作 IndexDocument 时使用。

@@ -828,6 +828,9 @@ impl HippocampusMcp {
     ///
     /// v2.6 批次 8：在 update 前预检测冲突，让 Agent 决策是否继续。
     /// 返回 ConflictReport（含 conflicts 数组 + has_critical 标志）。
+    ///
+    /// v2.25：从 IndexHook.summary.key_facts 提取历史事实集注入到 memory.updates，
+    /// 解决 archive 只写 turns 不写 updates 导致 detector 拿不到历史事实的问题。
     #[tool(description = "检测记忆更新的潜在冲突（不实际写入）。传入 added/revised/deprecated facts，返回检测到的冲突列表（自我矛盾/直接矛盾/立场反转）。Agent 可在 update 前调用此 tool 评估风险。")]
     async fn detect_conflicts(
         &self,
@@ -840,10 +843,10 @@ impl HippocampusMcp {
             params.project_id.clone(),
         );
 
-        // 通过 hook_id 找到 memory_id
-        let memory_id = retriever.find_memory_id_by_hook(&params.hook_id).await;
-        let memory_id = match memory_id {
-            Some(mid) => mid,
+        // 通过 hook_id 找到 IndexHook（v2.25：需要 key_facts）
+        let hook = retriever.find_hook_by_id(&params.hook_id).await;
+        let hook = match hook {
+            Some(h) => h,
             None => {
                 return Err(McpError::invalid_params(
                     format!("未找到 hook_id: {}", params.hook_id),
@@ -853,15 +856,43 @@ impl HippocampusMcp {
         };
 
         // 读取现有记忆
-        let existing = storage.read_memory(&memory_id).await.map_err(|e| {
+        let mut existing = storage.read_memory(&hook.memory_id).await.map_err(|e| {
             McpError::internal_error(format!("读取记忆失败: {e}"), None)
         })?;
 
-        // 构造 MemoryUpdate
-        let update = hippocampus_core::model::MemoryUpdate::new()
-            .add_fact(params.added_facts.join("\n"))
-            .revise_fact(params.revised_facts.join("\n"))
-            .deprecate_fact(params.deprecated_facts.join("\n"));
+        // v2.25：若 memory.updates 为空但 IndexHook 有 key_facts，
+        // 把 key_facts 作为虚拟 MemoryUpdateRecord 注入，让 detector 能看到历史事实。
+        // 这解决了 archive 只写 turns 不写 updates 的设计缺陷。
+        // v2.25.1：逐条 add_fact 保持事实粒度，避免 join 导致检测粒度变粗。
+        if existing.updates.is_empty() && !hook.summary.key_facts.is_empty() {
+            use hippocampus_core::model::MemoryUpdateRecord;
+            let mut virtual_update = hippocampus_core::model::MemoryUpdate::new();
+            for fact in &hook.summary.key_facts {
+                virtual_update = virtual_update.add_fact(fact.clone());
+            }
+            existing.updates.push(MemoryUpdateRecord {
+                updated_at: hook.archived_at,
+                update: virtual_update,
+                conflicts: vec![],
+            });
+            tracing::debug!(
+                hook_id = %params.hook_id,
+                facts_count = hook.summary.key_facts.len(),
+                "detect_conflicts: 已从 IndexHook 注入 key_facts 作为历史事实集"
+            );
+        }
+
+        // 构造 MemoryUpdate（v2.25.1：逐条添加保持事实粒度）
+        let mut update = hippocampus_core::model::MemoryUpdate::new();
+        for fact in &params.added_facts {
+            update = update.add_fact(fact.clone());
+        }
+        for fact in &params.revised_facts {
+            update = update.revise_fact(fact.clone());
+        }
+        for fact in &params.deprecated_facts {
+            update = update.deprecate_fact(fact.clone());
+        }
 
         // v2.11：使用注入的检测器（支持 HeuristicDetector / HttpLlmDetector / HybridDetector）
         // 未注入时降级为 HeuristicDetector（向后兼容）

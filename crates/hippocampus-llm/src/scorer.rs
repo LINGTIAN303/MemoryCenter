@@ -161,6 +161,9 @@ impl AsyncScorer for HttpLlmScorer {
             ],
             "max_tokens": self.config.max_tokens,
             "temperature": 0.0,
+            // v2.24：关闭思考模式（DeepSeek V4 Flash 默认启用思考模式，
+            // 输出会进入 reasoning_content 而 content 为空，导致解析失败）
+            "thinking": {"type": "disabled"},
         });
 
         let resp = self
