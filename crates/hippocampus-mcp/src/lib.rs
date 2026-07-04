@@ -467,12 +467,17 @@ impl HippocampusMcp {
         Parameters(params): Parameters<CompactionParams>,
     ) -> Result<String, McpError> {
         let storage = self.create_storage();
-        let compactor = Compactor::new(
+        let mut compactor = Compactor::new(
             storage,
             Box::new(DefaultScorer::new()),
             &params.session_id,
             params.project_id,
         );
+
+        // v2.22: 若注入了 summary_generator，注入到 Compactor（compaction 也用 LLM 摘要）
+        if let Some(gen) = &self.summary_generator {
+            compactor = compactor.with_summary_generator(gen.clone());
+        }
 
         let (memory, index_doc) = match params.period.as_str() {
             "weekly" => compactor.weekly_merge().await,

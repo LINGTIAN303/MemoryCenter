@@ -28,6 +28,7 @@
 //! [`Compactor`] 持有 `Arc<dyn Storage>`，与 [`Archiver`] / [`Retriever`] 一致。
 //! 构造时绑定 session_id 和 project_id，全封装周期任务。
 
+use crate::generate::SummaryGenerator;
 use crate::model::{ArchivePeriod, IndexDocument, MemoryFile, MessageTurn, Summary, Tag};
 use crate::score::{AsyncScorer, Scorer};
 use crate::storage::Storage;
@@ -75,6 +76,17 @@ pub struct Compactor {
     /// 通过 [`Compactor::with_cleanup_daily_after_weekly_merge`] 注入。
     /// 开启后可节省存储空间，但失去 daily 级别的回溯能力。
     cleanup_daily_after_weekly_merge: bool,
+
+    /// 可选的 LLM 摘要生成器（v2.22）
+    ///
+    /// 注入后 `weekly_merge` 和 `monthly_evict` 完成合并时会调用 LLM 生成
+    /// 结构化摘要，替换启发式 Summary（v2.4 机械拼接的标题/事实/实体）。
+    ///
+    /// 降级策略：LLM 调用失败时保留启发式 Summary，周期任务主流程不中断。
+    /// 为 None 时使用启发式（向后兼容）。
+    ///
+    /// 通过 [`Compactor::with_summary_generator`] 注入。
+    summary_generator: Option<Arc<dyn SummaryGenerator>>,
 }
 
 /// 寒暄判定核心逻辑（自由函数，供测试直接调用）
@@ -151,6 +163,7 @@ impl Compactor {
             chitchat_patterns: Vec::new(),
             async_scorer: None,
             cleanup_daily_after_weekly_merge: false,
+            summary_generator: None,
         }
     }
 
@@ -208,6 +221,35 @@ impl Compactor {
     /// ```
     pub fn with_cleanup_daily_after_weekly_merge(mut self, cleanup: bool) -> Self {
         self.cleanup_daily_after_weekly_merge = cleanup;
+        self
+    }
+
+    /// 注入 LLM 摘要生成器（v2.22）
+    ///
+    /// 注入后 `weekly_merge` 和 `monthly_evict` 完成合并时会调用 LLM 生成
+    /// 结构化摘要，替换启发式 Summary（v2.4 机械拼接的标题/事实/实体）。
+    ///
+    /// ## 降级策略
+    ///
+    /// LLM 调用失败时保留启发式 Summary，周期任务主流程不中断。
+    /// 未注入时使用启发式（向后兼容）。
+    ///
+    /// ## LLM 调用次数
+    ///
+    /// - `weekly_merge`：1 次（基于合并后的 weekly MemoryFile）
+    /// - `monthly_evict`：1 次（基于合并后的 monthly 主记忆 MemoryFile）
+    ///
+    /// 所有 weekly/monthly 钩子共用同一个 LLM Summary（代表整体记忆）。
+    ///
+    /// # 示例
+    ///
+    /// ```ignore
+    /// use hippocampus_core::generate::SummaryGenerator;
+    /// let compactor = Compactor::new(storage, scorer, "sess", None)
+    ///     .with_summary_generator(Arc::new(http_summary_generator));
+    /// ```
+    pub fn with_summary_generator(mut self, gen: Arc<dyn SummaryGenerator>) -> Self {
+        self.summary_generator = Some(gen);
         self
     }
 
@@ -348,6 +390,36 @@ impl Compactor {
                 };
 
                 weekly_index.add_hook(new_hook);
+            }
+        }
+
+        // v2.22: 若注入了 LLM 摘要生成器，对合并后的 weekly MemoryFile 生成结构化摘要
+        //
+        // 所有 weekly 钩子共用同一个 LLM Summary（代表周级整体记忆）。
+        // 降级策略：LLM 调用失败时保留启发式 Summary（v2.4 机械拼接），主流程不中断。
+        if !weekly_index.hooks.is_empty() {
+            if let Some(gen) = &self.summary_generator {
+                match gen.generate_summary(&merged_memory).await {
+                    Ok(llm_summary) => {
+                        tracing::info!(
+                            title = %llm_summary.title,
+                            facts_count = llm_summary.key_facts.len(),
+                            entities_count = llm_summary.key_entities.len(),
+                            hooks_count = weekly_index.hooks.len(),
+                            "weekly LLM 摘要生成成功，替换启发式 Summary"
+                        );
+                        for hook in &mut weekly_index.hooks {
+                            hook.summary = llm_summary.clone();
+                        }
+                    }
+                    Err(e) => {
+                        // 降级：保留启发式 Summary，主流程不中断
+                        tracing::warn!(
+                            error = %e,
+                            "weekly LLM 摘要生成失败，降级为启发式 Summary（v2.4 机械拼接）"
+                        );
+                    }
+                }
             }
         }
 
@@ -538,6 +610,36 @@ impl Compactor {
                 new_hook.memory_id = memory_path.clone();
                 new_hook.period = ArchivePeriod::Monthly;
                 monthly_index.add_hook(new_hook);
+            }
+        }
+
+        // v2.22: 若注入了 LLM 摘要生成器，对合并后的 monthly 主记忆 MemoryFile 生成结构化摘要
+        //
+        // 所有 monthly 钩子共用同一个 LLM Summary（代表月级整体记忆）。
+        // 降级策略：LLM 调用失败时保留原 weekly 钩子的 Summary，主流程不中断。
+        if !monthly_index.hooks.is_empty() {
+            if let Some(gen) = &self.summary_generator {
+                match gen.generate_summary(&main_memory).await {
+                    Ok(llm_summary) => {
+                        tracing::info!(
+                            title = %llm_summary.title,
+                            facts_count = llm_summary.key_facts.len(),
+                            entities_count = llm_summary.key_entities.len(),
+                            hooks_count = monthly_index.hooks.len(),
+                            "monthly LLM 摘要生成成功，替换原 weekly Summary"
+                        );
+                        for hook in &mut monthly_index.hooks {
+                            hook.summary = llm_summary.clone();
+                        }
+                    }
+                    Err(e) => {
+                        // 降级：保留原 weekly 钩子的 Summary，主流程不中断
+                        tracing::warn!(
+                            error = %e,
+                            "monthly LLM 摘要生成失败，降级为原 weekly 钩子 Summary"
+                        );
+                    }
+                }
             }
         }
 
@@ -964,5 +1066,199 @@ mod tests {
 
         let result = compactor.monthly_evict().await;
         assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // v2.22: Compactor SummaryGenerator 注入测试
+    // ========================================================================
+
+    /// Mock 摘要生成器（测试用）
+    ///
+    /// - `fail = true`：模拟 LLM 调用失败，返回 Err
+    /// - `fail = false`：返回固定的结构化 Summary
+    struct MockSummaryGenerator {
+        fail: bool,
+    }
+
+    impl MockSummaryGenerator {
+        fn new() -> Self {
+            Self { fail: false }
+        }
+        fn failing() -> Self {
+            Self { fail: true }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SummaryGenerator for MockSummaryGenerator {
+        async fn generate_summary(&self, _file: &MemoryFile) -> crate::Result<Summary> {
+            if self.fail {
+                return Err(crate::Error::Storage("Mock 摘要生成失败".into()));
+            }
+            Ok(Summary {
+                title: "LLM 生成的周/月级摘要标题".into(),
+                abstract_text: Some("LLM 生成的结构化摘要内容".into()),
+                key_facts: vec!["关键事实1".into(), "关键事实2".into()],
+                key_entities: vec!["实体A".into(), "实体B".into()],
+                clue_anchors: Vec::new(),
+            })
+        }
+    }
+
+    /// 辅助函数：归档若干 daily 文件（供 weekly_merge 测试使用）
+    async fn setup_daily_files(storage: Arc<dyn Storage>, session_id: &str, count: usize) {
+        use crate::archive::Archiver;
+        use crate::model::ArchiveConfig;
+        for i in 0..count {
+            let mut archiver = Archiver::new(
+                ArchiveConfig {
+                    token_threshold: 100,
+                    force_truncate_limit: 150,
+                    wait_for_turn_completion: true,
+                },
+                storage.clone(),
+                session_id,
+                None,
+            );
+            archiver.push_turn(make_normal_turn(&format!("用户消息 {i}"), 60));
+            archiver.archive().await.unwrap();
+        }
+    }
+
+    /// v2.22: weekly_merge 注入 SummaryGenerator 后应使用 LLM 生成的摘要
+    #[tokio::test]
+    async fn test_weekly_merge_with_summary_generator_uses_llm() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+        setup_daily_files(storage.clone(), "sess-weekly-gen", 2).await;
+
+        let scorer: Box<dyn Scorer> = Box::new(DefaultScorer::new());
+        let gen: Arc<dyn SummaryGenerator> = Arc::new(MockSummaryGenerator::new());
+        let compactor = Compactor::new(storage.clone(), scorer, "sess-weekly-gen", None)
+            .with_summary_generator(gen);
+
+        let (merged, index) = compactor.weekly_merge().await.unwrap();
+
+        // 验证合并成功
+        assert_eq!(merged.period, ArchivePeriod::Weekly);
+        assert!(!index.hooks.is_empty(), "weekly 索引应有钩子");
+
+        // 验证所有钩子的 Summary 被替换为 LLM 生成的
+        for hook in &index.hooks {
+            assert_eq!(hook.summary.title, "LLM 生成的周/月级摘要标题");
+            assert_eq!(
+                hook.summary.abstract_text.as_deref(),
+                Some("LLM 生成的结构化摘要内容")
+            );
+            assert_eq!(hook.summary.key_facts.len(), 2);
+            assert_eq!(hook.summary.key_entities.len(), 2);
+        }
+    }
+
+    /// v2.22: weekly_merge LLM 失败时降级为启发式 Summary（v2.4 机械拼接）
+    #[tokio::test]
+    async fn test_weekly_merge_summary_generator_failure_degrades_gracefully() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+        setup_daily_files(storage.clone(), "sess-weekly-fail", 2).await;
+
+        let scorer: Box<dyn Scorer> = Box::new(DefaultScorer::new());
+        let gen: Arc<dyn SummaryGenerator> = Arc::new(MockSummaryGenerator::failing());
+        let compactor = Compactor::new(storage.clone(), scorer, "sess-weekly-fail", None)
+            .with_summary_generator(gen);
+
+        let (merged, index) = compactor.weekly_merge().await.unwrap();
+
+        // 验证合并仍成功（主流程不中断）
+        assert_eq!(merged.period, ArchivePeriod::Weekly);
+        assert!(!index.hooks.is_empty(), "weekly 索引应有钩子");
+
+        // 验证降级为启发式 Summary（v2.4 机械拼接的"周度合并（N 个记忆）"）
+        for hook in &index.hooks {
+            assert!(
+                hook.summary.title.starts_with("周度合并（"),
+                "降级后 title 应为启发式，实际: {}",
+                hook.summary.title
+            );
+        }
+    }
+
+    /// v2.22: monthly_evict 注入 SummaryGenerator 后应使用 LLM 生成的摘要
+    #[tokio::test]
+    async fn test_monthly_evict_with_summary_generator_uses_llm() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+
+        // 先归档若干 daily 文件，再执行 weekly_merge 生成 weekly 文件
+        setup_daily_files(storage.clone(), "sess-monthly-gen", 2).await;
+        let weekly_compactor = Compactor::new(
+            storage.clone(),
+            Box::new(DefaultScorer::new()),
+            "sess-monthly-gen",
+            None,
+        );
+        weekly_compactor.weekly_merge().await.unwrap();
+
+        // 注入 SummaryGenerator 执行 monthly_evict
+        let gen: Arc<dyn SummaryGenerator> = Arc::new(MockSummaryGenerator::new());
+        let compactor = Compactor::new(storage.clone(), Box::new(DefaultScorer::new()), "sess-monthly-gen", None)
+            .with_summary_generator(gen);
+
+        let (main_memory, index) = compactor.monthly_evict().await.unwrap();
+
+        // 验证月级淘汰成功
+        assert_eq!(main_memory.period, ArchivePeriod::Monthly);
+        assert!(!index.hooks.is_empty(), "monthly 索引应有钩子");
+
+        // 验证所有钩子的 Summary 被替换为 LLM 生成的
+        for hook in &index.hooks {
+            assert_eq!(hook.summary.title, "LLM 生成的周/月级摘要标题");
+            assert_eq!(
+                hook.summary.abstract_text.as_deref(),
+                Some("LLM 生成的结构化摘要内容")
+            );
+            assert_eq!(hook.summary.key_facts.len(), 2);
+            assert_eq!(hook.summary.key_entities.len(), 2);
+        }
+    }
+
+    /// v2.22: monthly_evict LLM 失败时降级为原 weekly 钩子 Summary
+    #[tokio::test]
+    async fn test_monthly_evict_summary_generator_failure_degrades_gracefully() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+
+        // 先归档 + weekly_merge 生成 weekly 文件
+        setup_daily_files(storage.clone(), "sess-monthly-fail", 2).await;
+        let weekly_compactor = Compactor::new(
+            storage.clone(),
+            Box::new(DefaultScorer::new()),
+            "sess-monthly-fail",
+            None,
+        );
+        let (_, weekly_index) = weekly_compactor.weekly_merge().await.unwrap();
+
+        // 记录 weekly 钩子的原始 title（降级时应保留）
+        let weekly_title = weekly_index.hooks[0].summary.title.clone();
+
+        // 注入失败的 SummaryGenerator 执行 monthly_evict
+        let gen: Arc<dyn SummaryGenerator> = Arc::new(MockSummaryGenerator::failing());
+        let compactor = Compactor::new(storage.clone(), Box::new(DefaultScorer::new()), "sess-monthly-fail", None)
+            .with_summary_generator(gen);
+
+        let (main_memory, index) = compactor.monthly_evict().await.unwrap();
+
+        // 验证月级淘汰仍成功（主流程不中断）
+        assert_eq!(main_memory.period, ArchivePeriod::Monthly);
+        assert!(!index.hooks.is_empty(), "monthly 索引应有钩子");
+
+        // 验证降级为原 weekly 钩子的 Summary
+        for hook in &index.hooks {
+            assert_eq!(
+                hook.summary.title, weekly_title,
+                "降级后应保留原 weekly 钩子 Summary，实际: {}",
+                hook.summary.title
+            );
+        }
     }
 }

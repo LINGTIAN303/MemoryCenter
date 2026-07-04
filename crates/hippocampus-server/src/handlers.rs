@@ -197,12 +197,17 @@ pub async fn run_compaction(
     Json(req): Json<CompactionRequest>,
 ) -> Result<Json<CompactionResult>, AppError> {
     let storage = create_storage(&state);
-    let compactor = Compactor::new(
+    let mut compactor = Compactor::new(
         storage,
         Box::new(DefaultScorer::new()),
         &sid,
         req.project_id,
     );
+
+    // v2.22: 若注入了 summary_generator，注入到 Compactor（compaction 也用 LLM 摘要）
+    if let Some(gen) = &state.summary_generator {
+        compactor = compactor.with_summary_generator(gen.clone());
+    }
 
     let (memory, index_doc) = match req.period.as_str() {
         "weekly" => compactor.weekly_merge().await?,
