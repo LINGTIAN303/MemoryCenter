@@ -27,6 +27,7 @@
 
 use hippocampus_core::archive::Archiver;
 use hippocampus_core::compact::Compactor;
+use hippocampus_core::generate::SummaryGenerator;
 use hippocampus_core::model::ArchiveConfig;
 use hippocampus_core::retrieve::Retriever;
 use hippocampus_core::score::DefaultScorer;
@@ -115,6 +116,11 @@ struct Hippocampus {
     session_id: String,
     /// 项目 ID（可选）
     project_id: Option<String>,
+    /// 可选的 LLM 摘要生成器（v2.23）
+    ///
+    /// 由 `from_env()` 类方法从环境变量构建注入。
+    /// 为 None 时 archive/compaction 使用启发式 Summary（向后兼容）。
+    summary_generator: Option<Arc<dyn SummaryGenerator>>,
 }
 
 // ============================================================================
@@ -149,6 +155,23 @@ fn create_storage(root: &std::path::Path) -> Arc<dyn Storage> {
     Arc::new(LocalStorage::new(root.to_path_buf()))
 }
 
+/// 从环境变量构建 LLM 摘要生成器（v2.23）
+///
+/// 环境变量前缀 `HIPPOCAMPUS_GENERATOR_`，与 server/mcp 一致：
+/// - `HIPPOCAMPUS_GENERATOR_API_URL`：LLM API 地址（必填，未设置则返回 None）
+/// - `HIPPOCAMPUS_GENERATOR_API_KEY`：API Key（可选）
+/// - `HIPPOCAMPUS_GENERATOR_MODEL`：模型名（可选，默认 gpt-4o-mini）
+/// - `HIPPOCAMPUS_GENERATOR_MAX_TOKENS`：最大 token 数（可选，默认 1024）
+///
+/// 返回 None 时调用方使用启发式 Summary（向后兼容）。
+fn build_summary_generator_from_env() -> Option<Arc<dyn SummaryGenerator>> {
+    use hippocampus_core::generate::LlmGeneratorConfig;
+    use hippocampus_llm::HttpSummaryGenerator;
+
+    let config = LlmGeneratorConfig::from_env()?;
+    Some(Arc::new(HttpSummaryGenerator::new(config)))
+}
+
 // ============================================================================
 // Hippocampus 方法实现
 // ============================================================================
@@ -163,6 +186,9 @@ impl Hippocampus {
     /// - `project_id`：项目 ID（可选，默认 None）
     ///
     /// 返回：Hippocampus 实例
+    ///
+    /// **注意**：此构造器不注入 LLM 摘要生成器，archive/compaction 使用启发式 Summary。
+    /// 若需 LLM 摘要，请使用 [`Hippocampus::from_env`] 类方法。
     #[new]
     #[pyo3(signature = (storage_root, session_id, project_id=None))]
     fn new(
@@ -183,6 +209,60 @@ impl Hippocampus {
             runtime,
             session_id,
             project_id,
+            summary_generator: None,
+        })
+    }
+
+    /// 从环境变量构建 Hippocampus 实例（v2.23）
+    ///
+    /// 在 [`Hippocampus::new`] 基础上，从环境变量读取 LLM 配置并注入摘要生成器。
+    /// archive/compaction 将使用 LLM 生成的结构化摘要（失败时降级为启发式）。
+    ///
+    /// ## 环境变量（前缀 `HIPPOCAMPUS_GENERATOR_`）
+    ///
+    /// - `HIPPOCAMPUS_GENERATOR_API_URL`：LLM API 地址（必填，未设置则不注入 LLM）
+    /// - `HIPPOCAMPUS_GENERATOR_API_KEY`：API Key（可选）
+    /// - `HIPPOCAMPUS_GENERATOR_MODEL`：模型名（可选，默认 gpt-4o-mini）
+    /// - `HIPPOCAMPUS_GENERATOR_MAX_TOKENS`：最大 token 数（可选，默认 1024）
+    ///
+    /// ## 参数
+    ///
+    /// - `storage_root`：存储根目录路径
+    /// - `session_id`：会话 ID
+    /// - `project_id`：项目 ID（可选，默认 None）
+    ///
+    /// ## 返回
+    ///
+    /// Hippocampus 实例（含 LLM 摘要生成器，若环境变量未配置则降级为启发式）
+    ///
+    /// ## Python 用法
+    ///
+    /// ```python
+    /// import os
+    /// os.environ["HIPPOCAMPUS_GENERATOR_API_URL"] = "https://api.openai.com/v1"
+    /// os.environ["HIPPOCAMPUS_GENERATOR_API_KEY"] = "sk-xxx"
+    /// os.environ["HIPPOCAMPUS_GENERATOR_MODEL"] = "gpt-4o-mini"
+    ///
+    /// from hippocampus_python import Hippocampus
+    /// hp = Hippocampus.from_env("./data", "session-1")
+    /// summary = hp.archive(turns)  # 使用 LLM 生成的结构化摘要
+    /// ```
+    #[classmethod]
+    #[pyo3(signature = (storage_root, session_id, project_id=None))]
+    fn from_env(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        storage_root: String,
+        session_id: String,
+        project_id: Option<String>,
+    ) -> PyResult<Self> {
+        // 先调用普通构造器创建实例
+        let instance = Self::new(storage_root, session_id, project_id)?;
+        // 从环境变量构建 summary_generator
+        let summary_generator = build_summary_generator_from_env();
+        // 注入到实例
+        Ok(Self {
+            summary_generator,
+            ..instance
         })
     }
 
@@ -259,6 +339,11 @@ impl Hippocampus {
             &self.session_id,
             self.project_id.clone(),
         );
+
+        // v2.23: 若注入了 summary_generator，注入到 Archiver
+        if let Some(gen) = &self.summary_generator {
+            archiver = archiver.with_summary_generator(gen.clone());
+        }
 
         for turn in message_turns {
             archiver.push_turn(turn);
@@ -344,12 +429,17 @@ impl Hippocampus {
     /// 返回：精简结果 dict（memory_file_id/total_turns/total_tokens/hooks_count/period）
     fn compaction(&self, period: String) -> PyResult<Py<PyAny>> {
         let storage = create_storage(&self.storage_root);
-        let compactor = Compactor::new(
+        let mut compactor = Compactor::new(
             storage,
             Box::new(DefaultScorer::new()),
             &self.session_id,
             self.project_id.clone(),
         );
+
+        // v2.23: 若注入了 summary_generator，注入到 Compactor
+        if let Some(gen) = &self.summary_generator {
+            compactor = compactor.with_summary_generator(gen.clone());
+        }
 
         let (memory, index_doc) = self
             .runtime
@@ -622,5 +712,102 @@ mod tests {
         assert!(combined.window.is_none());
         assert!(combined.model.is_none());
         assert_eq!(combined.skills.len(), 0);
+    }
+
+    // ========================================================================
+    // v2.23: from_env + summary_generator 注入测试
+    // ========================================================================
+
+    /// 验证 build_summary_generator_from_env 环境变量驱动行为
+    ///
+    /// 合并为单个测试避免并行竞争（std::env 是进程级全局状态）。
+    #[test]
+    fn test_build_summary_generator_from_env() {
+        // 1. 清理环境变量，验证无配置时返回 None
+        std::env::remove_var("HIPPOCAMPUS_GENERATOR_API_URL");
+        std::env::remove_var("HIPPOCAMPUS_GENERATOR_API_KEY");
+        assert!(
+            build_summary_generator_from_env().is_none(),
+            "未配置 API_URL/API_KEY 时应返回 None"
+        );
+
+        // 2. 配置环境变量后验证返回 Some（注意 from_env 要求 URL 和 KEY 都非空）
+        std::env::set_var("HIPPOCAMPUS_GENERATOR_API_URL", "https://api.openai.com/v1");
+        std::env::set_var("HIPPOCAMPUS_GENERATOR_API_KEY", "sk-test-key");
+        let gen = build_summary_generator_from_env();
+
+        // 清理环境变量（避免影响其他测试）
+        std::env::remove_var("HIPPOCAMPUS_GENERATOR_API_URL");
+        std::env::remove_var("HIPPOCAMPUS_GENERATOR_API_KEY");
+
+        assert!(gen.is_some(), "配置 API_URL + API_KEY 后应返回 Some");
+    }
+
+    /// 验证注入 summary_generator 后 archive 调用 LLM 生成摘要（Rust 侧验证）
+    ///
+    /// 此测试直接调用 Rust Archiver（不经过 PyO3），验证 summary_generator 字段能正常注入。
+    /// Python 侧行为由 PyO3 桥接，逻辑等价。
+    #[tokio::test]
+    async fn test_archive_with_summary_generator_injection() {
+        use hippocampus_core::archive::Archiver;
+        use hippocampus_core::generate::SummaryGenerator;
+        use hippocampus_core::model::{MemoryFile, Summary};
+        use tempfile::TempDir;
+
+        // Mock 摘要生成器
+        struct MockGen;
+        #[async_trait::async_trait]
+        impl SummaryGenerator for MockGen {
+            async fn generate_summary(&self, _file: &MemoryFile) -> hippocampus_core::Result<Summary> {
+                Ok(Summary {
+                    title: "Python 绑定 LLM 摘要".into(),
+                    abstract_text: Some("Mock 摘要".into()),
+                    key_facts: vec!["事实".into()],
+                    key_entities: vec!["实体".into()],
+                    clue_anchors: Vec::new(),
+                })
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+        let gen: Arc<dyn SummaryGenerator> = Arc::new(MockGen);
+
+        let mut archiver = Archiver::new(
+            ArchiveConfig::default(),
+            storage,
+            "sess-py-test",
+            None,
+        )
+        .with_summary_generator(gen);
+
+        // 推入一个 turn
+        use hippocampus_core::model::{MessageContent, MessageTurn, Tag};
+        use chrono::Utc;
+        use uuid::Uuid;
+        archiver.push_turn(MessageTurn {
+            id: Uuid::new_v4(),
+            user_message: MessageContent {
+                text: Some("测试消息".into()),
+                attachments: Vec::new(),
+                tool_calls: Vec::new(),
+                thinking: None,
+            },
+            llm_message: MessageContent {
+                text: Some("回复".into()),
+                attachments: Vec::new(),
+                tool_calls: Vec::new(),
+                thinking: None,
+            },
+            tags: vec![Tag::Text],
+            timestamp: Utc::now(),
+            token_count: 10,
+        });
+
+        let (_, hook) = archiver.archive().await.unwrap();
+
+        // 验证 LLM 摘要被注入
+        assert_eq!(hook.summary.title, "Python 绑定 LLM 摘要");
+        assert_eq!(hook.summary.abstract_text.as_deref(), Some("Mock 摘要"));
     }
 }

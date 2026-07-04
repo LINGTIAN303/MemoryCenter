@@ -23,6 +23,8 @@ hippocampus-core = { path = "../hippocampus-core", version = "0.1.0" }
 hippocampus-presets = { path = "../hippocampus-presets", version = "0.1.0" }
 hippocampus-agents = { path = "../hippocampus-agents", version = "0.1.0" }
 hippocampus-scenarios = { path = "../hippocampus-scenarios", version = "0.1.0" }
+# v2.23：from_env() 类方法注入 LLM 摘要生成器
+hippocampus-llm = { path = "../hippocampus-llm", version = "0.1.0" }
 # PyO3 Python 绑定框架（extension-module feature 避免 Mac 上链接 libpython）
 pyo3.workspace = true
 # FFI 内部需要独立 tokio runtime 来 block_on 异步 Core 方法
@@ -32,3 +34,7 @@ serde = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.0"
+async-trait = "0.1"
+chrono = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
