@@ -41,6 +41,8 @@ pub mod cache;
 /// 记忆冲突检测（ConflictDetector trait + NoopDetector）
 pub mod conflict;
 pub mod compact;
+/// LLM 生成器 trait（AnchorGenerator / SummaryGenerator，v2.16 IMP-05/10）
+pub mod generate;
 /// 混合检索器（HybridRetriever + RRF 融合 + 降级策略）
 pub mod hybrid;
 /// 启发式冲突检测器（HeuristicDetector，反义词词典 + 三维度检测）

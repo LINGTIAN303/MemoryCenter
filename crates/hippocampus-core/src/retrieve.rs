@@ -357,7 +357,7 @@ impl Retriever {
     /// - `query` 为空时退化为 [`Retriever::render_to_system_prompt`]（按时间排序）
     /// - 相关性分数为 0 的钩子仍会展示（排在末尾），保证 LLM 能看到全部可用记忆
     pub async fn render_to_system_prompt_with_query(&self, query: &str) -> crate::Result<String> {
-        let mut summaries = self.get_summaries().await?;
+        let summaries = self.get_summaries().await?;
 
         if summaries.is_empty() {
             return Ok(String::new());

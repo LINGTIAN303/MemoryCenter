@@ -29,7 +29,7 @@
 //! 构造时绑定 session_id 和 project_id，全封装周期任务。
 
 use crate::model::{ArchivePeriod, IndexDocument, MemoryFile, MessageTurn, Summary, Tag};
-use crate::score::Scorer;
+use crate::score::{AsyncScorer, Scorer};
 use crate::storage::Storage;
 use std::sync::Arc;
 
@@ -49,7 +49,7 @@ const CHITCHAT_PATTERNS: &[&str] = &[
 pub struct Compactor {
     /// 存储后端
     storage: Arc<dyn Storage>,
-    /// 评分器（月级淘汰用）
+    /// 评分器（月级淘汰用，同步启发式）
     scorer: Box<dyn Scorer>,
     /// 会话 ID
     session_id: String,
@@ -60,6 +60,12 @@ pub struct Compactor {
     /// 为空时使用内置 `CHITCHAT_PATTERNS`，非空时与内置词典合并匹配。
     /// 通过 [`Compactor::with_chitchat_patterns`] 注入。
     chitchat_patterns: Vec<String>,
+    /// 异步评分器（v2.16 IMP-03：可选 LLM 评分注入）
+    ///
+    /// 注入后在 `monthly_evict` 中优先使用，支持 LLM topic_relevance 维度。
+    /// 为 None 时退化为同步 `scorer`（纯启发式 3 维）。
+    /// 推荐注入 [`crate::score::HybridScorer`] 以组合启发式 + LLM 评分。
+    async_scorer: Option<Arc<dyn AsyncScorer>>,
 }
 
 /// 寒暄判定核心逻辑（自由函数，供测试直接调用）
@@ -134,6 +140,7 @@ impl Compactor {
             session_id: session_id.into(),
             project_id,
             chitchat_patterns: Vec::new(),
+            async_scorer: None,
         }
     }
 
@@ -150,6 +157,26 @@ impl Compactor {
     /// ```
     pub fn with_chitchat_patterns(mut self, patterns: Vec<String>) -> Self {
         self.chitchat_patterns = patterns;
+        self
+    }
+
+    /// 注入异步评分器（v2.16 IMP-03）
+    ///
+    /// 注入后 `monthly_evict` 将优先使用此异步评分器（支持 LLM topic_relevance 维度）。
+    /// 异步评分失败时降级为同步启发式评分。
+    ///
+    /// 推荐注入 [`crate::score::HybridScorer`] 以组合启发式 3 维 + LLM 1 维评分。
+    ///
+    /// # 示例
+    ///
+    /// ```ignore
+    /// use hippocampus_core::score::{HybridScorer, ScoreWeights};
+    /// let hybrid = HybridScorer::new(Box::new(http_llm_scorer), ScoreWeights::default());
+    /// let compactor = Compactor::new(storage, scorer, "sess", None)
+    ///     .with_async_scorer(Arc::new(hybrid));
+    /// ```
+    pub fn with_async_scorer(mut self, scorer: Arc<dyn AsyncScorer>) -> Self {
+        self.async_scorer = Some(scorer);
         self
     }
 
@@ -343,13 +370,26 @@ impl Compactor {
         }
 
         // 评分并按分数从高到低排序
-        let mut scored: Vec<(MemoryFile, f64)> = weekly_files
-            .into_iter()
-            .map(|f| {
-                let score = self.scorer.score(&f);
-                (f, score)
-            })
-            .collect();
+        // v2.16 IMP-03：若注入了 async_scorer，优先使用异步评分（支持 LLM topic_relevance 维）
+        let mut scored: Vec<(MemoryFile, f64)> = Vec::with_capacity(weekly_files.len());
+        for f in weekly_files {
+            let score = if let Some(async_scorer) = &self.async_scorer {
+                match async_scorer.score(&f).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            memory_id = %f.id,
+                            "异步评分失败，降级为同步启发式评分"
+                        );
+                        self.scorer.score(&f)
+                    }
+                }
+            } else {
+                self.scorer.score(&f)
+            };
+            scored.push((f, score));
+        }
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         tracing::info!(
