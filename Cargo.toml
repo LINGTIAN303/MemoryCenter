@@ -11,6 +11,7 @@ members = [
     "crates/hippocampus-windows",
     "crates/hippocampus-agents",
     "crates/hippocampus-skills",
+    "crates/hippocampus-presets",
     "crates/hippocampus-ffi",
     "crates/hippocampus-llm",
     "crates/hippocampus-search",

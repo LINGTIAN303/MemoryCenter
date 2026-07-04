@@ -1,0 +1,473 @@
+//! # PresetBuilder（预设构造器 + 叠加引擎）
+//!
+//! 链式收集 5 个可选 Profile + 用户覆盖参数，调用 [`build`](PresetBuilder::build)
+//! 时应用联动机制 + 优先级链，生成 [`CombinedProfile`]。
+
+use crate::combined::{CombinedProfile, DEFAULT_ARCHIVE_THRESHOLD, DEFAULT_SUMMARY_TEMPLATE};
+use crate::linkage::{derive_window_from_agent, should_derive_window};
+use hippocampus_agents::AgentProfile;
+use hippocampus_models::ModelVariant;
+use hippocampus_scenarios::ScenarioProfile;
+use hippocampus_skills::SkillProfile;
+use hippocampus_windows::WindowProfile;
+
+/// 预设构造器错误
+#[derive(Debug, thiserror::Error)]
+pub enum PresetError {
+    /// Profile 校验失败
+    #[error("{0} 校验失败: {1}")]
+    ValidateFailed(&'static str, String),
+}
+
+/// 预设构造器
+///
+/// ## 使用示例
+///
+/// ```rust,ignore
+/// use hippocampus_presets::PresetBuilder;
+/// use hippocampus_agents::AgentProfile;
+/// use hippocampus_scenarios::{ScenarioProfile, Scenario};
+///
+/// let combined = PresetBuilder::new()
+///     .with_agent(AgentProfile::claude_code())
+///     .with_scenario(ScenarioProfile::from_scenario(Scenario::Coding))
+///     .with_user_archive_threshold(450_000)  // 用户覆盖
+///     .build()
+///     .unwrap();
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct PresetBuilder {
+    /// 模型型号（可选）
+    model: Option<ModelVariant>,
+    /// 场景配置（可选）
+    scenario: Option<ScenarioProfile>,
+    /// 窗口配置（可选，未设置时由 Agent 联动推导）
+    window: Option<WindowProfile>,
+    /// Agent 配置（可选）
+    agent: Option<AgentProfile>,
+    /// 技能列表（可为空）
+    skills: Vec<SkillProfile>,
+    /// 用户覆盖：归档阈值
+    user_archive_threshold: Option<usize>,
+    /// 用户覆盖：摘要模板
+    user_summary_template: Option<String>,
+}
+
+impl PresetBuilder {
+    /// 创建空的构造器
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 设置模型型号
+    pub fn with_model(mut self, model: ModelVariant) -> Self {
+        self.model = Some(model);
+        self
+    }
+
+    /// 设置场景配置
+    pub fn with_scenario(mut self, scenario: ScenarioProfile) -> Self {
+        self.scenario = Some(scenario);
+        self
+    }
+
+    /// 设置窗口配置（显式设置后不触发 Agent → Window 联动）
+    pub fn with_window(mut self, window: WindowProfile) -> Self {
+        self.window = Some(window);
+        self
+    }
+
+    /// 设置 Agent 配置
+    pub fn with_agent(mut self, agent: AgentProfile) -> Self {
+        self.agent = Some(agent);
+        self
+    }
+
+    /// 添加技能（可链式调用多次）
+    pub fn with_skill(mut self, skill: SkillProfile) -> Self {
+        self.skills.push(skill);
+        self
+    }
+
+    /// 批量设置技能（覆盖原有列表）
+    pub fn with_skills(mut self, skills: Vec<SkillProfile>) -> Self {
+        self.skills = skills;
+        self
+    }
+
+    /// 用户覆盖：归档阈值（最高优先级）
+    pub fn with_user_archive_threshold(mut self, threshold: usize) -> Self {
+        self.user_archive_threshold = Some(threshold);
+        self
+    }
+
+    /// 用户覆盖：摘要模板（最高优先级）
+    ///
+    /// 模板需包含 `{conversation}` 占位符
+    pub fn with_user_summary_template(mut self, template: impl Into<String>) -> Self {
+        self.user_summary_template = Some(template.into());
+        self
+    }
+
+    /// 构建最终配置
+    ///
+    /// ## 执行顺序
+    ///
+    /// 1. 校验所有已设置的 Profile
+    /// 2. 联动推导：若 Agent 已设置但 Window 未设置，从 Agent 推导 Window
+    /// 3. 解析归档阈值（优先级：用户 > scenario > model > 默认）
+    /// 4. 解析摘要模板（优先级：用户 > scenario.custom > scenario 预设 > 默认）
+    /// 5. 解析 session_prefix（来自 Agent）
+    /// 6. 解析 archive_to_hippocampus（Agent 和 Window 任一禁用则不归档）
+    pub fn build(self) -> Result<CombinedProfile, PresetError> {
+        // 1. 校验所有 Profile
+        if let Some(s) = &self.scenario {
+            s.validate()
+                .map_err(|e| PresetError::ValidateFailed("scenario", e))?;
+        }
+        if let Some(w) = &self.window {
+            w.validate()
+                .map_err(|e| PresetError::ValidateFailed("window", e))?;
+        }
+        if let Some(a) = &self.agent {
+            a.validate()
+                .map_err(|e| PresetError::ValidateFailed("agent", e))?;
+        }
+        for s in &self.skills {
+            s.validate()
+                .map_err(|e| PresetError::ValidateFailed("skill", e))?;
+        }
+
+        // 2. 联动推导：Agent → Window
+        let resolved_window = if should_derive_window(self.agent.as_ref(), self.window.as_ref()) {
+            let agent = self.agent.as_ref().expect("agent 已确认存在");
+            let derived = derive_window_from_agent(agent);
+            tracing::debug!(
+                agent = %agent.family,
+                derived_scheme = ?derived_window_scheme(&derived),
+                "联动推导 Window"
+            );
+            Some(derived)
+        } else {
+            self.window.clone()
+        };
+
+        // 3. 解析归档阈值（用户 > scenario > model > 默认）
+        let archive_threshold = self
+            .user_archive_threshold
+            .or_else(|| self.scenario.as_ref().map(|s| s.archive_threshold))
+            .or_else(|| self.model.as_ref().map(|m| m.archive_strategy.threshold()))
+            .unwrap_or(DEFAULT_ARCHIVE_THRESHOLD);
+
+        // 4. 解析摘要模板（用户 > scenario > 默认）
+        let summary_template = self
+            .user_summary_template
+            .clone()
+            .or_else(|| {
+                self.scenario
+                    .as_ref()
+                    .map(|s| s.summary_template())
+            })
+            .unwrap_or_else(|| DEFAULT_SUMMARY_TEMPLATE.to_string());
+
+        // 5. 解析 session_prefix（来自 Agent）
+        let session_prefix = self
+            .agent
+            .as_ref()
+            .map(|a| a.session_prefix.clone());
+
+        // 6. 解析 archive_to_hippocampus（Agent 和 Window 任一禁用则不归档）
+        let archive_to_hippocampus = {
+            let agent_flag = self
+                .agent
+                .as_ref()
+                .map(|a| a.archive_to_hippocampus)
+                .unwrap_or(true);
+            let window_flag = resolved_window
+                .as_ref()
+                .map(|w| w.archive_to_hippocampus)
+                .unwrap_or(true);
+            agent_flag && window_flag
+        };
+
+        Ok(CombinedProfile::new(
+            self.model,
+            self.scenario,
+            resolved_window,
+            self.agent,
+            self.skills,
+            archive_threshold,
+            summary_template,
+            session_prefix,
+            archive_to_hippocampus,
+        ))
+    }
+}
+
+/// 辅助函数：获取 WindowProfile 的 scheme 字符串（用于日志）
+fn derived_window_scheme(w: &WindowProfile) -> String {
+    format!("{:?}", w.scheme)
+}
+
+// ============================================================================
+// 单元测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hippocampus_agents::{AgentFamily, AgentProfile};
+    use hippocampus_scenarios::{Scenario, ScenarioProfile};
+    use hippocampus_skills::{BuiltinSkill, SkillProfile};
+
+    #[test]
+    fn test_empty_builder_uses_defaults() {
+        let combined = PresetBuilder::new().build().unwrap();
+        assert_eq!(combined.archive_threshold(), DEFAULT_ARCHIVE_THRESHOLD);
+        assert_eq!(combined.summary_template(), DEFAULT_SUMMARY_TEMPLATE);
+        assert!(combined.session_prefix().is_none());
+        assert!(combined.archive_to_hippocampus());
+    }
+
+    #[test]
+    fn test_agent_only_triggers_window_linkage() {
+        let combined = PresetBuilder::new()
+            .with_agent(AgentProfile::claude_code())
+            .build()
+            .unwrap();
+
+        // 联动推导：ClaudeCode → claude_code() window（180K）
+        assert!(combined.window.is_some());
+        assert_eq!(combined.window.as_ref().unwrap().trigger_threshold, 180_000);
+        // session_prefix 来自 Agent
+        assert_eq!(combined.session_prefix(), Some("claude-code"));
+    }
+
+    #[test]
+    fn test_explicit_window_overrides_linkage() {
+        let custom_window = WindowProfile::default(); // GenericSliding, 100K
+        let combined = PresetBuilder::new()
+            .with_agent(AgentProfile::claude_code())
+            .with_window(custom_window)
+            .build()
+            .unwrap();
+
+        // 显式设置的 Window 优先，不触发联动（100K 而非 ClaudeCode 的 180K）
+        assert_eq!(combined.window.as_ref().unwrap().trigger_threshold, 100_000);
+    }
+
+    #[test]
+    fn test_scenario_archive_threshold() {
+        let combined = PresetBuilder::new()
+            .with_scenario(ScenarioProfile::from_scenario(Scenario::Coding))
+            .build()
+            .unwrap();
+
+        // Coding 场景默认 500K
+        assert_eq!(combined.archive_threshold(), 500_000);
+    }
+
+    #[test]
+    fn test_user_archive_threshold_overrides_scenario() {
+        let combined = PresetBuilder::new()
+            .with_scenario(ScenarioProfile::from_scenario(Scenario::Coding))
+            .with_user_archive_threshold(450_000)
+            .build()
+            .unwrap();
+
+        // 用户覆盖优先
+        assert_eq!(combined.archive_threshold(), 450_000);
+    }
+
+    #[test]
+    fn test_model_archive_threshold() {
+        use hippocampus_models::variant::ArchiveStrategy;
+
+        let mut model = ModelVariant::claude_opus_4_6();
+        model.archive_strategy = ArchiveStrategy::LargeWindow { threshold: 600_000 };
+
+        let combined = PresetBuilder::new()
+            .with_model(model)
+            .build()
+            .unwrap();
+
+        // 来自 model.archive_strategy.threshold()
+        assert_eq!(combined.archive_threshold(), 600_000);
+    }
+
+    #[test]
+    fn test_priority_user_over_scenario_over_model() {
+        use hippocampus_models::variant::ArchiveStrategy;
+
+        let mut model = ModelVariant::claude_opus_4_6();
+        model.archive_strategy = ArchiveStrategy::LargeWindow { threshold: 600_000 };
+
+        let combined = PresetBuilder::new()
+            .with_model(model)
+            .with_scenario(ScenarioProfile::from_scenario(Scenario::Coding)) // 500K
+            .with_user_archive_threshold(300_000) // 用户最高优先
+            .build()
+            .unwrap();
+
+        assert_eq!(combined.archive_threshold(), 300_000);
+    }
+
+    #[test]
+    fn test_scenario_over_model() {
+        use hippocampus_models::variant::ArchiveStrategy;
+
+        let mut model = ModelVariant::claude_opus_4_6();
+        model.archive_strategy = ArchiveStrategy::LargeWindow { threshold: 600_000 };
+
+        let combined = PresetBuilder::new()
+            .with_model(model) // 600K
+            .with_scenario(ScenarioProfile::from_scenario(Scenario::Coding)) // 500K
+            .build()
+            .unwrap();
+
+        // scenario 优先于 model
+        assert_eq!(combined.archive_threshold(), 500_000);
+    }
+
+    #[test]
+    fn test_summary_template_user_override() {
+        let combined = PresetBuilder::new()
+            .with_scenario(ScenarioProfile::from_scenario(Scenario::Coding))
+            .with_user_summary_template("custom {conversation}")
+            .build()
+            .unwrap();
+
+        assert_eq!(combined.summary_template(), "custom {conversation}");
+    }
+
+    #[test]
+    fn test_summary_template_from_scenario() {
+        let combined = PresetBuilder::new()
+            .with_scenario(ScenarioProfile::from_scenario(Scenario::Coding))
+            .build()
+            .unwrap();
+
+        // 来自 scenario 的 SummaryFocus 预设
+        let template = combined.summary_template();
+        assert!(template.contains("{conversation}"));
+        assert!(template.contains("title"));
+    }
+
+    #[test]
+    fn test_summary_template_default_when_no_scenario() {
+        let combined = PresetBuilder::new().build().unwrap();
+        assert_eq!(combined.summary_template(), DEFAULT_SUMMARY_TEMPLATE);
+    }
+
+    #[test]
+    fn test_archive_disabled_by_agent() {
+        let combined = PresetBuilder::new()
+            .with_agent(AgentProfile::claude_code().with_archive_disabled())
+            .build()
+            .unwrap();
+
+        assert!(!combined.archive_to_hippocampus());
+    }
+
+    #[test]
+    fn test_archive_disabled_by_window() {
+        let window = WindowProfile::default().with_archive_to_hippocampus(false);
+        let combined = PresetBuilder::new()
+            .with_window(window)
+            .build()
+            .unwrap();
+
+        assert!(!combined.archive_to_hippocampus());
+    }
+
+    #[test]
+    fn test_archive_enabled_when_both_default() {
+        let combined = PresetBuilder::new()
+            .with_agent(AgentProfile::cursor())
+            .build()
+            .unwrap();
+
+        assert!(combined.archive_to_hippocampus());
+    }
+
+    #[test]
+    fn test_skills_collected() {
+        let combined = PresetBuilder::new()
+            .with_skill(SkillProfile::new(BuiltinSkill::Read))
+            .with_skill(SkillProfile::new(BuiltinSkill::Bash).with_disabled())
+            .build()
+            .unwrap();
+
+        assert_eq!(combined.skills.len(), 2);
+        assert!(combined.is_skill_enabled("读取文件"));
+        assert!(!combined.is_skill_enabled("执行命令"));
+    }
+
+    #[test]
+    fn test_all_builtin_agents_build_success() {
+        for family in AgentFamily::all_builtin() {
+            let agent = AgentProfile::from_family(family);
+            let combined = PresetBuilder::new()
+                .with_agent(agent)
+                .build()
+                .unwrap();
+            assert!(combined.window.is_some(), "Agent 未触发 Window 联动");
+        }
+    }
+
+    #[test]
+    fn test_full_preset() {
+        let combined = PresetBuilder::new()
+            .with_model(ModelVariant::claude_opus_4_6())
+            .with_scenario(ScenarioProfile::from_scenario(Scenario::Coding))
+            .with_agent(AgentProfile::claude_code())
+            .with_skill(SkillProfile::new(BuiltinSkill::Read))
+            .with_user_archive_threshold(450_000)
+            .build()
+            .unwrap();
+
+        assert_eq!(combined.archive_threshold(), 450_000);
+        assert!(combined.window.is_some());
+        assert!(combined.agent.is_some());
+        assert!(combined.model.is_some());
+        assert!(combined.scenario.is_some());
+        assert_eq!(combined.skills.len(), 1);
+        assert_eq!(combined.session_prefix(), Some("claude-code"));
+    }
+
+    #[test]
+    fn test_invalid_scenario_returns_error() {
+        use hippocampus_scenarios::{RetrievalStrategy, ScoreWeights};
+
+        let mut bad_scenario = ScenarioProfile::from_scenario(Scenario::Coding);
+        // 构造非法权重（和不为 1.0）
+        bad_scenario.score_weights = ScoreWeights {
+            recency: 0.1,
+            access_frequency: 0.1,
+            topic_relevance: 0.1,
+            user_marked: 0.1,
+        };
+        bad_scenario.retrieval_strategy = RetrievalStrategy::Hybrid {
+            bm25_weight: 0.0,
+            semantic_weight: 0.0,
+        };
+
+        let result = PresetBuilder::new()
+            .with_scenario(bad_scenario)
+            .build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_builder_chain() {
+        let combined = PresetBuilder::new()
+            .with_agent(AgentProfile::cursor().with_variant("1.45"))
+            .with_scenario(ScenarioProfile::from_scenario(Scenario::Writing))
+            .with_user_summary_template("writing template {conversation}")
+            .build()
+            .unwrap();
+
+        assert_eq!(combined.session_prefix(), Some("cursor"));
+        assert_eq!(combined.summary_template(), "writing template {conversation}");
+    }
+}
