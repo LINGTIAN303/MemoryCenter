@@ -44,6 +44,19 @@
 //! - 未配置 `API_URL`：使用启发式 `Summary::from_title`（首条消息前 80 字符）
 //! - 配置完整：使用 `HttpSummaryGenerator`（LLM 生成 title + abstract + key_facts + key_entities）
 //! - LLM 调用失败：降级为启发式，归档主流程不中断
+//!
+//! ## API Key 鉴权配置（v2.24）
+//!
+//! | 环境变量 | 说明 | 默认值 |
+//! |---------|------|--------|
+//! | `HIPPOCAMPUS_API_KEY` | API Key（客户端需在 `Authorization: Bearer <key>` 头携带） | 空（不鉴权） |
+//!
+//! - **未配置**：所有请求无鉴权放行（向后兼容，本地开发零配置）
+//! - **已配置**：所有请求必须携带正确的 `Authorization: Bearer <key>` 头
+//! - 错误响应：
+//!   - 未携带 Authorization 头 → `401 {"error":{"code":"UNAUTHORIZED"}}`
+//!   - API Key 不匹配 → `403 {"error":{"code":"FORBIDDEN"}}`
+//! - 安全特性：常量时间比对（避免时序侧信道攻击）
 
 use hippocampus_server::{create_router, AppState, Config};
 use std::sync::Arc;
@@ -204,6 +217,14 @@ async fn main() {
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("Hippocampus HTTP 服务启动于 http://{}", addr);
     tracing::info!("存储根目录: {:?}", config.storage_root);
+    // v2.24：API Key 鉴权状态日志
+    if hippocampus_server::middleware::auth::configured_api_key().is_some() {
+        tracing::info!("API Key 鉴权：已启用（环境变量 HIPPOCAMPUS_API_KEY 已配置）");
+    } else {
+        tracing::warn!(
+            "API Key 鉴权：未启用（未配置 HIPPOCAMPUS_API_KEY，所有请求将无鉴权放行）"
+        );
+    }
     tracing::info!("API 端点:");
     tracing::info!("  POST   /api/v1/sessions/{{sid}}/archive");
     tracing::info!("  GET    /api/v1/sessions/{{sid}}/memories/{{hook_id}}");

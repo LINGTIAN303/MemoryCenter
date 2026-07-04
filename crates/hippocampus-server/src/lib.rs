@@ -21,6 +21,7 @@
 
 mod error;
 mod handlers;
+pub mod middleware;
 
 // v2.18 批次2：搜索模块下沉到 hippocampus-search crate
 // v2.5 批次 7: SearchIndexer（归档后自动索引）
@@ -115,7 +116,12 @@ impl Default for AppState {
 }
 
 /// 创建路由
+///
+/// v2.24：新增 API Key 鉴权中间件（环境变量 `HIPPOCAMPUS_API_KEY` 驱动）
+/// - 未配置：跳过鉴权（向后兼容，本地开发零配置）
+/// - 已配置：所有请求必须携带 `Authorization: Bearer <key>` 头
 pub fn create_router(state: AppState) -> axum::Router {
+    use axum::middleware as axum_mw;
     use axum::routing::{get, post};
 
     axum::Router::new()
@@ -163,6 +169,10 @@ pub fn create_router(state: AppState) -> axum::Router {
             "/api/v1/sessions/{sid}/memories/{hook_id}/conflicts",
             get(handlers::get_conflicts),
         )
+        // v2.24：API Key 鉴权中间件（对所有路由生效）
+        // 顺序：路由定义 → 鉴权中间件 → TraceLayer（在 main.rs 中添加）
+        // 注意：axum::middleware 与 crate::middleware 同名，用别名 axum_mw 消歧
+        .layer(axum_mw::from_fn(middleware::auth::require_api_key))
         .with_state(state)
 }
 

@@ -7,6 +7,39 @@
 ### 计划中
 - v2.4：WASM 组件（待生态成熟）+ Node/Go/Java 绑定
 
+### v2.24 - API Key 鉴权中间件 + 生产部署文档（2026-07-05）
+
+#### 新增
+- **API Key 鉴权中间件**（`crates/hippocampus-server/src/middleware/auth.rs`）
+  - 从 `Authorization: Bearer <key>` 头提取 API Key 比对
+  - 环境变量 `HIPPOCAMPUS_API_KEY` 驱动，未配置时跳过鉴权（向后兼容）
+  - 常量时间比对（避免时序侧信道攻击）
+  - 错误响应：401 UNAUTHORIZED / 403 FORBIDDEN
+  - 4 个单元测试（同值/异值/异长/空）
+- **部署文档**（`docs/DEPLOY.md`）
+  - 完整生产部署指南：编译 → systemd 守护 → Nginx 反代 → 验证
+  - 含故障排查、安全建议、运维操作、API 端点速查
+- **E2E 测试脚本**（`deploy/test_e2e.py`）
+  - 5 项端到端验证：归档/检索/摘要/Prompt 渲染/公网反代
+  - 支持命令行参数或环境变量传入 API Key
+- **Nginx 配置示例**（`deploy/nginx-hippocampus.conf` + `deploy/nginx-hippo-block.conf`）
+
+#### 变更
+- `lib.rs` create_router 应用 `middleware::from_fn(require_api_key)` 到所有路由
+- `main.rs` 启动时打印 API Key 鉴权状态（已启用/未启用警告）
+- 中间件模块独立成 `crates/hippocampus-server/src/middleware/`（遵循工程规范第 5 条）
+
+#### 测试
+- hippocampus-server：5 lib + 44 集成 = 49 测试全通过
+- 服务器 E2E：归档/检索/摘要/Prompt/公网反代 5 项 200 OK
+
+#### 部署验证
+- 服务器：162.211.183.236（openworld.dpdns.org）
+- 二进制：/opt/hippocampus-server/bin/hippocampus-server（9.2MB）
+- systemd：hippocampus-server.service（active running, Restart=always）
+- Nginx：`/hippo/` 子路径反代到 127.0.0.1:8765
+- 公网入口：https://openworld.dpdns.org/hippo/api/v1/...
+
 ### 型号库更新（2026-07-04 核查官方文档）
 
 #### 背景
