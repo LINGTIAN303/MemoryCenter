@@ -1,4 +1,4 @@
-//! # LLM 摘要生成器（v2.16 IMP-10）
+//! # LLM 摘要生成器（v2.16 IMP-10 / v2.20 模板优先级链）
 //!
 //! 基于 [`hippocampus_core::generate::SummaryGenerator`] trait 的 HTTP 实现，
 //! 通过调用外部 LLM API 为记忆文件生成结构化 [`Summary`]。
@@ -15,7 +15,19 @@
 //! 3. 解析 LLM 返回的 JSON 结构化摘要
 //! 4. 失败时降级返回启发式 `Summary::from_title`（不影响主流程）
 //!
-//! ## Prompt 策略
+//! ## Prompt 策略（v2.20 模板优先级链）
+//!
+//! 支持通过 [`with_summary_template`](HttpSummaryGenerator::with_summary_template)
+//! 注入自定义摘要模板，模板中的 `{conversation}` 占位符会被替换为实际对话内容。
+//!
+//! 优先级链（由调用方解析，本生成器只接收最终模板）：
+//!
+//! ```text
+//! 用户 custom > ScenarioProfile.custom_summary_template > SummaryFocus 预设 > 默认硬编码
+//! ```
+//!
+//! - **注入模板**：替换 `{conversation}` 后作为 prompt 发送
+//! - **未注入**：使用默认硬编码 prompt（向后兼容）
 //!
 //! 要求 LLM 以严格 JSON 格式返回：
 //!
@@ -63,11 +75,22 @@ struct LlmSummary {
 /// - 未配置 API URL：降级为 `Summary::from_title`（启发式）
 /// - 网络错误 / API 错误：降级为 `Summary::from_title`
 /// - JSON 解析失败：降级为 `Summary::from_title`
+///
+/// ## 模板优先级链（v2.20）
+///
+/// 通过 [`with_summary_template`](Self::with_summary_template) 注入自定义模板，
+/// 模板中的 `{conversation}` 占位符会被替换为实际对话内容。
+/// 未注入时使用默认硬编码 prompt（向后兼容）。
 pub struct HttpSummaryGenerator {
     /// 配置
     config: LlmGeneratorConfig,
     /// HTTP 客户端
     client: reqwest::Client,
+    /// 自定义摘要模板（含 `{conversation}` 占位符）
+    ///
+    /// 由调用方（hippocampus-server / mcp）通过 CombinedProfile 解析后注入。
+    /// None 时使用默认硬编码 prompt。
+    summary_template: Option<String>,
 }
 
 impl HttpSummaryGenerator {
@@ -77,7 +100,28 @@ impl HttpSummaryGenerator {
             .timeout(Duration::from_secs(config.timeout_secs))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { config, client }
+        Self {
+            config,
+            client,
+            summary_template: None,
+        }
+    }
+
+    /// 注入自定义摘要模板（v2.20 模板优先级链）
+    ///
+    /// 模板需包含 `{conversation}` 占位符，该占位符会被替换为实际对话内容。
+    ///
+    /// ## 优先级链（由调用方解析）
+    ///
+    /// ```text
+    /// 用户 custom > ScenarioProfile.custom_summary_template > SummaryFocus 预设 > 默认硬编码
+    /// ```
+    ///
+    /// 调用方（hippocampus-server / mcp）通过 `CombinedProfile::summary_template()`
+    /// 获取最终模板后注入本生成器。
+    pub fn with_summary_template(mut self, template: impl Into<String>) -> Self {
+        self.summary_template = Some(template.into());
+        self
     }
 
     /// 从 MemoryFile 提取对话内容（用于构造 Prompt）
@@ -106,8 +150,17 @@ impl HttpSummaryGenerator {
     }
 
     /// 构造摘要生成 Prompt
+    ///
+    /// 优先级：注入的 summary_template > 默认硬编码
     fn build_prompt(&self, file: &MemoryFile) -> String {
         let conversation = Self::extract_conversation(file);
+
+        if let Some(template) = &self.summary_template {
+            // 注入模板：替换 {conversation} 占位符
+            return template.replace("{conversation}", &conversation);
+        }
+
+        // 默认硬编码 prompt（向后兼容）
         format!(
             r#"你是一个记忆摘要生成器。请为以下对话生成结构化摘要。
 
@@ -267,6 +320,37 @@ mod tests {
         assert!(prompt.contains("abstract"));
         assert!(prompt.contains("key_facts"));
         assert!(prompt.contains("JSON"));
+    }
+
+    #[test]
+    fn test_build_prompt_with_template() {
+        // 注入自定义模板后，应使用模板而非默认 prompt
+        let config = LlmGeneratorConfig::default();
+        let gen = HttpSummaryGenerator::new(config)
+            .with_summary_template("请为以下对话生成摘要：{conversation}（要求 JSON 格式）");
+        let file = make_memory();
+        let prompt = gen.build_prompt(&file);
+        // 模板前缀存在
+        assert!(prompt.starts_with("请为以下对话生成摘要："));
+        // {conversation} 占位符已被替换为实际对话内容
+        assert!(prompt.contains("用户[1]:"));
+        assert!(prompt.contains("助手[1]:"));
+        assert!(prompt.contains("Rust 记忆库"));
+        // 不应包含默认 prompt 的特征词
+        assert!(!prompt.contains("你是一个记忆摘要生成器"));
+        // 占位符已被替换（不应再出现 {conversation}）
+        assert!(!prompt.contains("{conversation}"));
+    }
+
+    #[test]
+    fn test_build_prompt_template_without_placeholder() {
+        // 模板不含 {conversation} 占位符时，原样返回（不追加对话内容）
+        let config = LlmGeneratorConfig::default();
+        let gen = HttpSummaryGenerator::new(config)
+            .with_summary_template("固定 prompt，无占位符");
+        let file = make_memory();
+        let prompt = gen.build_prompt(&file);
+        assert_eq!(prompt, "固定 prompt，无占位符");
     }
 
     #[test]
