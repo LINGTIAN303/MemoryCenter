@@ -83,6 +83,88 @@ impl From<&IndexHook> for SummaryView {
     }
 }
 
+// ========================================================================
+// v2.16 批次 1：IMP-06 + IMP-07 相关性评分辅助函数
+// ========================================================================
+
+/// 计算摘要视图与查询词的相关性分数
+///
+/// `terms` 为已小写化的查询词列表（按空白拆分）。函数对每个 term 在摘要的
+/// 各字段中做大小写不敏感子串匹配，命中则加权累加。
+///
+/// 权重设计（与字段信息密度成正比）：
+/// - `summary_title`：3（标题最浓缩）
+/// - `tags`：2（人工/启发式标注，语义性强）
+/// - `key_entities`：2（实体名高辨识度）
+/// - `clue_anchors`：2（检索锚点，专为匹配设计）
+/// - `key_facts`：1（事实陈述，可能较长，子串命中权重略低）
+/// - `abstract_text`：1（摘要文本，同上）
+///
+/// 返回所有 term 在所有字段命中后的加权总分。`terms` 为空返回 0。
+fn relevance_score(summary: &SummaryView, terms: &[String]) -> usize {
+    if terms.is_empty() {
+        return 0;
+    }
+
+    let mut score = 0usize;
+
+    // 预处理各字段为小写，避免重复分配
+    let title_lower = summary.summary_title.to_lowercase();
+    let abs_lower = summary
+        .abstract_text
+        .as_ref()
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    let tags_lower: Vec<String> = summary.tags.iter().map(|t| t.to_lowercase()).collect();
+    let entities_lower: Vec<String> =
+        summary.key_entities.iter().map(|e| e.to_lowercase()).collect();
+    let facts_lower: Vec<String> = summary.key_facts.iter().map(|f| f.to_lowercase()).collect();
+    let anchors_lower: Vec<String> =
+        summary.clue_anchors.iter().map(|a| a.to_lowercase()).collect();
+
+    for term in terms {
+        // title（权重 3）
+        if title_lower.contains(term) {
+            score += 3;
+        }
+        // tags（权重 2，命中任一即可）
+        if tags_lower.iter().any(|t| t.contains(term)) {
+            score += 2;
+        }
+        // key_entities（权重 2）
+        if entities_lower.iter().any(|e| e.contains(term)) {
+            score += 2;
+        }
+        // clue_anchors（权重 2）
+        if anchors_lower.iter().any(|a| a.contains(term)) {
+            score += 2;
+        }
+        // key_facts（权重 1）
+        if facts_lower.iter().any(|f| f.contains(term)) {
+            score += 1;
+        }
+        // abstract_text（权重 1）
+        if !abs_lower.is_empty() && abs_lower.contains(term) {
+            score += 1;
+        }
+    }
+
+    score
+}
+
+/// 周期层级排序辅助函数
+///
+/// 返回 daily=0, weekly=1, monthly=2，其他=3。
+/// 用于在相关性渲染中保持周期分组的自然顺序。
+fn period_order(period: &str) -> u8 {
+    match period {
+        "daily" => 0,
+        "weekly" => 1,
+        "monthly" => 2,
+        _ => 3,
+    }
+}
+
 /// 检索器
 ///
 /// 持有 [`Storage`] 引用，从存储实时读取索引文档和记忆文件。
@@ -239,12 +321,200 @@ impl Retriever {
         Ok(out)
     }
 
+    // ========================================================================
+    // v2.16 批次 1：IMP-06 + IMP-07 相关性检索
+    // ========================================================================
+
+    /// 按关键词预筛选钩子（IMP-06）
+    ///
+    /// 从所有周期的摘要视图中筛选出与 `keyword` 相关的钩子。
+    /// 匹配字段（大小写不敏感，子串匹配）：
+    /// - `summary_title`（权重 3）
+    /// - `tags`（权重 2）
+    /// - `key_entities`（权重 2）
+    /// - `clue_anchors`（权重 2）
+    /// - `key_facts`（权重 1）
+    /// - `abstract_text`（权重 1）
+    ///
+    /// 返回的钩子按相关性分数降序排列（同分按归档时间升序）。
+    /// 无匹配时返回空 Vec。
+    ///
+    /// ## 用途
+    ///
+    /// 供 LLM tool 调用前的预筛选：当钩子数量过多时，先用关键词缩小范围，
+    /// 再决定是否 retrieve 完整记忆文件。
+    pub async fn filter_hooks_by_keyword(&self, keyword: &str) -> crate::Result<Vec<SummaryView>> {
+        let summaries = self.get_summaries().await?;
+        let filtered = self.filter_and_sort_by_relevance(summaries, keyword);
+        Ok(filtered)
+    }
+
+    /// 渲染 system prompt（按查询相关性排序，IMP-07）
+    ///
+    /// 与 [`Retriever::render_to_system_prompt`] 行为一致，但每个周期内的钩子
+    /// 按 `query` 相关性降序排列，使 LLM 优先看到最相关的记忆。
+    ///
+    /// - `query` 为空时退化为 [`Retriever::render_to_system_prompt`]（按时间排序）
+    /// - 相关性分数为 0 的钩子仍会展示（排在末尾），保证 LLM 能看到全部可用记忆
+    pub async fn render_to_system_prompt_with_query(&self, query: &str) -> crate::Result<String> {
+        let mut summaries = self.get_summaries().await?;
+
+        if summaries.is_empty() {
+            return Ok(String::new());
+        }
+
+        // query 为空时退化为时间排序
+        if query.trim().is_empty() {
+            return self.render_to_system_prompt().await;
+        }
+
+        // 按周期分组，组内按相关性排序
+        // 先按 period 分组，每组内按 relevance_score 降序
+        let query_lower = query.to_lowercase();
+        let terms: Vec<String> = query_lower
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+
+        // 对每个 summary 计算分数并附加
+        let mut scored: Vec<(SummaryView, usize)> = summaries
+            .into_iter()
+            .map(|s| {
+                let score = relevance_score(&s, &terms);
+                (s, score)
+            })
+            .collect();
+
+        // 按 period 分组排序：先按 period 顺序（daily/weekly/monthly），组内按 score 降序，同分按时间升序
+        scored.sort_by(|a, b| {
+            let pa = period_order(&a.0.period);
+            let pb = period_order(&b.0.period);
+            pa.cmp(&pb)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.0.archived_at.cmp(&b.0.archived_at))
+        });
+
+        let mut out = String::from("# 可用记忆索引\n\n");
+        out.push_str("以下是可用的历史记忆摘要（按与查询的相关性排序）：\n\n");
+
+        const HIGH_VALUE_TAGS: &[&str] = &[
+            "工具调用",
+            "思考过程",
+            "代码块",
+            "文件附件",
+            "图片",
+            "视频",
+        ];
+
+        // 按 period 分组渲染
+        let mut current_period: Option<&str> = None;
+        for (s, score) in &scored {
+            // 检测 period 切换
+            if current_period != Some(&s.period) {
+                current_period = Some(&s.period);
+                let period_label = match s.period.as_str() {
+                    "daily" => "近期记忆",
+                    "weekly" => "周度记忆",
+                    "monthly" => "月度记忆",
+                    other => other,
+                };
+                out.push_str(&format!("## {}（{}）\n\n", period_label, s.period));
+            }
+
+            let tags_str = if s.tags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", s.tags.join(", "))
+            };
+            // 相关性标记：score > 0 时显示
+            let relevance_marker = if *score > 0 {
+                format!("（相关性: {}）", score)
+            } else {
+                String::new()
+            };
+            out.push_str(&format!(
+                "- **{}**{}{}（{} tokens, at {}）\n",
+                s.summary_title, tags_str, relevance_marker, s.token_count, s.archived_at
+            ));
+            out.push_str(&format!("  - 记忆 ID: `{}`\n", s.hook_id));
+
+            // 分级渲染策略（与 render_to_system_prompt 一致）
+            let should_expand = match s.period.as_str() {
+                "daily" => {
+                    s.tags.iter().any(|t| HIGH_VALUE_TAGS.contains(&t.as_str()))
+                        && !s.key_facts.is_empty()
+                }
+                "weekly" => s.is_rich,
+                "monthly" => true,
+                _ => false,
+            };
+
+            if should_expand {
+                if let Some(abs) = &s.abstract_text {
+                    out.push_str(&format!("  - 摘要：{}\n", abs));
+                }
+                if !s.key_facts.is_empty() {
+                    out.push_str("  - 关键事实：\n");
+                    for fact in &s.key_facts {
+                        out.push_str(&format!("    - {}\n", fact));
+                    }
+                }
+                if !s.key_entities.is_empty() {
+                    out.push_str(&format!("  - 关键实体：{}\n", s.key_entities.join(", ")));
+                }
+                if !s.clue_anchors.is_empty() {
+                    out.push_str(&format!("  - 线索锚点：{}\n", s.clue_anchors.join(", ")));
+                }
+            }
+        }
+        out.push('\n');
+
+        Ok(out)
+    }
+
+    /// 内部辅助：对摘要列表按关键词筛选并按相关性排序
+    ///
+    /// 返回相关性 > 0 的钩子，按分数降序（同分按时间升序）。
+    fn filter_and_sort_by_relevance(
+        &self,
+        summaries: Vec<SummaryView>,
+        keyword: &str,
+    ) -> Vec<SummaryView> {
+        if keyword.trim().is_empty() {
+            return summaries;
+        }
+
+        let keyword_lower = keyword.to_lowercase();
+        let terms: Vec<String> = keyword_lower
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+
+        let mut scored: Vec<(SummaryView, usize)> = summaries
+            .into_iter()
+            .map(|s| {
+                let score = relevance_score(&s, &terms);
+                (s, score)
+            })
+            .filter(|(_, score)| *score > 0)
+            .collect();
+
+        // 按分数降序，同分按时间升序
+        scored.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.archived_at.cmp(&b.0.archived_at))
+        });
+
+        scored.into_iter().map(|(s, _)| s).collect()
+    }
+
     /// 按钩子 ID 检索完整记忆文件（tool 调用入口）
     ///
     /// 流程：
     /// 1. 从所有周期的索引文档中查找对应 hook_id
     /// 2. 获取该钩子指向的 memory_id
     /// 3. 从 Storage 读取完整 MemoryFile
+    /// 4. v2.16（IMP-01）：异步自增 access_count（失败容忍，不影响主流程）
     pub async fn retrieve_memory(&self, hook_id: &str) -> crate::Result<MemoryFile> {
         // 在所有周期中查找钩子
         for period in ArchivePeriod::all() {
@@ -256,7 +526,20 @@ impl Retriever {
                 for hook in &doc.hooks {
                     if hook.id.to_string() == hook_id {
                         // 找到钩子，读取对应的记忆文件
-                        return self.storage.read_memory(&hook.memory_id).await;
+                        let memory = self.storage.read_memory(&hook.memory_id).await?;
+
+                        // v2.16 IMP-01：自增 access_count（失败容忍）
+                        // 错误仅记录日志，不影响 retrieve 主流程
+                        if let Err(e) = self.storage.update_access_count(&hook.memory_id).await {
+                            tracing::warn!(
+                                hook_id = %hook_id,
+                                memory_id = %hook.memory_id,
+                                error = %e,
+                                "access_count 自增失败（不影响 retrieve 主流程）"
+                            );
+                        }
+
+                        return Ok(memory);
                     }
                 }
             }
@@ -485,5 +768,226 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("话题 2"));
+    }
+
+    // ====================================================================
+    // v2.16 批次 1 测试：IMP-01 / IMP-06 / IMP-07
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_imp01_access_count_increments_on_retrieve() {
+        // IMP-01：retrieve 成功后 access_count 应自增
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+
+        let config = ArchiveConfig {
+            token_threshold: 100,
+            force_truncate_limit: 150,
+            wait_for_turn_completion: true,
+        };
+        let mut archiver = Archiver::new(config, storage.clone(), "sess-acc", None);
+        archiver.push_turn(make_turn("访问计数测试", 110));
+        let (_, hook) = archiver.archive().await.unwrap();
+
+        // retrieve 前：access_count 应为 0
+        let memory_id = hook.memory_id.clone();
+        let before = storage.read_memory(&memory_id).await.unwrap();
+        assert_eq!(before.access_count, 0);
+
+        // 执行 retrieve
+        let retriever = Retriever::new(storage.clone(), "sess-acc", None);
+        let _ = retriever
+            .retrieve_memory(&hook.id.to_string())
+            .await
+            .unwrap();
+
+        // retrieve 后：access_count 应为 1
+        let after = storage.read_memory(&memory_id).await.unwrap();
+        assert_eq!(after.access_count, 1);
+
+        // 再次 retrieve，access_count 应为 2
+        let _ = retriever
+            .retrieve_memory(&hook.id.to_string())
+            .await
+            .unwrap();
+        let after2 = storage.read_memory(&memory_id).await.unwrap();
+        assert_eq!(after2.access_count, 2);
+    }
+
+    #[test]
+    fn test_imp06_relevance_score_basic() {
+        // 直接测试相关性评分函数
+        let summary = SummaryView {
+            hook_id: "h1".into(),
+            memory_id: "m1".into(),
+            summary_title: "Rust 记忆库设计".into(),
+            abstract_text: Some("讨论了三级索引周期".into()),
+            key_facts: vec!["采用 daily/weekly/monthly 三级".into()],
+            key_entities: vec!["Rust".into(), "Hippocampus".into()],
+            clue_anchors: vec!["归档".into()],
+            tags: vec!["代码块".into(), "文本消息".into()],
+            archived_at: "2026-07-04T10:00:00Z".into(),
+            period: "daily".into(),
+            token_count: 100,
+            is_rich: true,
+        };
+
+        // "rust" 命中 title(3) + entities(2) = 5
+        let terms = vec!["rust".into()];
+        assert_eq!(relevance_score(&summary, &terms), 5);
+
+        // "记忆库" 命中 title(3) = 3
+        let terms = vec!["记忆库".into()];
+        assert_eq!(relevance_score(&summary, &terms), 3);
+
+        // "归档" 命中 clue_anchors(2) = 2
+        let terms = vec!["归档".into()];
+        assert_eq!(relevance_score(&summary, &terms), 2);
+
+        // "不存在词" 不命中 = 0
+        let terms = vec!["不存在词".into()];
+        assert_eq!(relevance_score(&summary, &terms), 0);
+
+        // 多词："rust 记忆库" = 5 + 3 = 8
+        let terms = vec!["rust".into(), "记忆库".into()];
+        assert_eq!(relevance_score(&summary, &terms), 8);
+
+        // 空词列表 = 0
+        let terms: Vec<String> = vec![];
+        assert_eq!(relevance_score(&summary, &terms), 0);
+    }
+
+    #[tokio::test]
+    async fn test_imp06_filter_hooks_by_keyword() {
+        // IMP-06：按关键词筛选钩子
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+
+        let config = ArchiveConfig {
+            token_threshold: 100,
+            force_truncate_limit: 150,
+            wait_for_turn_completion: true,
+        };
+        let mut archiver = Archiver::new(config, storage.clone(), "sess-filter", None);
+
+        // 归档 3 个不同主题的记忆
+        archiver.push_turn(make_turn("讨论 Rust 记忆库设计", 110));
+        archiver.archive().await.unwrap();
+
+        archiver.push_turn(make_turn("Vue 前端开发", 110));
+        archiver.archive().await.unwrap();
+
+        archiver.push_turn(make_turn("Rust 异步运行时", 110));
+        archiver.archive().await.unwrap();
+
+        let retriever = Retriever::new(storage, "sess-filter", None);
+
+        // 筛选 "Rust"：应返回 2 个（标题含 Rust 的）
+        let filtered = retriever.filter_hooks_by_keyword("Rust").await.unwrap();
+        assert_eq!(filtered.len(), 2);
+        // 验证都包含 Rust
+        for s in &filtered {
+            assert!(
+                s.summary_title.to_lowercase().contains("rust"),
+                "标题应包含 Rust: {}",
+                s.summary_title
+            );
+        }
+
+        // 筛选 "Vue"：应返回 1 个
+        let filtered = retriever.filter_hooks_by_keyword("Vue").await.unwrap();
+        assert_eq!(filtered.len(), 1);
+
+        // 筛选不存在的关键词：应返回 0 个
+        let filtered = retriever
+            .filter_hooks_by_keyword("Python")
+            .await
+            .unwrap();
+        assert!(filtered.is_empty());
+
+        // 空关键词：返回全部（不过滤）
+        let filtered = retriever.filter_hooks_by_keyword("").await.unwrap();
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_imp07_render_with_query_relevance_order() {
+        // IMP-07：按查询相关性排序渲染
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+
+        let config = ArchiveConfig {
+            token_threshold: 100,
+            force_truncate_limit: 150,
+            wait_for_turn_completion: true,
+        };
+        let mut archiver = Archiver::new(config, storage.clone(), "sess-rel", None);
+
+        // 归档 3 个记忆，其中 2 个含 "Rust"
+        archiver.push_turn(make_turn("Vue 前端开发", 110));
+        archiver.archive().await.unwrap();
+
+        archiver.push_turn(make_turn("Rust 记忆库设计", 110));
+        archiver.archive().await.unwrap();
+
+        archiver.push_turn(make_turn("Rust 异步运行时", 110));
+        archiver.archive().await.unwrap();
+
+        let retriever = Retriever::new(storage, "sess-rel", None);
+
+        // 用 "Rust" 查询渲染
+        let prompt = retriever
+            .render_to_system_prompt_with_query("Rust")
+            .await
+            .unwrap();
+
+        // 应包含所有 3 个记忆（相关性为 0 的也展示，排在末尾）
+        assert!(prompt.contains("Vue 前端开发"));
+        assert!(prompt.contains("Rust 记忆库设计"));
+        assert!(prompt.contains("Rust 异步运行时"));
+
+        // 相关性标记应出现
+        assert!(prompt.contains("相关性:"));
+
+        // Vue 的相关性标记不应出现（分数为 0）
+        // 验证 "Rust" 相关项排在 "Vue" 之前
+        let rust_pos = prompt
+            .find("Rust 记忆库设计")
+            .or_else(|| prompt.find("Rust 异步运行时"))
+            .unwrap_or(usize::MAX);
+        let vue_pos = prompt.find("Vue 前端开发").unwrap_or(0);
+        assert!(
+            rust_pos < vue_pos,
+            "Rust 相关记忆应排在 Vue 之前"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_imp07_render_with_empty_query_degrades() {
+        // IMP-07：空 query 退化为时间排序
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+
+        let config = ArchiveConfig {
+            token_threshold: 100,
+            force_truncate_limit: 150,
+            wait_for_turn_completion: true,
+        };
+        let mut archiver = Archiver::new(config, storage.clone(), "sess-empty-q", None);
+        archiver.push_turn(make_turn("测试内容", 110));
+        archiver.archive().await.unwrap();
+
+        let retriever = Retriever::new(storage, "sess-empty-q", None);
+
+        // 空 query 应退化为 render_to_system_prompt
+        let prompt_with_empty = retriever
+            .render_to_system_prompt_with_query("")
+            .await
+            .unwrap();
+        let prompt_normal = retriever.render_to_system_prompt().await.unwrap();
+
+        assert_eq!(prompt_with_empty, prompt_normal);
+        // 不应包含相关性标记
+        assert!(!prompt_with_empty.contains("相关性:"));
     }
 }

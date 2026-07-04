@@ -33,7 +33,7 @@ use crate::score::Scorer;
 use crate::storage::Storage;
 use std::sync::Arc;
 
-/// 寒暄/无信息量文本列表（小写匹配）
+/// 寒暄/无信息量文本列表（小写匹配，内置默认词典）
 const CHITCHAT_PATTERNS: &[&str] = &[
     "你好", "您好", "早上好", "下午好", "晚上好", "嗨", "哈喽", "hi", "hello",
     "谢谢", "感谢", "thanks", "thank you", "多谢",
@@ -55,6 +55,64 @@ pub struct Compactor {
     session_id: String,
     /// 项目 ID（可选）
     project_id: Option<String>,
+    /// 寒暄词典（v2.16 IMP-04：可注入自定义词典）
+    ///
+    /// 为空时使用内置 `CHITCHAT_PATTERNS`，非空时与内置词典合并匹配。
+    /// 通过 [`Compactor::with_chitchat_patterns`] 注入。
+    chitchat_patterns: Vec<String>,
+}
+
+/// 寒暄判定核心逻辑（自由函数，供测试直接调用）
+///
+/// 判定规则（满足任一即视为寒暄）：
+/// 1. user_message.text 去空格后长度 ≤ 10，且匹配寒暄模式（内置 + 自定义）
+/// 2. user_message 和 llm_message 都无 text，且都无 attachments/tool_calls/thinking
+/// 3. user_message.text 去空格后长度 ≤ 3（如「嗯」「哦」「好」）
+///
+/// v2.16 IMP-04：`custom_patterns` 与内置 `CHITCHAT_PATTERNS` 合并匹配（非替换）。
+fn is_chitchat_with_patterns(turn: &MessageTurn, custom_patterns: &[String]) -> bool {
+    // 规则 2：完全空内容的 turn
+    let user_empty = turn.user_message.text.is_none()
+        && turn.user_message.attachments.is_empty()
+        && turn.user_message.tool_calls.is_empty()
+        && turn.user_message.thinking.is_none();
+    let llm_empty = turn.llm_message.text.is_none()
+        && turn.llm_message.attachments.is_empty()
+        && turn.llm_message.tool_calls.is_empty()
+        && turn.llm_message.thinking.is_none();
+    if user_empty && llm_empty {
+        return true;
+    }
+
+    // 规则 3：极短用户消息（≤3 字符）
+    if let Some(text) = &turn.user_message.text {
+        let trimmed = text.trim();
+        if trimmed.chars().count() <= 3 {
+            return true;
+        }
+    }
+
+    // 规则 1：匹配寒暄模式（内置 + 自定义）
+    if let Some(text) = &turn.user_message.text {
+        let lower = text.trim().to_lowercase();
+        if lower.chars().count() <= 10 {
+            // 先匹配内置词典
+            for pattern in CHITCHAT_PATTERNS {
+                if lower == *pattern || lower.starts_with(pattern) {
+                    return true;
+                }
+            }
+            // 再匹配自定义词典
+            for pattern in custom_patterns {
+                let p = pattern.trim().to_lowercase();
+                if lower == p || lower.starts_with(&p) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 impl Compactor {
@@ -75,50 +133,31 @@ impl Compactor {
             scorer,
             session_id: session_id.into(),
             project_id,
+            chitchat_patterns: Vec::new(),
         }
     }
 
-    /// 判断 turn 是否为寒暄/无信息量
+    /// 注入自定义寒暄词典（v2.16 IMP-04）
     ///
-    /// 判定规则（满足任一即视为寒暄）：
-    /// 1. user_message.text 去空格后长度 ≤ 10，且匹配寒暄模式
-    /// 2. user_message 和 llm_message 都无 text，且都无 attachments/tool_calls/thinking
-    /// 3. user_message.text 去空格后长度 ≤ 3（如「嗯」「哦」「好」）
-    fn is_chitchat(turn: &MessageTurn) -> bool {
-        // 规则 2：完全空内容的 turn
-        let user_empty = turn.user_message.text.is_none()
-            && turn.user_message.attachments.is_empty()
-            && turn.user_message.tool_calls.is_empty()
-            && turn.user_message.thinking.is_none();
-        let llm_empty = turn.llm_message.text.is_none()
-            && turn.llm_message.attachments.is_empty()
-            && turn.llm_message.tool_calls.is_empty()
-            && turn.llm_message.thinking.is_none();
-        if user_empty && llm_empty {
-            return true;
-        }
+    /// 传入的词典会与内置 `CHITCHAT_PATTERNS` **合并**使用（非替换），
+    /// 用于扩展寒暄剥离规则。
+    ///
+    /// # 示例
+    ///
+    /// ```ignore
+    /// let compactor = Compactor::new(storage, scorer, "sess", None)
+    ///     .with_chitchat_patterns(vec!["辛苦了".into(), "麻烦了".into()]);
+    /// ```
+    pub fn with_chitchat_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.chitchat_patterns = patterns;
+        self
+    }
 
-        // 规则 3：极短用户消息（≤3 字符）
-        if let Some(text) = &turn.user_message.text {
-            let trimmed = text.trim();
-            if trimmed.chars().count() <= 3 {
-                return true;
-            }
-        }
-
-        // 规则 1：匹配寒暄模式
-        if let Some(text) = &turn.user_message.text {
-            let lower = text.trim().to_lowercase();
-            if lower.chars().count() <= 10 {
-                for pattern in CHITCHAT_PATTERNS {
-                    if lower == *pattern || lower.starts_with(pattern) {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        false
+    /// 判断 turn 是否为寒暄/无信息量（实例方法，注入自定义词典）
+    ///
+    /// 委托给自由函数 [`is_chitchat_with_patterns`]，合并内置词典与 `self.chitchat_patterns`。
+    fn is_chitchat(&self, turn: &MessageTurn) -> bool {
+        is_chitchat_with_patterns(turn, &self.chitchat_patterns)
     }
 
     /// 周级合并：7 个天级文件无损去重合并为 1 个周级文件
@@ -155,7 +194,7 @@ impl Compactor {
         for path in &daily_paths {
             let file = self.storage.read_memory(path).await?;
             for turn in &file.turns {
-                if Self::is_chitchat(turn) {
+                if self.is_chitchat(turn) {
                     removed_count += 1;
                 } else {
                     all_turns.push(turn.clone());
@@ -475,26 +514,26 @@ mod tests {
     #[test]
     fn test_is_chitchat_greeting() {
         let turn = make_turn("你好", "你好！有什么可以帮你的吗？", 10, vec![Tag::Text]);
-        assert!(Compactor::is_chitchat(&turn));
+        assert!(is_chitchat_with_patterns(&turn, &[]));
     }
 
     #[test]
     fn test_is_chitchat_thanks() {
         let turn = make_turn("谢谢", "不客气！", 10, vec![Tag::Text]);
-        assert!(Compactor::is_chitchat(&turn));
+        assert!(is_chitchat_with_patterns(&turn, &[]));
     }
 
     #[test]
     fn test_is_chitchat_ok() {
         let turn = make_turn("好的", "好的，我开始执行", 10, vec![Tag::Text]);
-        assert!(Compactor::is_chitchat(&turn));
+        assert!(is_chitchat_with_patterns(&turn, &[]));
     }
 
     #[test]
     fn test_is_chitchat_short_response() {
         // 极短用户消息（≤3 字符）
         let turn = make_turn("嗯", "明白", 5, vec![Tag::Text]);
-        assert!(Compactor::is_chitchat(&turn));
+        assert!(is_chitchat_with_patterns(&turn, &[]));
     }
 
     #[test]
@@ -502,7 +541,7 @@ mod tests {
         let mut turn = make_turn("hello", "hi", 5, vec![Tag::Text]);
         turn.user_message.text = None;
         turn.llm_message.text = None;
-        assert!(Compactor::is_chitchat(&turn));
+        assert!(is_chitchat_with_patterns(&turn, &[]));
     }
 
     #[test]
@@ -513,7 +552,7 @@ mod tests {
             100,
             vec![Tag::Text, Tag::CodeBlock],
         );
-        assert!(!Compactor::is_chitchat(&turn));
+        assert!(!is_chitchat_with_patterns(&turn, &[]));
     }
 
     #[test]
@@ -523,7 +562,18 @@ mod tests {
         // 虽然用户消息是「好的」，但 llm 含工具调用
         // 注意：寒暄判定只看 user_message.text 的匹配
         // 但规则 3（极短用户消息 ≤3 字符）会触发
-        assert!(Compactor::is_chitchat(&turn)); // 「好的」是 2 字符，触发规则 3
+        assert!(is_chitchat_with_patterns(&turn, &[])); // 「好的」是 2 字符，触发规则 3
+    }
+
+    #[test]
+    fn test_is_chitchat_with_custom_patterns() {
+        // v2.16 IMP-04：自定义词典扩展测试
+        // 注意：测试词需 >3 字符，避免触发规则 3（极短用户消息 ≤3 字符）
+        let turn = make_turn("辛苦你了", "应该的", 10, vec![Tag::Text]);
+        // 内置词典不含「辛苦你了」，且为 4 字符不触发规则 3，默认不匹配
+        assert!(!is_chitchat_with_patterns(&turn, &[]));
+        // 注入自定义词典后匹配
+        assert!(is_chitchat_with_patterns(&turn, &["辛苦你了".into()]));
     }
 
     #[test]

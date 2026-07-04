@@ -160,6 +160,23 @@ pub trait Storage: Send + Sync {
     }
 
     // ========================================================================
+    // 访问计数自增（v2.16 批次 1 新增：IMP-01）
+    // ========================================================================
+
+    /// 自增记忆文件的访问计数（retrieve 成功后调用）
+    ///
+    /// 默认实现为 no-op（旧后端可继续工作，不影响 retrieve 主流程）。
+    /// 后端可覆写为原子自增以持久化访问次数，用于月级评分淘汰的 access_frequency 维度。
+    ///
+    /// ## 失败容忍
+    ///
+    /// 调用方（Retriever）应忽略此方法的错误，避免 access_count 自增失败影响 retrieve 主流程。
+    async fn update_access_count(&self, _memory_id: &str) -> crate::Result<()> {
+        // 默认 no-op：旧后端不支持访问计数自增
+        Ok(())
+    }
+
+    // ========================================================================
     // 记忆迭代更新（v2.4 批次 3 新增）
     // ========================================================================
 
@@ -819,6 +836,38 @@ impl Storage for LocalStorage {
         memory_ids.sort();
         memory_ids.dedup();
         Ok(memory_ids)
+    }
+
+    // ========================================================================
+    // 访问计数自增（v2.16 批次 1：IMP-01）
+    // ========================================================================
+
+    async fn update_access_count(&self, memory_id: &str) -> crate::Result<()> {
+        // 从 memory_id 解析 session_id 获取细粒度锁
+        let session_id = Self::parse_session_id(memory_id)
+            .unwrap_or_else(|| "unknown".to_string());
+        let lock = self.session_write_lock(&session_id);
+        let _guard = lock.write().await;
+
+        // 读取 → record_access → 原子写回
+        let mut file = self.read_memory(memory_id).await?;
+        file.record_access();
+
+        // 序列化回写（保持原格式）
+        let abs = self.root.join(memory_id);
+        let path = Path::new(memory_id);
+        let ext = path.extension().and_then(|e| e.to_str());
+        let format = SerializationFormat::detect_from_extension(ext);
+        let content = format.serialize_memory(&file)?;
+        self.atomic_write(&abs, &content).await?;
+
+        tracing::debug!(
+            memory_id = %memory_id,
+            access_count = file.access_count,
+            "访问计数自增完成"
+        );
+
+        Ok(())
     }
 
     // ========================================================================
