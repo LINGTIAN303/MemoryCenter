@@ -51,6 +51,8 @@ use hippocampus_core::model::{ArchiveConfig, MessageTurn};
 use hippocampus_core::retrieve::{Retriever, SummaryView};
 use hippocampus_core::score::DefaultScorer;
 use hippocampus_core::storage::{LocalStorage, Storage};
+// v2.18：复用 hippocampus-server 的 SessionSearchRouter（批次2 可下沉到独立 crate 减少二进制体积）
+use hippocampus_server::SessionSearchRouter;
 
 /// MCP server 主结构体
 #[derive(Clone)]
@@ -64,16 +66,23 @@ pub struct HippocampusMcp {
     /// - `None`：`detect_conflicts` 降级为 `HeuristicDetector`（向后兼容）
     ///   `batch_update` 不做冲突检测（保持 v2.6 行为）
     conflict_detector: Option<Arc<dyn ConflictDetector>>,
+    /// 可注入的 Session 级语义检索路由器（v2.18）
+    ///
+    /// - `Some`：`semantic_search` 工具使用注入的路由器
+    ///   （首次访问 session 时从 storage 自动重建索引 + 关键词/向量混合检索）
+    /// - `None`：`semantic_search` 工具不可用（返回 501 错误，向后兼容）
+    session_search: Option<Arc<SessionSearchRouter>>,
 }
 
 impl HippocampusMcp {
-    /// 创建新的 MCP server 实例（无冲突检测器，向后兼容）
+    /// 创建新的 MCP server 实例（无冲突检测器，无语义检索，向后兼容）
     ///
-    /// 等价于 `with_conflict_detector(None)`。
+    /// 等价于 `with_conflict_detector(None)` + `with_session_search(None)`。
     pub fn new(storage_root: PathBuf) -> Self {
         Self {
             storage_root,
             conflict_detector: None,
+            session_search: None,
         }
     }
 
@@ -93,7 +102,30 @@ impl HippocampusMcp {
         Self {
             storage_root,
             conflict_detector,
+            session_search: None,
         }
+    }
+
+    /// 链式注入 Session 级语义检索路由器（v2.18 builder 模式）
+    ///
+    /// 启用后 `semantic_search` 工具可用，首次访问 session 时自动从
+    /// storage 读取所有 hook 批量重建索引（使用 `embed_batch` 优化 API 调用）。
+    ///
+    /// ## 使用示例
+    ///
+    /// ```rust,ignore
+    /// let router = SessionSearchRouter::new(Some(embedder), dim)
+    ///     .with_storage(storage);
+    /// let mcp = HippocampusMcp::with_conflict_detector(root, detector)
+    ///     .with_session_search(Some(Arc::new(router)));
+    /// ```
+    ///
+    /// ## 参数
+    ///
+    /// - `session_search`：注入的路由器，传 `None` 禁用 `semantic_search` 工具
+    pub fn with_session_search(mut self, session_search: Option<Arc<SessionSearchRouter>>) -> Self {
+        self.session_search = session_search;
+        self
     }
 
     /// 创建 Storage 实例（每次 tool 调用创建，无状态）
@@ -264,6 +296,23 @@ struct GetConflictsParams {
     hook_id: String,
     /// 项目 ID（可选）
     #[schemars(description = "项目 ID（可选）")]
+    project_id: Option<String>,
+}
+
+/// semantic_search tool 参数（v2.18 新增）
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SemanticSearchParams {
+    /// 会话 ID
+    #[schemars(description = "会话 ID（用于隔离不同会话的检索范围）")]
+    session_id: String,
+    /// 查询文本
+    #[schemars(description = "查询文本（自然语言，用于关键词 + 向量混合检索）")]
+    query: String,
+    /// 返回 top-K 结果数（可选，默认 5）
+    #[schemars(description = "返回 top-K 结果数（默认 5）")]
+    top_k: Option<usize>,
+    /// 项目 ID（可选，影响索引读取路径：有则检索 project 级聚合索引）
+    #[schemars(description = "项目 ID（可选，跨 session 检索时使用）")]
     project_id: Option<String>,
 }
 
@@ -827,6 +876,63 @@ impl HippocampusMcp {
         });
         Ok(result.to_string())
     }
+
+    // ========================================================================
+    // v2.18 新增：semantic_search tool
+    // ========================================================================
+
+    /// 语义检索（关键词 + 向量混合，session 级隔离）。
+    ///
+    /// v2.18 批次1：基于 `SessionSearchRouter` 的 `search_with_rebuild` 实现。
+    ///
+    /// ## 行为
+    ///
+    /// - 首次访问 session 时，自动从 storage 读取所有 hook 批量重建索引
+    ///   （用 `embed_batch` 一次性 embed 所有文本，N 个 hook = 1 次 API 调用）
+    /// - 已索引的 session 直接走缓存（避免重复重建）
+    /// - 配置了 Embedder：使用 HybridRetriever（BM25 + 向量 + RRF 融合）
+    /// - 未配置 Embedder：降级为 KeywordOnlyRetriever（仅 BM25 关键词检索）
+    /// - 未注入 SessionSearchRouter：返回 501 错误（向后兼容）
+    ///
+    /// ## 返回
+    ///
+    /// SearchHit 列表的 JSON 数组，每个含 hook_id / memory_id / score / source 字段。
+    /// Agent 可用返回的 hook_id 调用 `retrieve` 工具获取完整记忆内容。
+    #[tool(description = "语义检索记忆（关键词+向量混合）。返回 top-K 相关记忆的 hook_id 列表，可再用 retrieve 工具获取完整内容。首次访问 session 自动从 storage 重建索引（懒加载）。")]
+    async fn semantic_search(
+        &self,
+        Parameters(params): Parameters<SemanticSearchParams>,
+    ) -> Result<String, McpError> {
+        let session_search = match &self.session_search {
+            Some(s) => s,
+            None => {
+                return Err(McpError::internal_error(
+                    "semantic_search 工具未启用：未注入 SessionSearchRouter（需在 MCP 启动时配置 HIPPOCAMPUS_EMBEDDER_* 环境变量）",
+                    None,
+                ));
+            }
+        };
+
+        let top_k = params.top_k.unwrap_or(5);
+
+        let hits = session_search
+            .search_with_rebuild(
+                &params.session_id,
+                params.project_id.as_deref(),
+                &params.query,
+                top_k,
+            )
+            .await
+            .map_err(|e| {
+                McpError::internal_error(format!("语义检索失败: {e}"), None)
+            })?;
+
+        let result = serde_json::json!({
+            "total": hits.len(),
+            "hits": hits,
+        });
+        Ok(result.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -854,6 +960,21 @@ mod tests {
             tmpdir.path().to_path_buf(),
             Some(detector),
         )
+    }
+
+    /// 创建一个注入 SessionSearchRouter 的 MCP 实例（v2.18 测试用）
+    ///
+    /// SessionSearchRouter 仅关键词模式（无 Embedder）+ 注入 storage 懒重建。
+    /// archive 写入 storage 后，semantic_search 首次调用会触发 rebuild。
+    fn make_mcp_with_session_search(tmpdir: &TempDir) -> HippocampusMcp {
+        use hippocampus_server::SessionSearchRouter;
+        let storage: Arc<dyn hippocampus_core::storage::Storage> =
+            Arc::new(hippocampus_core::storage::LocalStorage::new(
+                tmpdir.path().to_path_buf(),
+            ));
+        let router = SessionSearchRouter::new(None, 0).with_storage(storage);
+        HippocampusMcp::with_conflict_detector(tmpdir.path().to_path_buf(), None)
+            .with_session_search(Some(Arc::new(router)))
     }
 
     /// 构造一个最小合法 MessageTurn JSON 字符串
@@ -1572,5 +1693,173 @@ mod tests {
         let result = mcp.get_conflicts(get_params).await.unwrap();
         let result: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(result["total"], 0);
+    }
+
+    // ========================================================================
+    // v2.18 新增：semantic_search tool 测试
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_semantic_search_no_session_search_returns_error() {
+        // 未注入 SessionSearchRouter：semantic_search 应返回错误
+        let tmp = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmp); // 无 session_search
+
+        let params = Parameters(SemanticSearchParams {
+            session_id: "sess-x".to_string(),
+            query: "测试".to_string(),
+            top_k: None,
+            project_id: None,
+        });
+        let result = mcp.semantic_search(params).await;
+        assert!(result.is_err(), "未注入 SessionSearchRouter 应返回错误");
+        let err = result.unwrap_err();
+        let msg = err.message.as_ref();
+        assert!(
+            msg.contains("未启用") || msg.contains("未注入"),
+            "错误消息应提及未启用/未注入，实际: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_semantic_search_basic_with_rebuild() {
+        // 归档后 semantic_search 应触发 rebuild 从 storage 读取索引并返回结果
+        let tmp = TempDir::new().unwrap();
+        let mcp = make_mcp_with_session_search(&tmp);
+        let session_id = "sess-search-basic";
+
+        // 1. 归档一条记忆（写入 storage，但不调用 index_hook，模拟 MCP 进程重启场景）
+        let turns_json = make_turns_json("Rust 安全编程语言", "Rust 是系统级编程语言", 100);
+        let params = Parameters(ArchiveParams {
+            session_id: session_id.to_string(),
+            turns_json,
+            project_id: None,
+        });
+        let archive_result = mcp.archive(params).await.unwrap();
+        let archive_result: Value = serde_json::from_str(&archive_result).unwrap();
+        let hook_id = archive_result["hook_id"].as_str().unwrap().to_string();
+
+        // 2. semantic_search "Rust" → 应触发 rebuild 从 storage 重建索引
+        let params = Parameters(SemanticSearchParams {
+            session_id: session_id.to_string(),
+            query: "Rust".to_string(),
+            top_k: Some(5),
+            project_id: None,
+        });
+        let result = mcp.semantic_search(params).await.expect("semantic_search 失败");
+        let result: Value = serde_json::from_str(&result).unwrap();
+
+        // 应找到至少 1 个结果
+        let total = result["total"].as_u64().unwrap_or(0);
+        assert!(total >= 1, "rebuild 后应能搜索到归档的记忆，实际 total: {total}");
+
+        // 验证返回的 hits 含 hook_id
+        let hits = result["hits"].as_array().unwrap();
+        let found_hook = hits.iter().any(|h| {
+            h["hook_id"].as_str().map(|s| s == hook_id).unwrap_or(false)
+        });
+        assert!(
+            found_hook,
+            "应能找到刚归档的 hook_id: {hook_id}, 实际 hits: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_semantic_search_session_isolation() {
+        // 不同 session 的检索结果应隔离
+        let tmp = TempDir::new().unwrap();
+        let mcp = make_mcp_with_session_search(&tmp);
+
+        // session-a 归档"Rust 编程"
+        let turns_json = make_turns_json("Rust 编程语言", "Rust 是系统级语言", 100);
+        let params = Parameters(ArchiveParams {
+            session_id: "session-a".to_string(),
+            turns_json,
+            project_id: None,
+        });
+        mcp.archive(params).await.unwrap();
+
+        // session-b 归档"Python 编程"
+        let turns_json = make_turns_json("Python 数据分析", "Python 是脚本语言", 100);
+        let params = Parameters(ArchiveParams {
+            session_id: "session-b".to_string(),
+            turns_json,
+            project_id: None,
+        });
+        mcp.archive(params).await.unwrap();
+
+        // session-a 检索 "Rust" → 应找到 Rust，不应找到 Python
+        let params = Parameters(SemanticSearchParams {
+            session_id: "session-a".to_string(),
+            query: "Rust".to_string(),
+            top_k: Some(5),
+            project_id: None,
+        });
+        let result = mcp.semantic_search(params).await.unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        let hits_a = result["hits"].as_array().unwrap();
+        assert!(
+            !hits_a.is_empty(),
+            "session-a 应能搜到 Rust 相关记忆"
+        );
+
+        // 验证 hits_a 不包含 session-b 的内容（hook_id 不重复）
+        // 注意：BM25 只看文本相关性，但因 session 隔离，session-a 不会返回 session-b 的 hook
+        // 这里验证返回的所有 hook 都来自 session-a（hook_id 数量 = session-a 的归档数）
+        assert_eq!(
+            hits_a.len(),
+            1,
+            "session-a 只应有 1 条记忆，实际: {}",
+            hits_a.len()
+        );
+
+        // session-b 检索 "Python" → 应找到 Python
+        let params = Parameters(SemanticSearchParams {
+            session_id: "session-b".to_string(),
+            query: "Python".to_string(),
+            top_k: Some(5),
+            project_id: None,
+        });
+        let result = mcp.semantic_search(params).await.unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        let hits_b = result["hits"].as_array().unwrap();
+        assert_eq!(
+            hits_b.len(),
+            1,
+            "session-b 只应有 1 条记忆，实际: {}",
+            hits_b.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_semantic_search_default_top_k() {
+        // 验证 top_k 默认值 = 5（不传 top_k 参数）
+        let tmp = TempDir::new().unwrap();
+        let mcp = make_mcp_with_session_search(&tmp);
+        let session_id = "sess-default-topk";
+
+        // 归档 1 条记忆
+        let turns_json = make_turns_json("默认 top_k 测试", "测试默认值", 50);
+        let params = Parameters(ArchiveParams {
+            session_id: session_id.to_string(),
+            turns_json,
+            project_id: None,
+        });
+        mcp.archive(params).await.unwrap();
+
+        // 不传 top_k → 应默认为 5（不报错）
+        let params = Parameters(SemanticSearchParams {
+            session_id: session_id.to_string(),
+            query: "测试".to_string(),
+            top_k: None,
+            project_id: None,
+        });
+        let result = mcp.semantic_search(params).await.expect("默认 top_k 应可用");
+        let result: Value = serde_json::from_str(&result).unwrap();
+        // 至少返回 1 条（top_k=5 是上限，实际返回数 <= 5）
+        assert!(
+            result["total"].as_u64().unwrap_or(0) >= 1,
+            "应至少返回 1 条结果"
+        );
     }
 }

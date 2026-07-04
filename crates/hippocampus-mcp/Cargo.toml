@@ -20,6 +20,8 @@ path = "src/main.rs"
 hippocampus-core = { path = "../hippocampus-core" }
 # v2.12：复用 HttpLlmDetector + LlmDetectorConfig（从 hippocampus-llm，避免引入 axum/moka 重依赖）
 hippocampus-llm = { path = "../hippocampus-llm" }
+# v2.18：复用 SessionSearchRouter（从 hippocampus-server，引入 axum/moka 重依赖，批次2 可下沉到独立 crate）
+hippocampus-server = { path = "../hippocampus-server" }
 rmcp = { workspace = true }
 tokio = { version = "1.0", features = ["full"] }
 serde = { workspace = true }

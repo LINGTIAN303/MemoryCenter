@@ -44,10 +44,11 @@
 
 use hippocampus_core::bm25::Bm25Searcher;
 use hippocampus_core::hybrid::{HybridRetriever, KeywordOnlyRetriever};
-use hippocampus_core::model::IndexHook;
+use hippocampus_core::model::{ArchivePeriod, IndexHook};
 use hippocampus_core::semantic::{
     Embedder, KeywordSearcher, SearchHit, SemanticRetriever, VectorIndex,
 };
+use hippocampus_core::storage::Storage;
 use hippocampus_core::vector::InMemoryVectorIndex;
 use moka::future::Cache;
 use std::num::NonZeroUsize;
@@ -236,6 +237,14 @@ pub struct SessionSearchRouter {
     dim: usize,
     /// session → 独立索引器集合（根据 eviction_policy 选择底层实现）
     sessions: SessionCache,
+    /// 可选的存储后端引用（v2.18 新增，用于 session 索引懒重建）
+    ///
+    /// - `Some`：首次访问 session 且索引为空时，从 storage 读取所有 hook 批量重建索引
+    /// - `None`：不自动重建，依赖外部 `index_hook` 调用（向后兼容）
+    ///
+    /// MCP 场景必传（MCP 进程重启后索引丢失，需从 storage 重建）。
+    /// Server 场景可选（已有 `index_hook` 在归档时索引，但重启后也会丢失）。
+    storage: Option<Arc<dyn Storage>>,
 }
 
 impl SessionSearchRouter {
@@ -283,7 +292,26 @@ impl SessionSearchRouter {
             embedder,
             dim: config.dim,
             sessions,
+            storage: None,
         }
+    }
+
+    /// 注入存储后端引用（v2.18 新增，用于 session 索引懒重建）
+    ///
+    /// 注入后，[`SessionSearchRouter::search_with_rebuild`] 首次访问 session 且
+    /// 索引为空时，会自动从 storage 读取所有 hook 批量重建索引（用 `embed_batch` 优化）。
+    ///
+    /// ## 适用场景
+    ///
+    /// - **MCP**：进程重启后内存索引丢失，需从 storage 重建
+    /// - **Server**：可选，重启后首次 `/search` 会自动重建（首次访问有延迟）
+    ///
+    /// ## 向后兼容
+    ///
+    /// 不注入时（默认）：行为与 v2.17 完全一致，依赖外部 `index_hook` 调用。
+    pub fn with_storage(mut self, storage: Arc<dyn Storage>) -> Self {
+        self.storage = Some(storage);
+        self
     }
 
     /// 获取或创建指定 session 的索引器集合
@@ -413,6 +441,162 @@ impl SessionSearchRouter {
         indices.retriever.search(query, top_k).await
     }
 
+    /// 语义检索（带懒重建，v2.18 新增）
+    ///
+    /// 与 [`SessionSearchRouter::search`] 行为一致，额外特性：
+    /// - 首次访问 session 且索引为空时，自动从 storage 读取所有 hook 批量重建索引
+    /// - 使用 `embed_batch` 一次性 embed 所有文本（省 API 调用）
+    /// - 重建失败时降级为空索引（返回空结果或仅关键词结果）
+    ///
+    /// ## 参数
+    ///
+    /// - `sid`：session ID
+    /// - `project_id`：项目 ID（可选，影响索引读取路径：有则读 project 级聚合索引）
+    /// - `query`：查询文本
+    /// - `top_k`：返回 top-K 结果
+    ///
+    /// ## 触发重建的条件
+    ///
+    /// 1. `self.storage` 为 Some（注入了存储后端）
+    /// 2. 首次访问该 session（或被 LRU/TTL 驱逐后重新访问）
+    /// 3. 关键词索引为空（`keyword.is_empty()`）
+    ///
+    /// 满足以上条件才触发重建，否则直接走缓存。
+    pub async fn search_with_rebuild(
+        &self,
+        sid: &str,
+        project_id: Option<&str>,
+        query: &str,
+        top_k: usize,
+    ) -> hippocampus_core::Result<Vec<SearchHit>> {
+        let indices = self.get_or_create(sid).await;
+
+        // 懒重建：若 storage 存在且关键词索引为空，从 storage 批量重建
+        if indices.keyword.is_empty() {
+            if self.storage.is_some() {
+                match self.rebuild_index_from_storage(sid, project_id, &indices).await {
+                    Ok(count) => {
+                        if count > 0 {
+                            tracing::info!(
+                                session = %sid,
+                                rebuilt_hooks = count,
+                                "session 索引已从 storage 重建"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // 重建失败不中断查询，降级为空索引（可能返回空结果）
+                        tracing::warn!(
+                            session = %sid,
+                            error = %e,
+                            "session 索引重建失败，降级为空索引"
+                        );
+                    }
+                }
+            }
+        }
+
+        indices.retriever.search(query, top_k).await
+    }
+
+    /// 从 storage 重建 session 索引（v2.18 新增）
+    ///
+    /// 读取该 session（或 project）所有周期的索引文档，批量提取文本并 embed，
+    /// 一次性装入 keyword + vector 索引。
+    ///
+    /// ## 索引读取路径
+    ///
+    /// - `project_id` 为 Some：读 project 级聚合索引（跨 session 共享）
+    /// - `project_id` 为 None：读 session 级索引（隔离）
+    ///
+    /// ## 批量优化
+    ///
+    /// - 文本提取后用 `embedder.embed_batch(&texts)` 一次性 embed（N 个 hook = 1 次 API 调用）
+    /// - `keyword.index_batch()` + `vector_index.add_batch()` 批量装入
+    ///
+    /// ## 容错策略
+    ///
+    /// - 单个 hook 文本提取失败：跳过（warn 日志）
+    /// - embed_batch 整体失败：跳过向量索引，仅装入关键词索引（与 `index_hook` 降级策略一致）
+    /// - storage 读取失败：返回错误，调用方降级为空索引
+    ///
+    /// ## 返回值
+    ///
+    /// 成功重建的 hook 数量（0 表示 storage 无数据或索引文档不存在）。
+    async fn rebuild_index_from_storage(
+        &self,
+        sid: &str,
+        project_id: Option<&str>,
+        indices: &SessionIndices,
+    ) -> hippocampus_core::Result<usize> {
+        let storage = self.storage.as_ref().ok_or_else(|| {
+            hippocampus_core::Error::Storage("storage 未注入，无法重建索引".into())
+        })?;
+
+        // 1. 收集所有周期的 hook
+        let mut all_hooks: Vec<IndexHook> = Vec::new();
+        for period in ArchivePeriod::all() {
+            let doc = if let Some(pid) = project_id {
+                storage.read_project_index(pid, period).await?
+            } else {
+                storage.read_index(sid, None, period).await?
+            };
+            if let Some(doc) = doc {
+                all_hooks.extend(doc.hooks);
+            }
+        }
+
+        if all_hooks.is_empty() {
+            return Ok(0);
+        }
+
+        let count = all_hooks.len();
+
+        // 2. 批量提取索引文本
+        let texts: Vec<String> = all_hooks
+            .iter()
+            .map(|h| extract_index_text(h))
+            .collect();
+        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+
+        // 3. 批量装入关键词索引（必执行，无 IO 依赖）
+        let keyword_docs: Vec<(String, String, String)> = all_hooks
+            .iter()
+            .zip(texts.iter())
+            .map(|(h, text)| (h.id.to_string(), h.memory_id.clone(), text.clone()))
+            .collect();
+        indices.keyword.index_batch(keyword_docs);
+
+        // 4. 批量 embed + 装入向量索引（仅当 embedder 和 vector 都存在时）
+        if let (Some(embedder), Some(vi)) = (&self.embedder, &indices.vector) {
+            match embedder.embed_batch(&text_refs).await {
+                Ok(vectors) => {
+                    let vector_items: Vec<(String, String, Vec<f32>)> = all_hooks
+                        .iter()
+                        .zip(vectors.into_iter())
+                        .map(|(h, vec)| (h.id.to_string(), h.memory_id.clone(), vec))
+                        .collect();
+                    vi.add_batch(vector_items);
+                    tracing::debug!(
+                        session = %sid,
+                        vector_count = count,
+                        "向量索引已批量装入"
+                    );
+                }
+                Err(e) => {
+                    // embed 失败：跳过向量索引，关键词索引已装入（与 index_hook 降级策略一致）
+                    tracing::warn!(
+                        session = %sid,
+                        error = %e,
+                        "embed_batch 失败，跳过向量索引（关键词索引已装入）"
+                    );
+                }
+            }
+        }
+
+        Ok(count)
+    }
+
     /// 获取已注册的 session 数量（供监控/测试）
     ///
     /// 注意：
@@ -504,7 +688,7 @@ fn extract_index_text(hook: &IndexHook) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hippocampus_core::model::{ArchivePeriod, Summary, Tag};
+    use hippocampus_core::model::{ArchivePeriod, IndexDocument, Summary, Tag};
     use chrono::Utc;
     use uuid::Uuid;
 
@@ -1059,5 +1243,285 @@ mod tests {
             "StrictLRU + Embedder 模式应可正常搜索"
         );
         assert_eq!(results[0].hook_id, hook.id.to_string());
+    }
+
+    // ============================================================================
+    // v2.18 新增：search_with_rebuild + rebuild_index_from_storage 测试
+    // ============================================================================
+
+    /// Mock Storage：用于测试 rebuild_index_from_storage
+    ///
+    /// 预置 IndexDocument，模拟 storage 中已有的索引数据。
+    /// 不实现写入方法（rebuild 只读）。
+    ///
+    /// 注意：key 用 `(String, String)` 而非 `(String, ArchivePeriod)`，
+    /// 避免 `ArchivePeriod` 需要派生 `Hash`（core 模块未派生）。
+    /// period 用 `ArchivePeriod::as_str()` 转字符串。
+    struct MockStorage {
+        /// session 级索引：(session_id, period_str) → IndexDocument
+        session_indexes: std::sync::Mutex<
+            std::collections::HashMap<(String, String), IndexDocument>,
+        >,
+    }
+
+    impl MockStorage {
+        fn new() -> Self {
+            Self {
+                session_indexes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+
+        /// 注入一个 session 级索引文档
+        fn insert_session_index(&self, sid: &str, period: ArchivePeriod, doc: IndexDocument) {
+            self.session_indexes
+                .lock()
+                .unwrap()
+                .insert((sid.to_string(), period.as_str().to_string()), doc);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for MockStorage {
+        async fn write_memory(
+            &self,
+            _file: &hippocampus_core::model::MemoryFile,
+        ) -> hippocampus_core::Result<String> {
+            unimplemented!("MockStorage 不支持写入")
+        }
+
+        async fn read_memory(
+            &self,
+            _path: &str,
+        ) -> hippocampus_core::Result<hippocampus_core::model::MemoryFile> {
+            unimplemented!("MockStorage 不支持读取记忆文件")
+        }
+
+        async fn delete_memory(&self, _memory_id: &str) -> hippocampus_core::Result<()> {
+            unimplemented!("MockStorage 不支持删除记忆文件")
+        }
+
+        async fn write_index(
+            &self,
+            _doc: &IndexDocument,
+        ) -> hippocampus_core::Result<String> {
+            unimplemented!("MockStorage 不支持写入索引")
+        }
+
+        async fn read_index(
+            &self,
+            session_id: &str,
+            _project_id: Option<&str>,
+            period: ArchivePeriod,
+        ) -> hippocampus_core::Result<Option<IndexDocument>> {
+            let map = self.session_indexes.lock().unwrap();
+            Ok(map
+                .get(&(session_id.to_string(), period.as_str().to_string()))
+                .cloned())
+        }
+
+        async fn append_hook(
+            &self,
+            _session_id: &str,
+            _project_id: Option<&str>,
+            _period: ArchivePeriod,
+            _hook: IndexHook,
+        ) -> hippocampus_core::Result<()> {
+            unimplemented!("MockStorage 不支持追加 hook")
+        }
+
+        async fn list_memories(
+            &self,
+            _session_id: &str,
+            _project_id: Option<&str>,
+            _period: ArchivePeriod,
+        ) -> hippocampus_core::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn make_index_doc(sid: &str, period: ArchivePeriod, hooks: Vec<IndexHook>) -> IndexDocument {
+        IndexDocument {
+            id: Uuid::new_v4(),
+            schema_version: 1,
+            session_id: sid.to_string(),
+            project_id: None,
+            hooks,
+            updated_at: Utc::now(),
+            period,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_with_rebuild_no_storage() {
+        // 未注入 storage：search_with_rebuild 行为与 search 一致（返回空结果）
+        let router = SessionSearchRouter::new(None, 0);
+
+        let results = router
+            .search_with_rebuild("sess-1", None, "测试", 5)
+            .await
+            .unwrap();
+        assert!(results.is_empty(), "未注入 storage 且无 index_hook，应返回空");
+    }
+
+    #[tokio::test]
+    async fn test_search_with_rebuild_from_storage_keyword_only() {
+        // 注入 MockStorage + 预置 hook，未配置 embedder（仅关键词模式）
+        // 验证：首次 search_with_rebuild 自动从 storage 重建索引
+        let mock_storage = Arc::new(MockStorage::new());
+
+        // 预置一个 daily 索引文档，含 2 个 hook
+        let hook1 = make_hook("Rust 安全编程", vec!["所有权机制".into()]);
+        let hook2 = make_hook("Python 数据分析", vec!["pandas 库".into()]);
+        let doc = make_index_doc(
+            "sess-1",
+            ArchivePeriod::Daily,
+            vec![hook1.clone(), hook2.clone()],
+        );
+        mock_storage.insert_session_index("sess-1", ArchivePeriod::Daily, doc);
+
+        // 构造 router（未配置 embedder，仅关键词模式）
+        let storage: Arc<dyn Storage> = mock_storage.clone();
+        let router = SessionSearchRouter::new(None, 0).with_storage(storage);
+
+        // 首次 search_with_rebuild → 应触发 rebuild
+        let results = router
+            .search_with_rebuild("sess-1", None, "Rust", 5)
+            .await
+            .unwrap();
+        assert!(
+            !results.is_empty(),
+            "rebuild 后应能搜索到 Rust 相关记忆"
+        );
+        assert_eq!(results[0].hook_id, hook1.id.to_string());
+
+        // 搜索 Python 也应能命中（同一个 session）
+        let results_py = router
+            .search_with_rebuild("sess-1", None, "Python", 5)
+            .await
+            .unwrap();
+        assert!(!results_py.is_empty(), "应能搜索到 Python 相关记忆");
+        assert_eq!(results_py[0].hook_id, hook2.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_search_with_rebuild_uses_embed_batch() {
+        // 验证：rebuild 时调用 embed_batch（而非逐条 embed）
+        // 用 CountingEmbedder 统计 embed / embed_batch 调用次数
+        struct CountingEmbedder {
+            dim: usize,
+            embed_count: std::sync::atomic::AtomicUsize,
+            embed_batch_count: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl Embedder for CountingEmbedder {
+            fn dim(&self) -> usize {
+                self.dim
+            }
+            async fn embed(&self, _text: &str) -> hippocampus_core::Result<Vec<f32>> {
+                self.embed_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![0.0; self.dim])
+            }
+            async fn embed_batch(
+                &self,
+                texts: &[&str],
+            ) -> hippocampus_core::Result<Vec<Vec<f32>>> {
+                self.embed_batch_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(texts.iter().map(|_| vec![0.0; self.dim]).collect())
+            }
+            fn is_normalized(&self) -> bool {
+                true
+            }
+        }
+
+        let embedder = Arc::new(CountingEmbedder {
+            dim: 4,
+            embed_count: std::sync::atomic::AtomicUsize::new(0),
+            embed_batch_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let embedder_clone = embedder.clone();
+
+        // 预置 3 个 hook
+        let hooks = vec![
+            make_hook("文档1", vec![]),
+            make_hook("文档2", vec![]),
+            make_hook("文档3", vec![]),
+        ];
+        let doc = make_index_doc("sess-1", ArchivePeriod::Daily, hooks);
+        let mock_storage = Arc::new(MockStorage::new());
+        mock_storage.insert_session_index("sess-1", ArchivePeriod::Daily, doc);
+
+        let storage: Arc<dyn Storage> = mock_storage.clone();
+        let router = SessionSearchRouter::new(Some(embedder as Arc<dyn Embedder>), 4)
+            .with_storage(storage);
+
+        // 触发 rebuild
+        let _ = router
+            .search_with_rebuild("sess-1", None, "文档", 5)
+            .await
+            .unwrap();
+
+        // 验证：embed_batch 调用 1 次（rebuild 路径用批量优化）
+        // embed 调用 1 次是 HybridRetriever.search 时把 query 向量化的正常调用
+        // （非 rebuild 路径，是 search 路径）
+        assert_eq!(
+            embedder_clone
+                .embed_batch_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "embed_batch 应调用 1 次（rebuild 批量优化）"
+        );
+        assert_eq!(
+            embedder_clone
+                .embed_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "embed 应调用 1 次（HybridRetriever.search 时 query 向量化）"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_with_rebuild_skips_when_indexed() {
+        // 验证：已 index_hook 的 session 不会触发 rebuild（避免重复索引）
+        let mock_storage = Arc::new(MockStorage::new());
+
+        // 预置 storage 中的索引（模拟旧数据）
+        let hook_old = make_hook("旧文档", vec![]);
+        let doc = make_index_doc(
+            "sess-1",
+            ArchivePeriod::Daily,
+            vec![hook_old.clone()],
+        );
+        mock_storage.insert_session_index("sess-1", ArchivePeriod::Daily, doc);
+
+        let storage: Arc<dyn Storage> = mock_storage.clone();
+        let router = SessionSearchRouter::new(None, 0).with_storage(storage);
+
+        // 先通过 index_hook 索引新数据
+        let hook_new = make_hook("新文档", vec![]);
+        router.index_hook("sess-1", &hook_new).await;
+
+        // search_with_rebuild → 关键词索引非空，不应触发 rebuild
+        let results = router
+            .search_with_rebuild("sess-1", None, "新文档", 5)
+            .await
+            .unwrap();
+        assert!(!results.is_empty(), "应能搜到 index_hook 的数据");
+        assert_eq!(results[0].hook_id, hook_new.id.to_string());
+
+        // 验证：旧文档（来自 storage）不应被索引（因为 rebuild 未触发）
+        let results_old = router
+            .search_with_rebuild("sess-1", None, "旧文档", 5)
+            .await
+            .unwrap();
+        assert!(
+            results_old.is_empty()
+                || !results_old
+                    .iter()
+                    .any(|r| r.hook_id == hook_old.id.to_string()),
+            "rebuild 未触发，旧文档不应被索引"
+        );
     }
 }

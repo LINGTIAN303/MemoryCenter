@@ -466,6 +466,7 @@ pub async fn batch_retrieve(
     let retriever = Retriever::new(storage, &sid, req.project_id);
 
     // v2.16 IMP-08：并发检索（Semaphore 限制 8 并发 + JoinSet 收集结果）
+    // v2.18 修复：保持结果顺序与输入 hook_ids 一致（按 index 回填到预分配 Vec）
     //
     // 串行循环改为并发执行，提升批量检索性能。
     // 单个失败不影响其他（保持原有容错语义）。
@@ -474,22 +475,25 @@ pub async fn batch_retrieve(
     use tokio::sync::Semaphore;
     let semaphore = Arc::new(Semaphore::new(8));
     let mut tasks = tokio::task::JoinSet::new();
-    for hook_id in req.hook_ids.iter().cloned() {
+    for (idx, hook_id) in req.hook_ids.iter().cloned().enumerate() {
         let retriever = retriever.clone();
         let sem = semaphore.clone();
         tasks.spawn(async move {
             let _permit = match sem.acquire().await {
                 Ok(p) => p,
                 Err(e) => {
-                    return BatchRetrieveItem {
-                        hook_id,
-                        success: false,
-                        data: None,
-                        error: Some(format!("获取并发许可失败: {e}")),
-                    };
+                    return (
+                        idx,
+                        BatchRetrieveItem {
+                            hook_id,
+                            success: false,
+                            data: None,
+                            error: Some(format!("获取并发许可失败: {e}")),
+                        },
+                    );
                 }
             };
-            match retriever.retrieve_memory(&hook_id).await {
+            let item = match retriever.retrieve_memory(&hook_id).await {
                 Ok(memory) => BatchRetrieveItem {
                     hook_id,
                     success: true,
@@ -502,26 +506,42 @@ pub async fn batch_retrieve(
                     data: None,
                     error: Some(e.to_string()),
                 },
-            }
+            };
+            (idx, item)
         });
     }
 
-    // 收集结果（顺序与输入无关，按完成顺序）
-    let mut results = Vec::with_capacity(req.hook_ids.len());
+    // 按 idx 回填结果，保持顺序与输入 hook_ids 一致
+    let mut results: Vec<Option<BatchRetrieveItem>> =
+        (0..req.hook_ids.len()).map(|_| None).collect();
     while let Some(joined) = tasks.join_next().await {
         match joined {
-            Ok(item) => results.push(item),
+            Ok((idx, item)) => results[idx] = Some(item),
             Err(e) => {
+                // 任务 panic：无法定位 idx，找第一个空位填入错误项
                 tracing::error!(error = %e, "batch_retrieve 任务 panic，跳过");
-                results.push(BatchRetrieveItem {
-                    hook_id: String::new(),
-                    success: false,
-                    data: None,
-                    error: Some(format!("内部任务错误: {e}")),
-                });
+                if let Some(slot) = results.iter_mut().find(|r| r.is_none()) {
+                    *slot = Some(BatchRetrieveItem {
+                        hook_id: String::new(),
+                        success: false,
+                        data: None,
+                        error: Some(format!("内部任务错误: {e}")),
+                    });
+                }
             }
         }
     }
+
+    // 展开结果（理论已全部填满，兜底处理未完成的槽位）
+    let results: Vec<BatchRetrieveItem> = results
+        .into_iter()
+        .map(|x| x.unwrap_or_else(|| BatchRetrieveItem {
+            hook_id: String::new(),
+            success: false,
+            data: None,
+            error: Some("内部错误：任务未完成".to_string()),
+        }))
+        .collect();
 
     tracing::info!(
         session = %sid,

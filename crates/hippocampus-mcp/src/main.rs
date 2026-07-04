@@ -20,12 +20,30 @@
 //!
 //! 未配置 `API_URL` 时：注入 `HeuristicDetector`（启发式纯算法，三维度检测）。
 //! 配置完整时：注入 `HybridDetector`（串联 Heuristic + LLM，合并两份报告）。
+//!
+//! ## 语义检索配置（v2.18 新增）
+//!
+//! 通过环境变量配置 Embedder API 后，`semantic_search` 工具可用：
+//!
+//! | 环境变量 | 说明 | 默认值 |
+//! |---------|------|--------|
+//! | `HIPPOCAMPUS_EMBEDDER_API_URL` | Embedding API 地址（OpenAI 兼容 `/v1/embeddings`） | 空（降级为仅关键词） |
+//! | `HIPPOCAMPUS_EMBEDDER_API_KEY` | API Key | 空 |
+//! | `HIPPOCAMPUS_EMBEDDER_MODEL` | 模型名 | `text-embedding-3-large` |
+//! | `HIPPOCAMPUS_EMBEDDER_DIM` | 向量维度 | `3072` |
+//! | `HIPPOCAMPUS_EMBEDDER_TIMEOUT` | 超时秒数 | `30` |
+//!
+//! - 未配置 `API_URL`：降级为 `KeywordOnlyRetriever`（仅 BM25 关键词检索）
+//! - 配置完整：每 session 独立 `HybridRetriever`（关键词 + 向量 + RRF 融合）
+//! - **MCP 进程重启后索引丢失**：SessionSearchRouter 注入了 storage 引用，
+//!   首次访问 session 时自动从 storage 批量重建索引（用 `embed_batch` 优化 API 调用）
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hippocampus_core::conflict::{ConflictDetector, HybridDetector};
 use hippocampus_core::heuristic::HeuristicDetector;
+use hippocampus_core::storage::{LocalStorage, Storage};
 use hippocampus_mcp::HippocampusMcp;
 use hippocampus_llm::{HttpLlmDetector, LlmDetectorConfig};
 use rmcp::ServiceExt;
@@ -61,6 +79,48 @@ fn build_conflict_detector() -> Arc<dyn ConflictDetector> {
     Arc::new(HybridDetector::new(heuristic, llm))
 }
 
+/// 从环境变量构造 SessionSearchRouter（v2.18 新增）
+///
+/// 与 server 端 `build_session_search` 的关键差异：
+/// **MCP 端必须注入 storage 引用**（用 `with_storage`），因为 MCP 进程是
+/// 短生命周期子进程，每次启动后内存索引为空，必须从 storage 懒重建。
+///
+/// - 配置了 `HIPPOCAMPUS_EMBEDDER_API_URL` + `API_KEY`：
+///   返回注入了 HttpEmbedder 的 SessionSearchRouter（混合检索）
+/// - 未配置：返回仅关键词模式的 SessionSearchRouter（降级，但仍带 storage 懒重建）
+fn build_session_search(storage_root: &Path) -> Option<Arc<hippocampus_server::SessionSearchRouter>> {
+    use hippocampus_core::semantic::Embedder;
+    use hippocampus_server::{EmbedderConfig, HttpEmbedder, SessionSearchRouter};
+
+    // 构造 storage 后端（供 SessionSearchRouter 重建索引用）
+    let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(storage_root.to_path_buf()));
+
+    // v2.13：使用 EmbedderConfig::from_env() 统一环境变量读取
+    let embedder_config = match EmbedderConfig::from_env() {
+        Some(config) => config,
+        None => {
+            // 降级模式：仅关键词检索 + storage 懒重建
+            tracing::info!(
+                "语义检索：未配置 Embedder API，降级为仅关键词检索（KeywordOnlyRetriever，session 级隔离 + storage 懒重建）"
+            );
+            let router = SessionSearchRouter::new(None, 0).with_storage(storage);
+            return Some(Arc::new(router));
+        }
+    };
+
+    let dim = embedder_config.dim;
+    tracing::info!(
+        api_url = %embedder_config.api_url,
+        model = %embedder_config.model,
+        dim,
+        "语义检索：Embedder 已配置，启用 session 级混合检索（HybridRetriever + storage 懒重建 + embed_batch 批量优化）"
+    );
+
+    let embedder: Arc<dyn Embedder> = Arc::new(HttpEmbedder::new(embedder_config));
+    let router = SessionSearchRouter::new(Some(embedder), dim).with_storage(storage);
+    Some(Arc::new(router))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 初始化日志
@@ -79,6 +139,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // v2.11：构造冲突检测器并注入
     let conflict_detector = build_conflict_detector();
 
+    // v2.18：构造 SessionSearchRouter（注入 storage 支持懒重建）
+    let session_search = build_session_search(&storage_root);
+
     tracing::info!(
         root = %storage_root.display(),
         "启动 Hippocampus MCP server (stdio 传输)"
@@ -89,6 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         storage_root,
         Some(conflict_detector),
     )
+    .with_session_search(session_search)
     .serve(stdio())
     .await?;
 
