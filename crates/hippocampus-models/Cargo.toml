@@ -1,0 +1,25 @@
+[package]
+name = "hippocampus-models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hippocampus LLM 模型特配库 - 模型家族/型号/Tokenizer/架构特点"
+keywords = ["llm", "tokenizer", "tiktoken", "model", "agent"]
+categories = ["data-structures", "api-bindings"]
+
+[dependencies]
+# 工作区依赖
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Tiktoken 分词器（重依赖，隔离在此 crate）
+# 支持 o200k_base（GPT-4o/5）、cl100k_base（GPT-4/3.5）、r50k_base/p50k_base（旧模型）
+tiktoken-rs = "0.6"
+
+# Hippocampus 核心数据结构
+hippocampus-core = { path = "../hippocampus-core", version = "0.1.0" }
