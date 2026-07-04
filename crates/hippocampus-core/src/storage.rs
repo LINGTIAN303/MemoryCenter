@@ -92,6 +92,30 @@ pub trait Storage: Send + Sync {
         period: ArchivePeriod,
     ) -> crate::Result<Option<IndexDocument>>;
 
+    /// 删除索引文档（v2.16 IMP-02 新增）
+    ///
+    /// 按 session + period 定位并删除整个索引文档。
+    /// 主要用于周级合并后清理已合并的 daily 索引文档（可选配置，默认关闭）。
+    ///
+    /// ## 默认实现
+    ///
+    /// 默认返回 `Ok(())`（no-op，向后兼容旧后端）。
+    /// 后端可覆写为实际的删除逻辑。
+    ///
+    /// ## 容错策略
+    ///
+    /// 索引文档不存在时视为已删除，返回 `Ok(())`（与 `delete_memory` 的"不存在则报错"行为不同，
+    /// 因为索引文档是衍生数据，缺失不影响正确性）。
+    async fn delete_index(
+        &self,
+        _session_id: &str,
+        _project_id: Option<&str>,
+        _period: ArchivePeriod,
+    ) -> crate::Result<()> {
+        // 默认 no-op：旧后端不支持删除索引
+        Ok(())
+    }
+
     /// 追加钩子到索引文档（读-改-写便利方法）
     ///
     /// 内部实现：读取现有索引文档 → 追加钩子 → 写回。
@@ -658,6 +682,45 @@ impl Storage for LocalStorage {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(crate::Error::Storage(format!(
                 "读取索引文档失败 {:?}: {}",
+                path_display(&relative),
+                e
+            ))),
+        }
+    }
+
+    /// 删除索引文档（v2.16 IMP-02：LocalStorage 实现）
+    ///
+    /// 删除 sessions/{session_id}/index/{period}_index.json 文件。
+    /// 文件不存在视为已删除，返回 Ok(())。
+    async fn delete_index(
+        &self,
+        session_id: &str,
+        _project_id: Option<&str>,
+        period: ArchivePeriod,
+    ) -> crate::Result<()> {
+        // 细粒度锁：per session
+        let lock = self.session_write_lock(session_id);
+        let _guard = lock.write().await;
+
+        let relative = self.session_index_path(session_id, period);
+        let abs = self.abs_path(&relative);
+
+        match tokio::fs::remove_file(&abs).await {
+            Ok(()) => {
+                tracing::debug!(
+                    session_id = %session_id,
+                    period = %period.as_str(),
+                    path = %path_display(&relative),
+                    "已删除索引文档"
+                );
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 文件不存在视为已删除
+                Ok(())
+            }
+            Err(e) => Err(crate::Error::Storage(format!(
+                "删除索引文档失败 {:?}: {}",
                 path_display(&relative),
                 e
             ))),

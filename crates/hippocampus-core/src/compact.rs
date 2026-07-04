@@ -66,6 +66,15 @@ pub struct Compactor {
     /// 为 None 时退化为同步 `scorer`（纯启发式 3 维）。
     /// 推荐注入 [`crate::score::HybridScorer`] 以组合启发式 + LLM 评分。
     async_scorer: Option<Arc<dyn AsyncScorer>>,
+
+    /// 周级合并后是否清理 daily 文件（v2.16 IMP-02，默认关闭）
+    ///
+    /// - `false`（默认）：保留原始 daily 文件和索引文档（向后兼容，可回溯）
+    /// - `true`：weekly_merge 成功后删除所有 daily 记忆文件 + daily 索引文档
+    ///
+    /// 通过 [`Compactor::with_cleanup_daily_after_weekly_merge`] 注入。
+    /// 开启后可节省存储空间，但失去 daily 级别的回溯能力。
+    cleanup_daily_after_weekly_merge: bool,
 }
 
 /// 寒暄判定核心逻辑（自由函数，供测试直接调用）
@@ -141,6 +150,7 @@ impl Compactor {
             project_id,
             chitchat_patterns: Vec::new(),
             async_scorer: None,
+            cleanup_daily_after_weekly_merge: false,
         }
     }
 
@@ -177,6 +187,27 @@ impl Compactor {
     /// ```
     pub fn with_async_scorer(mut self, scorer: Arc<dyn AsyncScorer>) -> Self {
         self.async_scorer = Some(scorer);
+        self
+    }
+
+    /// 配置 weekly_merge 后是否清理 daily 文件（v2.16 IMP-02）
+    ///
+    /// - `true`：weekly_merge 成功后删除所有 daily 记忆文件 + daily 索引文档
+    /// - `false`（默认）：保留原始 daily 文件（向后兼容，可回溯）
+    ///
+    /// ## 注意事项
+    ///
+    /// 开启后失去 daily 级别的回溯能力，但可节省存储空间。
+    /// 适用于存储空间受限、记忆量大的长期运行场景。
+    ///
+    /// # 示例
+    ///
+    /// ```ignore
+    /// let compactor = Compactor::new(storage, scorer, "sess", None)
+    ///     .with_cleanup_daily_after_weekly_merge(true);
+    /// ```
+    pub fn with_cleanup_daily_after_weekly_merge(mut self, cleanup: bool) -> Self {
+        self.cleanup_daily_after_weekly_merge = cleanup;
         self
     }
 
@@ -330,6 +361,49 @@ impl Compactor {
             hooks = weekly_index.hooks.len(),
             "周级合并完成: 已写入 weekly 记忆文件和索引"
         );
+
+        // v2.16 IMP-02：可选清理 daily 文件（默认关闭）
+        //
+        // 开启后删除所有已合并的 daily 记忆文件 + daily 索引文档。
+        // 单个文件删除失败不中断整体清理，仅记录 warn 日志（容错策略）。
+        if self.cleanup_daily_after_weekly_merge {
+            let mut deleted_count = 0usize;
+            let mut failed_count = 0usize;
+            for path in &daily_paths {
+                match self.storage.delete_memory(path).await {
+                    Ok(()) => deleted_count += 1,
+                    Err(e) => {
+                        failed_count += 1;
+                        tracing::warn!(
+                            path = %path,
+                            error = %e,
+                            "清理 daily 记忆文件失败，跳过"
+                        );
+                    }
+                }
+            }
+
+            // 删除 daily 索引文档
+            if let Err(e) = self
+                .storage
+                .delete_index(&self.session_id, self.project_id.as_deref(), ArchivePeriod::Daily)
+                .await
+            {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    error = %e,
+                    "清理 daily 索引文档失败，跳过"
+                );
+            }
+
+            tracing::info!(
+                session_id = %self.session_id,
+                daily_total = daily_paths.len(),
+                deleted = deleted_count,
+                failed = failed_count,
+                "已清理 daily 记忆文件（IMP-02 可选配置已开启）"
+            );
+        }
 
         Ok((merged_memory, weekly_index))
     }
@@ -692,6 +766,123 @@ mod tests {
 
         let result = compactor.weekly_merge().await;
         assert!(result.is_err());
+    }
+
+    /// IMP-02：weekly_merge 开启 cleanup_daily 后应删除 daily 文件和索引
+    #[tokio::test]
+    async fn test_imp02_weekly_merge_cleanup_daily() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+
+        // 归档 2 个 daily 文件
+        use crate::archive::Archiver;
+        use crate::model::ArchiveConfig;
+        for i in 0..2 {
+            let mut archiver = Archiver::new(
+                ArchiveConfig {
+                    token_threshold: 100,
+                    force_truncate_limit: 150,
+                    wait_for_turn_completion: true,
+                },
+                storage.clone(),
+                "sess-imp02",
+                None,
+            );
+            archiver.push_turn(make_normal_turn(&format!("用户消息 {i}"), 60));
+            archiver.archive().await.unwrap();
+        }
+
+        // 确认 daily 文件存在
+        let daily_before = storage
+            .list_memories("sess-imp02", None, ArchivePeriod::Daily)
+            .await
+            .unwrap();
+        assert_eq!(daily_before.len(), 2, "归档后应有 2 个 daily 文件");
+
+        // 确认 daily 索引文档存在
+        let daily_index_before = storage
+            .read_index("sess-imp02", None, ArchivePeriod::Daily)
+            .await
+            .unwrap();
+        assert!(daily_index_before.is_some(), "归档后应有 daily 索引文档");
+
+        // 执行 weekly_merge（开启 cleanup_daily）
+        let scorer: Box<dyn Scorer> = Box::new(DefaultScorer::new());
+        let compactor = Compactor::new(storage.clone(), scorer, "sess-imp02", None)
+            .with_cleanup_daily_after_weekly_merge(true);
+        let (merged, index) = compactor.weekly_merge().await.unwrap();
+
+        // 验证 weekly 合并成功
+        assert_eq!(merged.turns.len(), 2);
+        assert_eq!(index.hooks.len(), 2);
+
+        // IMP-02 核心断言：daily 文件已被删除
+        let daily_after = storage
+            .list_memories("sess-imp02", None, ArchivePeriod::Daily)
+            .await
+            .unwrap();
+        assert!(daily_after.is_empty(), "cleanup_daily 后 daily 文件应被删除");
+
+        // IMP-02 核心断言：daily 索引文档已被删除
+        let daily_index_after = storage
+            .read_index("sess-imp02", None, ArchivePeriod::Daily)
+            .await
+            .unwrap();
+        assert!(daily_index_after.is_none(), "cleanup_daily 后 daily 索引应被删除");
+
+        // weekly 文件和索引应保留
+        let weekly_files = storage
+            .list_memories("sess-imp02", None, ArchivePeriod::Weekly)
+            .await
+            .unwrap();
+        assert_eq!(weekly_files.len(), 1, "weekly 文件应保留");
+
+        let weekly_index = storage
+            .read_index("sess-imp02", None, ArchivePeriod::Weekly)
+            .await
+            .unwrap();
+        assert!(weekly_index.is_some(), "weekly 索引应保留");
+    }
+
+    /// IMP-02：默认配置（cleanup_daily=false）应保留 daily 文件（向后兼容）
+    #[tokio::test]
+    async fn test_imp02_weekly_merge_default_keeps_daily() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+
+        use crate::archive::Archiver;
+        use crate::model::ArchiveConfig;
+        let mut archiver = Archiver::new(
+            ArchiveConfig {
+                token_threshold: 100,
+                force_truncate_limit: 150,
+                wait_for_turn_completion: true,
+            },
+            storage.clone(),
+            "sess-imp02-default",
+            None,
+        );
+        archiver.push_turn(make_normal_turn("测试消息", 60));
+        archiver.archive().await.unwrap();
+
+        // 默认配置（不调 with_cleanup_daily_after_weekly_merge）
+        let scorer: Box<dyn Scorer> = Box::new(DefaultScorer::new());
+        let compactor = Compactor::new(storage.clone(), scorer, "sess-imp02-default", None);
+        compactor.weekly_merge().await.unwrap();
+
+        // daily 文件应保留
+        let daily = storage
+            .list_memories("sess-imp02-default", None, ArchivePeriod::Daily)
+            .await
+            .unwrap();
+        assert_eq!(daily.len(), 1, "默认配置应保留 daily 文件");
+
+        // daily 索引文档应保留
+        let daily_index = storage
+            .read_index("sess-imp02-default", None, ArchivePeriod::Daily)
+            .await
+            .unwrap();
+        assert!(daily_index.is_some(), "默认配置应保留 daily 索引");
     }
 
     #[tokio::test]

@@ -427,19 +427,60 @@ impl HippocampusMcp {
         let storage = self.create_storage();
         let retriever = Retriever::new(storage, &params.session_id, params.project_id);
 
+        // v2.16 IMP-08：并发检索（Semaphore 限制 8 并发 + JoinSet 收集结果）
+        //
+        // 串行循环改为并发执行，提升批量检索性能。
+        // 单个失败不影响其他（保持原有容错语义）。
+        // 8 是经验值：平衡并发开销与系统负载，适合大多数存储后端。
+        // 使用 tokio::sync::Semaphore 限制并发数，避免大批量请求压垮存储后端。
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        let semaphore = Arc::new(Semaphore::new(8));
+        let mut tasks = tokio::task::JoinSet::new();
+        for hook_id in hook_ids.iter().cloned() {
+            let retriever = retriever.clone();
+            let sem = semaphore.clone();
+            tasks.spawn(async move {
+                // 获取许可（最多 8 个并发，其余等待）
+                let _permit = match sem.acquire().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return serde_json::json!({
+                            "hook_id": hook_id,
+                            "success": false,
+                            "error": format!("获取并发许可失败: {e}"),
+                        });
+                    }
+                };
+                match retriever.retrieve_memory(&hook_id).await {
+                    Ok(memory) => serde_json::json!({
+                        "hook_id": hook_id,
+                        "success": true,
+                        "data": memory,
+                    }),
+                    Err(e) => serde_json::json!({
+                        "hook_id": hook_id,
+                        "success": false,
+                        "error": e.to_string(),
+                    }),
+                }
+            });
+        }
+
+        // 收集结果（顺序与输入无关，按完成顺序）
         let mut results = Vec::with_capacity(hook_ids.len());
-        for hook_id in &hook_ids {
-            match retriever.retrieve_memory(hook_id).await {
-                Ok(memory) => results.push(serde_json::json!({
-                    "hook_id": hook_id,
-                    "success": true,
-                    "data": memory,
-                })),
-                Err(e) => results.push(serde_json::json!({
-                    "hook_id": hook_id,
-                    "success": false,
-                    "error": e.to_string(),
-                })),
+        while let Some(joined) = tasks.join_next().await {
+            // JoinSet 内部 panic 会转化为 JoinError，这里容错保证不中断
+            match joined {
+                Ok(value) => results.push(value),
+                Err(e) => {
+                    tracing::error!(error = %e, "batch_retrieve 任务 panic，跳过");
+                    results.push(serde_json::json!({
+                        "hook_id": "",
+                        "success": false,
+                        "error": format!("内部任务错误: {e}"),
+                    }));
+                }
             }
         }
 

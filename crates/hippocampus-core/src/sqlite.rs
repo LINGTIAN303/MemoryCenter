@@ -430,6 +430,30 @@ impl Storage for SqliteStorage {
         .await
     }
 
+    /// 删除索引文档（v2.16 IMP-02：SqliteStorage 实现）
+    ///
+    /// 删除 hooks 表中同 session + period + scope=session 的所有行。
+    /// 行不存在视为已删除，返回 Ok(())。
+    async fn delete_index(
+        &self,
+        session_id: &str,
+        _project_id: Option<&str>,
+        period: ArchivePeriod,
+    ) -> crate::Result<()> {
+        let session_id = session_id.to_string();
+        let period_str = period.as_str().to_string();
+
+        self.with_conn(move |conn| {
+            conn.execute(
+                "DELETE FROM hooks WHERE session_id = ?1 AND period = ?2 AND scope = 'session'",
+                rusqlite::params![&session_id, &period_str],
+            )
+            .map_err(|e| crate::Error::Storage(format!("删除 hooks 失败: {}", e)))?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn append_hook(
         &self,
         session_id: &str,

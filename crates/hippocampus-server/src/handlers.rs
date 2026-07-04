@@ -465,21 +465,61 @@ pub async fn batch_retrieve(
     let storage = create_storage(&state);
     let retriever = Retriever::new(storage, &sid, req.project_id);
 
+    // v2.16 IMP-08：并发检索（Semaphore 限制 8 并发 + JoinSet 收集结果）
+    //
+    // 串行循环改为并发执行，提升批量检索性能。
+    // 单个失败不影响其他（保持原有容错语义）。
+    // 8 是经验值：平衡并发开销与系统负载，适合大多数存储后端。
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+    let semaphore = Arc::new(Semaphore::new(8));
+    let mut tasks = tokio::task::JoinSet::new();
+    for hook_id in req.hook_ids.iter().cloned() {
+        let retriever = retriever.clone();
+        let sem = semaphore.clone();
+        tasks.spawn(async move {
+            let _permit = match sem.acquire().await {
+                Ok(p) => p,
+                Err(e) => {
+                    return BatchRetrieveItem {
+                        hook_id,
+                        success: false,
+                        data: None,
+                        error: Some(format!("获取并发许可失败: {e}")),
+                    };
+                }
+            };
+            match retriever.retrieve_memory(&hook_id).await {
+                Ok(memory) => BatchRetrieveItem {
+                    hook_id,
+                    success: true,
+                    data: Some(memory),
+                    error: None,
+                },
+                Err(e) => BatchRetrieveItem {
+                    hook_id,
+                    success: false,
+                    data: None,
+                    error: Some(e.to_string()),
+                },
+            }
+        });
+    }
+
+    // 收集结果（顺序与输入无关，按完成顺序）
     let mut results = Vec::with_capacity(req.hook_ids.len());
-    for hook_id in &req.hook_ids {
-        match retriever.retrieve_memory(hook_id).await {
-            Ok(memory) => results.push(BatchRetrieveItem {
-                hook_id: hook_id.clone(),
-                success: true,
-                data: Some(memory),
-                error: None,
-            }),
-            Err(e) => results.push(BatchRetrieveItem {
-                hook_id: hook_id.clone(),
-                success: false,
-                data: None,
-                error: Some(e.to_string()),
-            }),
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(item) => results.push(item),
+            Err(e) => {
+                tracing::error!(error = %e, "batch_retrieve 任务 panic，跳过");
+                results.push(BatchRetrieveItem {
+                    hook_id: String::new(),
+                    success: false,
+                    data: None,
+                    error: Some(format!("内部任务错误: {e}")),
+                });
+            }
         }
     }
 

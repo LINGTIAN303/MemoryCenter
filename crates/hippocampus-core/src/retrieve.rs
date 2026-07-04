@@ -168,6 +168,7 @@ fn period_order(period: &str) -> u8 {
 /// 检索器
 ///
 /// 持有 [`Storage`] 引用，从存储实时读取索引文档和记忆文件。
+#[derive(Clone)]
 pub struct Retriever {
     /// 存储后端
     storage: Arc<dyn Storage>,
