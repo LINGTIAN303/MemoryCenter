@@ -169,6 +169,11 @@ pub fn create_router(state: AppState) -> axum::Router {
             "/api/v1/sessions/{sid}/memories/{hook_id}/conflicts",
             get(handlers::get_conflicts),
         )
+        // v2.27：冲突预检测端点（POST，不实际写入，复用 MCP 端 key_facts 注入逻辑）
+        .route(
+            "/api/v1/sessions/{sid}/memories/{hook_id}/detect-conflicts",
+            post(handlers::detect_conflicts),
+        )
         // v2.24：API Key 鉴权中间件（对所有路由生效）
         // 顺序：路由定义 → 鉴权中间件 → TraceLayer（在 main.rs 中添加）
         // 注意：axum::middleware 与 crate::middleware 同名，用别名 axum_mw 消歧

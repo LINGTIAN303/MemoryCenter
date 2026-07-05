@@ -434,6 +434,111 @@ pub async fn get_conflicts(
 }
 
 // ============================================================================
+// v2.27：冲突预检测端点（不实际写入）
+// ============================================================================
+
+/// POST /api/v1/sessions/{sid}/memories/{hook_id}/detect-conflicts
+///
+/// 检测单次记忆更新的潜在冲突（不实际写入）。
+/// 与 MCP 端 `detect_conflicts` tool 行为一致：
+/// - 读取 IndexHook 的 summary.key_facts 作为历史事实集
+/// - 注入到 memory.updates（若为空），让 detector 能看到 archive 时的结构化事实
+/// - 调用注入的 conflict_detector（HybridDetector / HeuristicDetector）检测
+///
+/// 与 `update_memory` 的区别：不持久化更新和冲突记录，仅返回检测报告。
+/// 用于 Agent 在 update 前评估风险。
+pub async fn detect_conflicts(
+    State(state): State<AppState>,
+    Path((sid, hook_id)): Path<(String, String)>,
+    Json(req): Json<UpdateMemoryRequest>,
+) -> Result<Json<ConflictsResponse>, AppError> {
+    // 空更新校验
+    if req.added_facts.is_empty() && req.revised_facts.is_empty() && req.deprecated_facts.is_empty()
+    {
+        return Err(AppError::BadRequest(
+            "更新内容不能为空：至少需要一项 added/revised/deprecated facts".into(),
+        ));
+    }
+
+    let storage = create_storage(&state);
+    let retriever = Retriever::new(storage.clone(), &sid, req.project_id);
+
+    // v2.27：使用 find_hook_by_id 获取完整 IndexHook（含 summary.key_facts）
+    let hook = retriever.find_hook_by_id(&hook_id).await.ok_or_else(|| {
+        AppError::NotFound(format!("未找到钩子 ID: {}", hook_id))
+    })?;
+
+    // 读取现有记忆
+    let mut existing = storage.read_memory(&hook.memory_id).await?;
+
+    // v2.27：若 memory.updates 为空但 IndexHook 有 key_facts，
+    // 把 key_facts 作为虚拟 MemoryUpdateRecord 注入，让 detector 能看到历史事实。
+    // 解决 archive 只写 turns 不写 updates 的设计缺陷（与 MCP 端保持一致）。
+    if existing.updates.is_empty() && !hook.summary.key_facts.is_empty() {
+        use hippocampus_core::model::MemoryUpdateRecord;
+        let mut virtual_update = hippocampus_core::model::MemoryUpdate::new();
+        for fact in &hook.summary.key_facts {
+            virtual_update = virtual_update.add_fact(fact.clone());
+        }
+        existing.updates.push(MemoryUpdateRecord {
+            updated_at: hook.archived_at,
+            update: virtual_update,
+            conflicts: vec![],
+        });
+        tracing::debug!(
+            session = %sid,
+            hook_id = %hook_id,
+            facts_count = hook.summary.key_facts.len(),
+            "detect_conflicts: 已从 IndexHook 注入 key_facts 作为历史事实集"
+        );
+    }
+
+    // 构造 MemoryUpdate（逐条添加保持事实粒度，v2.25.1）
+    let mut update = hippocampus_core::model::MemoryUpdate::new();
+    for fact in &req.added_facts {
+        update = update.add_fact(fact.clone());
+    }
+    for fact in &req.revised_facts {
+        update = update.revise_fact(fact.clone());
+    }
+    for fact in &req.deprecated_facts {
+        update = update.deprecate_fact(fact.clone());
+    }
+
+    // 调用检测器（未配置时降级为 HeuristicDetector）
+    let detector: Arc<dyn hippocampus_core::conflict::ConflictDetector> =
+        match &state.conflict_detector {
+            Some(d) => Arc::clone(d),
+            None => Arc::new(hippocampus_core::heuristic::HeuristicDetector::new()),
+        };
+    let report = detector.detect(&update, &existing).await;
+
+    let total = report.count();
+    let has_critical = report.has_critical();
+    let critical_count = report
+        .conflicts
+        .iter()
+        .filter(|c| c.severity == hippocampus_core::conflict::Severity::Critical)
+        .count();
+
+    tracing::info!(
+        session = %sid,
+        hook_id = %hook_id,
+        memory_id = %hook.memory_id,
+        total = total,
+        critical = critical_count,
+        has_critical = has_critical,
+        "冲突预检测完成（未写入）"
+    );
+
+    Ok(Json(ConflictsResponse {
+        total,
+        critical_count,
+        conflicts: report.conflicts,
+    }))
+}
+
+// ============================================================================
 // v2.5 批次 6：批量操作端点
 // ============================================================================
 
