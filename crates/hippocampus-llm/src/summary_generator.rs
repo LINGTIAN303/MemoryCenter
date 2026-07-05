@@ -201,7 +201,45 @@ impl SummaryGenerator for HttpSummaryGenerator {
         }
 
         let prompt = self.build_prompt(file);
+        self.call_llm(file, prompt).await
+    }
 
+    /// v2.29：支持 per-request 模板覆盖
+    ///
+    /// - `Some(template)`：用传入模板替换 `{conversation}` 后作为 prompt
+    /// - `None`：等价于 `generate_summary`（使用内部模板或默认硬编码）
+    async fn generate_summary_with_template(
+        &self,
+        file: &MemoryFile,
+        template_override: Option<&str>,
+    ) -> hippocampus_core::Result<Summary> {
+        // 未配置 API URL：降级为启发式
+        if self.config.api_url.is_empty() {
+            tracing::warn!("摘要生成器未配置 api_url，降级为启发式");
+            return Ok(Self::heuristic_fallback(file));
+        }
+
+        let prompt = if let Some(tpl) = template_override {
+            // 用传入模板覆盖（替换 {conversation} 占位符）
+            let conversation = Self::extract_conversation(file);
+            tpl.replace("{conversation}", &conversation)
+        } else {
+            self.build_prompt(file)
+        };
+
+        self.call_llm(file, prompt).await
+    }
+}
+
+impl HttpSummaryGenerator {
+    /// 实际调用 LLM API 并解析响应（v2.29 提取的公共逻辑）
+    ///
+    /// `generate_summary` 和 `generate_summary_with_template` 共用此方法。
+    async fn call_llm(
+        &self,
+        file: &MemoryFile,
+        prompt: String,
+    ) -> hippocampus_core::Result<Summary> {
         let request_body = serde_json::json!({
             "model": self.config.model,
             "messages": [
@@ -268,6 +306,7 @@ impl SummaryGenerator for HttpSummaryGenerator {
         }
 
         tracing::warn!(raw = %content, "无法从 LLM 响应中解析摘要，降级为启发式");
+        let _ = file; // file 参数仅在 heuristic_fallback 中使用
         Ok(Self::heuristic_fallback(file))
     }
 }

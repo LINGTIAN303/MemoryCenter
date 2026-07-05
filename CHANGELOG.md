@@ -7,6 +7,85 @@
 ### 计划中
 - v2.4：WASM 组件（待生态成熟）+ Node/Go/Java 绑定
 
+### v2.29 - Presets Create 全链路落地（2026-07-05）
+
+#### 背景
+v2.21 引入 PresetBuilder + 5 Profile 联动机制后，CombinedProfile 一直未被 archive/compaction 实际消费（仍用 `ArchiveConfig::default()` + 固定模板）。本版本让 PresetBuilder 真正影响 archive 行为，覆盖 core / HTTP API / MCP / Python 4 个层面。
+
+#### 核心机制
+- **预设生命周期**：即时计算（不持久化，无状态）
+- **应用方式**：archive 内联参数（请求体新增可选 `preset` 字段，服务端 build 后应用 `archive_threshold` + `summary_template`）
+- **优先级链**：用户 > scenario > model > 默认 400K
+- **DRY 公共函数**：`hippocampus_presets::build_from_strings` 被 server / mcp / python 三端共享
+
+#### 变更
+
+##### 阶段 1：core 改造
+- **`SummaryGenerator` trait**（`crates/hippocampus-core/src/generate.rs`）
+  - 新增默认方法 `generate_summary_with_template(file, template)`，默认实现忽略 template 调用 `generate_summary`（向后兼容）
+- **`Archiver` / `Compactor`**（`crates/hippocampus-core/src/archive.rs` / `compact.rs`）
+  - 新增 `summary_template_override: Option<String>` 字段 + `with_summary_template_override` builder
+  - `archive()` / `compaction` 根据 override 选择调用 `generate_summary_with_template(Some(tpl))` 或 `generate_summary()`
+- **`HttpSummaryGenerator`**（`crates/hippocampus-llm/src/summary_generator.rs`）
+  - 覆盖 `generate_summary_with_template`，提取公共 `call_llm` 方法
+
+##### 阶段 2：HTTP API
+- **`crates/hippocampus-server/src/presets.rs`**（新文件）
+  - 4 个端点：`POST /api/v1/presets/build` / `GET /presets/agents` / `GET /presets/scenarios` / `GET /presets/models`
+  - 公共函数 `build_combined_from_request` 复用 `build_from_strings`
+- **`crates/hippocampus-server/src/handlers.rs`**
+  - `ArchiveRequest` 新增 `preset: Option<PresetRequest>` 字段
+  - archive handler 应用 `archive_threshold`（覆盖 `ArchiveConfig.token_threshold` + `force_truncate_limit` 按 3/2 比例放大）+ `summary_template_override`
+
+##### 阶段 3：MCP 工具
+- **`crates/hippocampus-presets/src/builder.rs`**
+  - 新增公共函数 `build_from_strings` + `scenario_from_str`（供 server / mcp / python 复用）
+- **`crates/hippocampus-mcp/src/lib.rs`**
+  - `ArchiveParams` 新增 `preset: Option<PresetParams>` 字段（派生 Default 向后兼容）
+  - `archive` tool 改造：解析 preset → build_from_strings → 应用 archive_threshold + summary_template_override
+  - 新增 4 个 preset_* tool：`preset_build` / `preset_list_agents` / `preset_list_scenarios` / `preset_list_models`
+  - 13 个新增测试覆盖 preset 应用链路
+
+##### 阶段 4：Python 绑定
+- **`crates/hippocampus-python/Cargo.toml`**：新增 3 个依赖（hippocampus-models / -windows / -skills）
+- **`crates/hippocampus-python/src/lib.rs`**
+  - 删除本地 `scenario_from_str`，改用 `hippocampus_presets::scenario_from_str`（DRY）
+  - 新增辅助函数 `window_scheme_from_str`（6 种窗口预设名解析）
+  - 新增辅助函数 `build_combined_from_preset`（Python dict → CombinedProfile）
+  - `PyPresetBuilder` 补齐 4 个方法：`with_model` / `with_window` / `with_skill` / `with_skills`
+  - `PyPresetBuilder.build()` 返回更完整字段：`model_name` / `window_scheme` / `window_trigger_threshold` / `skills`
+  - `Hippocampus.archive()` 新增可选 `preset` 参数（`#[pyo3(signature = (turns, preset=None))]`）
+  - 新增 3 个模块函数：`supported_models()` / `supported_skills()` / `supported_windows()`
+  - 10 个新增测试覆盖 with_model / with_window / with_skill / with_skills / build_from_strings / archive with preset
+
+#### 测试
+- hippocampus-python：19 测试通过（含 10 个新增）
+- hippocampus-mcp：38 测试通过（含 13 个新增）
+- hippocampus-presets：21 测试通过（含 2 个新增公共函数测试）
+- 整个 workspace：426+ 测试通过，0 失败
+
+#### 兼容性
+- **HTTP API**：`ArchiveRequest.preset` 为 `Option`，旧请求不传 `preset` 字段保持原行为
+- **MCP**：`ArchiveParams` 派生 `Default`，旧调用方用 `..Default::default()` 兼容
+- **Python**：`Hippocampus.archive(turns, preset=None)` 默认 `None` 保持原行为
+- **trait 默认方法**：旧 `SummaryGenerator` 实现自动忽略 template 参数
+
+#### 涉及文件
+- `crates/hippocampus-core/src/generate.rs`
+- `crates/hippocampus-core/src/archive.rs`
+- `crates/hippocampus-core/src/compact.rs`
+- `crates/hippocampus-llm/src/summary_generator.rs`
+- `crates/hippocampus-presets/src/builder.rs`
+- `crates/hippocampus-presets/src/lib.rs`
+- `crates/hippocampus-server/Cargo.toml`
+- `crates/hippocampus-server/src/presets.rs`（新）
+- `crates/hippocampus-server/src/lib.rs`
+- `crates/hippocampus-server/src/handlers.rs`
+- `crates/hippocampus-mcp/Cargo.toml`
+- `crates/hippocampus-mcp/src/lib.rs`
+- `crates/hippocampus-python/Cargo.toml`
+- `crates/hippocampus-python/src/lib.rs`
+
 ### v2.28 - HybridDetector 字段级 merge 替代二选一丢弃（2026-07-05）
 
 #### 背景

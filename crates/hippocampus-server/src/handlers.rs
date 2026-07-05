@@ -27,6 +27,32 @@ pub struct ArchiveRequest {
     pub turns: Vec<MessageTurn>,
     /// 项目 ID（可选，影响存储路径）
     pub project_id: Option<String>,
+    /// 预设配置（v2.29，可选）
+    ///
+    /// 传入后服务端即时构建 CombinedProfile，应用：
+    /// - `archive_threshold` 覆盖默认 ArchiveConfig.token_threshold
+    /// - `summary_template` 通过 `with_summary_template_override` 注入
+    ///
+    /// 未传入时保持原行为（`ArchiveConfig::default()` + 内部模板）。
+    pub preset: Option<PresetRequest>,
+}
+
+/// 预设请求体（archive 内联参数，v2.29）
+///
+/// 所有字段可选，未提供的字段使用默认值或联动推导。
+/// 与 `POST /api/v1/presets/build` 的请求体结构一致。
+#[derive(Deserialize, Default)]
+pub struct PresetRequest {
+    /// Agent display_name（如 "Claude Code"）
+    pub agent: Option<String>,
+    /// Scenario 名称（大小写不敏感）
+    pub scenario: Option<String>,
+    /// ModelVariant 名称
+    pub model: Option<String>,
+    /// 用户覆盖：归档阈值
+    pub archive_threshold: Option<usize>,
+    /// 用户覆盖：摘要模板（需含 {conversation}）
+    pub summary_template: Option<String>,
 }
 
 /// compaction 请求体
@@ -76,6 +102,10 @@ fn create_storage(state: &AppState) -> Arc<dyn Storage> {
 /// POST /api/v1/sessions/{sid}/archive
 ///
 /// 归档一批轮次为记忆文件，生成索引钩子。
+///
+/// v2.29：支持 `preset` 字段（内联预设），传入后：
+/// - 用 `archive_threshold` 覆盖默认 ArchiveConfig.token_threshold
+/// - 用 `summary_template` 通过 `with_summary_template_override` 注入
 pub async fn archive(
     State(state): State<AppState>,
     Path(sid): Path<String>,
@@ -85,14 +115,41 @@ pub async fn archive(
         return Err(AppError::BadRequest("turns 不能为空".to_string()));
     }
 
+    // v2.29：若传入 preset，构建 CombinedProfile 提取 archive_threshold + summary_template
+    let (archive_threshold, summary_template) = if let Some(preset_req) = &req.preset {
+        let combined = crate::presets::build_combined_from_request(preset_req)
+            .map_err(AppError::BadRequest)?;
+        (
+            Some(combined.archive_threshold()),
+            Some(combined.summary_template().to_string()),
+        )
+    } else {
+        (None, None)
+    };
+
     let storage = create_storage(&state);
-    let config = ArchiveConfig::default();
+    // v2.29：archive_threshold 覆盖默认 token_threshold（force_truncate_limit 按比例放大）
+    let config = if let Some(threshold) = archive_threshold {
+        ArchiveConfig {
+            token_threshold: threshold,
+            force_truncate_limit: threshold * 3 / 2,
+            wait_for_turn_completion: true,
+        }
+    } else {
+        ArchiveConfig::default()
+    };
     let mut archiver = Archiver::new(config, storage, &sid, req.project_id);
 
     // v2.21 批次 8b: 若注入了 summary_generator，注入到 Archiver
     // 注入后 archive() 时调用 LLM 生成结构化摘要，失败时降级为启发式
     if let Some(gen) = &state.summary_generator {
         archiver = archiver.with_summary_generator(gen.clone());
+    }
+
+    // v2.29：若构建出 summary_template，注入到 Archiver
+    // 通过 with_summary_template_override 覆盖 HttpSummaryGenerator 的内部模板
+    if let Some(tpl) = summary_template {
+        archiver = archiver.with_summary_template_override(tpl);
     }
 
     for turn in req.turns {
@@ -115,6 +172,7 @@ pub async fn archive(
         session = %sid,
         hook_id = %summary.hook_id,
         tokens = summary.token_count,
+        has_preset = archive_threshold.is_some(),
         "归档成功"
     );
 

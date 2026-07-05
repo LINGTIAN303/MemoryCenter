@@ -210,6 +210,100 @@ fn derived_window_scheme(w: &WindowProfile) -> String {
 }
 
 // ============================================================================
+// 字符串参数构建（v2.29 公共函数，供 server / mcp / python 复用）
+// ============================================================================
+
+/// 字符串解析为 Scenario（大小写不敏感）
+///
+/// 支持的别名：coding / writing / research / daily / finance / design / officework|office|work
+/// 未匹配则返回 `Scenario::Custom(s)`。
+pub fn scenario_from_str(s: &str) -> hippocampus_scenarios::Scenario {
+    let lower = s.to_lowercase();
+    match lower.as_str() {
+        "coding" => hippocampus_scenarios::Scenario::Coding,
+        "writing" => hippocampus_scenarios::Scenario::Writing,
+        "research" => hippocampus_scenarios::Scenario::Research,
+        "daily" => hippocampus_scenarios::Scenario::Daily,
+        "finance" => hippocampus_scenarios::Scenario::Finance,
+        "design" => hippocampus_scenarios::Scenario::Design,
+        "officework" | "office" | "work" => hippocampus_scenarios::Scenario::OfficeWork,
+        _ => hippocampus_scenarios::Scenario::Custom(s.to_string()),
+    }
+}
+
+/// 从字符串参数构建 CombinedProfile（v2.29）
+///
+/// 公共函数，供 `hippocampus-server` 的 archive handler / build_preset 端点、
+/// `hippocampus-mcp` 的 archive tool / preset_build tool 共用。
+///
+/// ## 参数
+///
+/// 所有参数可选，未提供的字段使用默认值或联动推导：
+/// - `agent`：Agent display_name（如 "Claude Code"），未匹配则视为 Custom Agent
+/// - `scenario`：Scenario 名称（大小写不敏感，如 "coding" / "Coding"）
+/// - `model`：ModelVariant 名称（如 "claude-opus-4.8"），未找到则返回错误
+/// - `archive_threshold`：用户覆盖归档阈值（最高优先级）
+/// - `summary_template`：用户覆盖摘要模板（最高优先级，需含 `{conversation}`）
+///
+/// ## 错误
+///
+/// - `model` 未找到：`"未找到型号: {name}"`
+/// - `summary_template` 缺少 `{conversation}`：`"summary_template 必须包含 {conversation} 占位符"`
+/// - Profile 校验失败：`"预设构建失败: {err}"`
+pub fn build_from_strings(
+    agent: Option<&str>,
+    scenario: Option<&str>,
+    model: Option<&str>,
+    archive_threshold: Option<usize>,
+    summary_template: Option<&str>,
+) -> Result<CombinedProfile, String> {
+    let mut builder = PresetBuilder::new();
+
+    // 1. Agent
+    if let Some(agent_str) = agent {
+        let family = hippocampus_agents::AgentFamily::from_str(agent_str)
+            .unwrap_or_else(|| hippocampus_agents::AgentFamily::Custom(agent_str.to_string()));
+        let profile = hippocampus_agents::AgentProfile::from_family(family);
+        builder = builder.with_agent(profile);
+    }
+
+    // 2. Scenario
+    if let Some(scenario_str) = scenario {
+        let sc = scenario_from_str(scenario_str);
+        let profile = hippocampus_scenarios::ScenarioProfile::from_scenario(sc);
+        builder = builder.with_scenario(profile);
+    }
+
+    // 3. Model
+    if let Some(model_str) = model {
+        match hippocampus_models::ModelRegistry::find(model_str) {
+            Some(variant) => {
+                builder = builder.with_model(variant);
+            }
+            None => {
+                return Err(format!(
+                    "未找到型号: {}（GET /api/v1/presets/models 查询支持的型号）",
+                    model_str
+                ));
+            }
+        }
+    }
+
+    // 4. 用户覆盖
+    if let Some(threshold) = archive_threshold {
+        builder = builder.with_user_archive_threshold(threshold);
+    }
+    if let Some(template) = summary_template {
+        if !template.contains("{conversation}") {
+            return Err("summary_template 必须包含 {conversation} 占位符".to_string());
+        }
+        builder = builder.with_user_summary_template(template);
+    }
+
+    builder.build().map_err(|e| format!("预设构建失败: {}", e))
+}
+
+// ============================================================================
 // 单元测试
 // ============================================================================
 

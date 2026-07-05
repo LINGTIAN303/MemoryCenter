@@ -87,6 +87,13 @@ pub struct Compactor {
     ///
     /// 通过 [`Compactor::with_summary_generator`] 注入。
     summary_generator: Option<Arc<dyn SummaryGenerator>>,
+
+    /// 可选的摘要模板覆盖（v2.29 Presets 落地）
+    ///
+    /// 来自 `CombinedProfile::summary_template()`，weekly/monthly 合并后通过
+    /// [`SummaryGenerator::generate_summary_with_template`] 传入。
+    /// `None` 时调用 [`generate_summary`](SummaryGenerator::generate_summary)（向后兼容）。
+    summary_template_override: Option<String>,
 }
 
 /// 寒暄判定核心逻辑（自由函数，供测试直接调用）
@@ -164,6 +171,7 @@ impl Compactor {
             async_scorer: None,
             cleanup_daily_after_weekly_merge: false,
             summary_generator: None,
+            summary_template_override: None,
         }
     }
 
@@ -250,6 +258,20 @@ impl Compactor {
     /// ```
     pub fn with_summary_generator(mut self, gen: Arc<dyn SummaryGenerator>) -> Self {
         self.summary_generator = Some(gen);
+        self
+    }
+
+    /// 注入摘要模板覆盖（v2.29 Presets 落地）
+    ///
+    /// 来自 `CombinedProfile::summary_template()`，weekly/monthly 合并后通过
+    /// [`SummaryGenerator::generate_summary_with_template`] 传入。
+    ///
+    /// - `Some(template)`：调用 `generate_summary_with_template(Some(template))`
+    /// - `None`：调用 `generate_summary()`（向后兼容）
+    ///
+    /// 模板需含 `{conversation}` 占位符。未注入 summary_generator 时本字段无效果。
+    pub fn with_summary_template_override(mut self, template: impl Into<String>) -> Self {
+        self.summary_template_override = Some(template.into());
         self
     }
 
@@ -394,18 +416,25 @@ impl Compactor {
         }
 
         // v2.22: 若注入了 LLM 摘要生成器，对合并后的 weekly MemoryFile 生成结构化摘要
+        // v2.29: 若注入了 summary_template_override，通过 generate_summary_with_template 覆盖模板
         //
         // 所有 weekly 钩子共用同一个 LLM Summary（代表周级整体记忆）。
         // 降级策略：LLM 调用失败时保留启发式 Summary（v2.4 机械拼接），主流程不中断。
         if !weekly_index.hooks.is_empty() {
             if let Some(gen) = &self.summary_generator {
-                match gen.generate_summary(&merged_memory).await {
+                let result = if let Some(tpl) = &self.summary_template_override {
+                    gen.generate_summary_with_template(&merged_memory, Some(tpl)).await
+                } else {
+                    gen.generate_summary(&merged_memory).await
+                };
+                match result {
                     Ok(llm_summary) => {
                         tracing::info!(
                             title = %llm_summary.title,
                             facts_count = llm_summary.key_facts.len(),
                             entities_count = llm_summary.key_entities.len(),
                             hooks_count = weekly_index.hooks.len(),
+                            has_template_override = self.summary_template_override.is_some(),
                             "weekly LLM 摘要生成成功，替换启发式 Summary"
                         );
                         for hook in &mut weekly_index.hooks {
@@ -614,18 +643,25 @@ impl Compactor {
         }
 
         // v2.22: 若注入了 LLM 摘要生成器，对合并后的 monthly 主记忆 MemoryFile 生成结构化摘要
+        // v2.29: 若注入了 summary_template_override，通过 generate_summary_with_template 覆盖模板
         //
         // 所有 monthly 钩子共用同一个 LLM Summary（代表月级整体记忆）。
         // 降级策略：LLM 调用失败时保留原 weekly 钩子的 Summary，主流程不中断。
         if !monthly_index.hooks.is_empty() {
             if let Some(gen) = &self.summary_generator {
-                match gen.generate_summary(&main_memory).await {
+                let result = if let Some(tpl) = &self.summary_template_override {
+                    gen.generate_summary_with_template(&main_memory, Some(tpl)).await
+                } else {
+                    gen.generate_summary(&main_memory).await
+                };
+                match result {
                     Ok(llm_summary) => {
                         tracing::info!(
                             title = %llm_summary.title,
                             facts_count = llm_summary.key_facts.len(),
                             entities_count = llm_summary.key_entities.len(),
                             hooks_count = monthly_index.hooks.len(),
+                            has_template_override = self.summary_template_override.is_some(),
                             "monthly LLM 摘要生成成功，替换原 weekly Summary"
                         );
                         for hook in &mut monthly_index.hooks {

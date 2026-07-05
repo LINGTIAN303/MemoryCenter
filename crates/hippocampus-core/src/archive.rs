@@ -64,6 +64,12 @@ pub struct Archiver {
     /// 注入后 `archive()` 时调用 `generate_summary()` 生成结构化摘要填入 IndexHook。
     /// 未注入或调用失败时降级为 `Summary::from_title`（启发式，向后兼容）。
     summary_generator: Option<Arc<dyn SummaryGenerator>>,
+    /// 可选的摘要模板覆盖（v2.29 Presets 落地）
+    ///
+    /// 来自 `CombinedProfile::summary_template()`，archive 时通过
+    /// [`SummaryGenerator::generate_summary_with_template`] 传入。
+    /// `None` 时调用 [`generate_summary`](SummaryGenerator::generate_summary)（向后兼容）。
+    summary_template_override: Option<String>,
 }
 
 impl Archiver {
@@ -87,6 +93,7 @@ impl Archiver {
             session_id: session_id.into(),
             project_id,
             summary_generator: None,
+            summary_template_override: None,
         }
     }
 
@@ -102,6 +109,20 @@ impl Archiver {
     /// - 未注入：使用 `Summary::from_title`（向后兼容）
     pub fn with_summary_generator(mut self, gen: Arc<dyn SummaryGenerator>) -> Self {
         self.summary_generator = Some(gen);
+        self
+    }
+
+    /// 注入摘要模板覆盖（v2.29 Presets 落地）
+    ///
+    /// 来自 `CombinedProfile::summary_template()`，archive 时通过
+    /// [`SummaryGenerator::generate_summary_with_template`] 传入。
+    ///
+    /// - `Some(template)`：调用 `generate_summary_with_template(Some(template))`
+    /// - `None`：调用 `generate_summary()`（向后兼容）
+    ///
+    /// 模板需含 `{conversation}` 占位符。未注入 summary_generator 时本字段无效果。
+    pub fn with_summary_template_override(mut self, template: impl Into<String>) -> Self {
+        self.summary_template_override = Some(template.into());
         self
     }
 
@@ -194,15 +215,22 @@ impl Archiver {
         let mut hook = IndexHook::from_memory_file(&memory_file, memory_path);
 
         // 5.1 v2.21 批次 8a: 若注入了 LLM 摘要生成器，尝试生成结构化摘要替换启发式
+        // v2.29: 若注入了 summary_template_override，通过 generate_summary_with_template 覆盖模板
         //
         // 降级策略：LLM 调用失败时保留启发式摘要，归档主流程不中断
         if let Some(gen) = &self.summary_generator {
-            match gen.generate_summary(&memory_file).await {
+            let result = if let Some(tpl) = &self.summary_template_override {
+                gen.generate_summary_with_template(&memory_file, Some(tpl)).await
+            } else {
+                gen.generate_summary(&memory_file).await
+            };
+            match result {
                 Ok(llm_summary) => {
                     tracing::info!(
                         title = %llm_summary.title,
                         facts_count = llm_summary.key_facts.len(),
                         entities_count = llm_summary.key_entities.len(),
+                        has_template_override = self.summary_template_override.is_some(),
                         "LLM 摘要生成成功，替换启发式摘要"
                     );
                     hook.summary = llm_summary;
@@ -552,5 +580,96 @@ mod tests {
         // 启发式摘要：首条消息前 80 字符 + "..."
         assert!(hook.summary.title.contains("测试用户消息"));
         assert!(hook.summary.title.ends_with("..."));
+    }
+
+    // ========================================================================
+    // v2.29: summary_template_override 测试
+    // ========================================================================
+
+    /// 记录传入的 template_override 参数的 Mock 生成器
+    struct TemplateRecordingGenerator {
+        last_template: std::sync::Mutex<Option<String>>,
+    }
+
+    impl TemplateRecordingGenerator {
+        fn new() -> Self {
+            Self {
+                last_template: std::sync::Mutex::new(None),
+            }
+        }
+        fn last_template(&self) -> Option<String> {
+            self.last_template.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SummaryGenerator for TemplateRecordingGenerator {
+        async fn generate_summary(&self, _file: &MemoryFile) -> crate::Result<Summary> {
+            // 默认方法：记录 None
+            *self.last_template.lock().unwrap() = None;
+            Ok(Summary::from_title("default-call"))
+        }
+
+        async fn generate_summary_with_template(
+            &self,
+            _file: &MemoryFile,
+            template_override: Option<&str>,
+        ) -> crate::Result<Summary> {
+            // 记录传入的 template_override
+            *self.last_template.lock().unwrap() =
+                template_override.map(|s| s.to_string());
+            Ok(Summary::from_title("template-call"))
+        }
+    }
+
+    /// 注入 summary_template_override 后，archive() 应调用
+    /// `generate_summary_with_template(Some(template))` 而非 `generate_summary`
+    #[tokio::test]
+    async fn test_archive_with_summary_template_override() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+        let config = ArchiveConfig {
+            token_threshold: 100,
+            force_truncate_limit: 150,
+            wait_for_turn_completion: true,
+        };
+        let gen: Arc<TemplateRecordingGenerator> = Arc::new(TemplateRecordingGenerator::new());
+        let gen_dyn: Arc<dyn SummaryGenerator> = gen.clone();
+        let mut archiver = Archiver::new(config, storage, "sess-tpl-001", None)
+            .with_summary_generator(gen_dyn)
+            .with_summary_template_override("custom preset template {conversation}");
+
+        archiver.push_turn(make_turn(110));
+        let (_memory, hook) = archiver.archive().await.unwrap();
+
+        // 验证调用了 generate_summary_with_template，且传入了 template
+        assert_eq!(gen.last_template(), Some("custom preset template {conversation}".to_string()));
+        // 验证返回的是 template-call 的结果
+        assert_eq!(hook.summary.title, "template-call");
+    }
+
+    /// 未注入 summary_template_override 时，archive() 应调用
+    /// `generate_summary`（向后兼容）
+    #[tokio::test]
+    async fn test_archive_without_template_override_uses_default() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+        let config = ArchiveConfig {
+            token_threshold: 100,
+            force_truncate_limit: 150,
+            wait_for_turn_completion: true,
+        };
+        let gen: Arc<TemplateRecordingGenerator> = Arc::new(TemplateRecordingGenerator::new());
+        let gen_dyn: Arc<dyn SummaryGenerator> = gen.clone();
+        let mut archiver = Archiver::new(config, storage, "sess-tpl-002", None)
+            .with_summary_generator(gen_dyn);
+        // 不注入 summary_template_override
+
+        archiver.push_turn(make_turn(110));
+        let (_memory, hook) = archiver.archive().await.unwrap();
+
+        // 验证调用了 generate_summary（template 记录为 None）
+        assert_eq!(gen.last_template(), None);
+        assert_eq!(hook.summary.title, "default-call");
     }
 }

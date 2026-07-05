@@ -80,6 +80,6 @@ pub mod builder;
 pub mod combined;
 pub mod linkage;
 
-pub use builder::PresetBuilder;
+pub use builder::{build_from_strings, scenario_from_str, PresetBuilder};
 pub use combined::CombinedProfile;
 pub use linkage::derive_window_from_agent;

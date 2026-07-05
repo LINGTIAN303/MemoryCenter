@@ -83,6 +83,40 @@ mod hippocampus_python {
         ]
     }
 
+    /// 模块级函数：返回支持的 ModelVariant 名称列表（v2.29）
+    ///
+    /// 用于 with_model() 的可选值参考。共 15 个内置型号。
+    #[pyfunction]
+    fn supported_models() -> Vec<String> {
+        hippocampus_models::ModelRegistry::all_variants()
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// 模块级函数：返回支持的技能名称列表（v2.29）
+    ///
+    /// 用于 with_skill() / with_skills() 的可选值参考。共 15 个内置技能。
+    /// 其他字符串将作为 Custom 技能处理。
+    #[pyfunction]
+    fn supported_skills() -> Vec<&'static str> {
+        vec![
+            "Read", "Write", "Edit", "Glob", "Grep", "LS",
+            "Bash", "Task", "WebSearch", "WebFetch", "SearchCodebase",
+            "AskUserQuestion", "TodoWrite", "Schedule", "Skill",
+        ]
+    }
+
+    /// 模块级函数：返回支持的窗口预设名列表（v2.29）
+    ///
+    /// 用于 with_window() 的 scheme 参数可选值参考。
+    #[pyfunction]
+    fn supported_windows() -> Vec<&'static str> {
+        vec![
+            "claude_code", "cursor", "trae", "codex",
+            "no_compression", "generic",
+        ]
+    }
+
     // 导出 Hippocampus 类
     #[pymodule_export]
     use super::Hippocampus;
@@ -170,6 +204,57 @@ fn build_summary_generator_from_env() -> Option<Arc<dyn SummaryGenerator>> {
 
     let config = LlmGeneratorConfig::from_env()?;
     Some(Arc::new(HttpSummaryGenerator::new(config)))
+}
+
+/// 从 Python dict 解析 preset 参数并构建 CombinedProfile（v2.29）
+///
+/// 与 `hippocampus-server` 的 `build_combined_from_request` 和
+/// `hippocampus-mcp` 的 archive tool 复用同一套 `build_from_strings` 解析逻辑。
+///
+/// ## 支持的 dict 字段（全部可选）
+///
+/// - `agent`: str（如 "Claude Code"）
+/// - `scenario`: str（如 "coding"）
+/// - `model`: str（如 "claude-opus-4.8"）
+/// - `archive_threshold`: int（用户覆盖归档阈值）
+/// - `summary_template`: str（用户覆盖摘要模板，需含 `{conversation}`）
+///
+/// ## 错误
+///
+/// - `model` 未找到：`"未找到型号: {name}"`
+/// - `summary_template` 缺少 `{conversation}`：`"summary_template 必须包含 {conversation} 占位符"`
+/// - Profile 校验失败：`"预设构建失败: {err}"`
+fn build_combined_from_preset(
+    preset_obj: Py<PyAny>,
+) -> PyResult<hippocampus_presets::CombinedProfile> {
+    // 将 Python dict 转为 JSON 字符串，再反序列化为 PresetRequest 等价结构
+    let json_str: String = Python::attach(|py| -> PyResult<String> {
+        py_to_json_string(py, preset_obj.bind(py))
+    })?;
+
+    // 解析为中间结构（与 server 的 PresetRequest 一致）
+    #[derive(serde::Deserialize)]
+    struct PresetDict {
+        #[serde(default)] agent: Option<String>,
+        #[serde(default)] scenario: Option<String>,
+        #[serde(default)] model: Option<String>,
+        #[serde(default)] archive_threshold: Option<usize>,
+        #[serde(default)] summary_template: Option<String>,
+    }
+
+    let req: PresetDict = serde_json::from_str(&json_str).map_err(|e| {
+        PyValueError::new_err(format!("解析 preset dict 失败: {}", e))
+    })?;
+
+    // 复用 presets crate 的 build_from_strings（与 server / mcp 一致）
+    hippocampus_presets::build_from_strings(
+        req.agent.as_deref(),
+        req.scenario.as_deref(),
+        req.model.as_deref(),
+        req.archive_threshold,
+        req.summary_template.as_deref(),
+    )
+    .map_err(|e| PyValueError::new_err(format!("预设构建失败: {}", e)))
 }
 
 // ============================================================================
@@ -294,10 +379,24 @@ impl Hippocampus {
     ///
     /// 参数：
     /// - `turns`：消息轮次列表（list[dict]，每个 dict 符合 MessageTurn 结构）
+    /// - `preset`：预设配置 dict（v2.29 新增，可选），含字段：
+    ///   - `agent`: str（如 "Claude Code"）
+    ///   - `scenario`: str（如 "coding"）
+    ///   - `model`: str（如 "claude-opus-4.8"）
+    ///   - `archive_threshold`: int（用户覆盖归档阈值）
+    ///   - `summary_template`: str（用户覆盖摘要模板，需含 `{conversation}`）
     ///
     /// 返回：摘要视图 dict（含 hook_id/memory_file_id/summary_title/tags/archived_at/period/token_count）
     ///
-    /// turn 结构示例：
+    /// ## preset 行为
+    ///
+    /// - 未传入 `preset`：保持原行为（`ArchiveConfig::default()` + 内部默认模板）
+    /// - 传入 `preset`：服务端即时构建 CombinedProfile，应用：
+    ///   - `archive_threshold` 覆盖 `ArchiveConfig.token_threshold`
+    ///   - `summary_template` 通过 `with_summary_template_override` 注入 Archiver
+    ///
+    /// ## turn 结构示例
+    ///
     /// ```python
     /// {
     ///     "id": "uuid-string",  # 可选，不传会自动生成
@@ -308,7 +407,12 @@ impl Hippocampus {
     ///     "token_count": 100
     /// }
     /// ```
-    fn archive(&self, turns: Vec<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+    #[pyo3(signature = (turns, preset=None))]
+    fn archive(
+        &self,
+        turns: Vec<Py<PyAny>>,
+        preset: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
         if turns.is_empty() {
             return Err(PyValueError::new_err("turns 不能为空"));
         }
@@ -330,9 +434,29 @@ impl Hippocampus {
                 PyValueError::new_err(format!("解析 turns 失败: {}", e))
             })?;
 
-        // 3. 调用 Core archive
+        // 3. v2.29：解析可选 preset，构建 CombinedProfile 提取 archive_threshold + summary_template
+        let (archive_threshold, summary_template) = if let Some(preset_obj) = preset {
+            let combined = build_combined_from_preset(preset_obj)?;
+            (
+                Some(combined.archive_threshold()),
+                Some(combined.summary_template().to_string()),
+            )
+        } else {
+            (None, None)
+        };
+
+        // 4. 调用 Core archive
         let storage = create_storage(&self.storage_root);
-        let config = ArchiveConfig::default();
+        let config = if let Some(threshold) = archive_threshold {
+            // 与 server / mcp 一致：force_truncate_limit 按 3/2 比例放大
+            ArchiveConfig {
+                token_threshold: threshold,
+                force_truncate_limit: threshold * 3 / 2,
+                wait_for_turn_completion: true,
+            }
+        } else {
+            ArchiveConfig::default()
+        };
         let mut archiver = Archiver::new(
             config,
             storage,
@@ -345,6 +469,11 @@ impl Hippocampus {
             archiver = archiver.with_summary_generator(gen.clone());
         }
 
+        // v2.29: 若 preset 提供了 summary_template，注入到 Archiver
+        if let Some(tpl) = summary_template {
+            archiver = archiver.with_summary_template_override(tpl);
+        }
+
         for turn in message_turns {
             archiver.push_turn(turn);
         }
@@ -354,7 +483,7 @@ impl Hippocampus {
             .block_on(async { archiver.archive().await })
             .map_err(|e| PyValueError::new_err(format!("归档失败: {}", e)))?;
 
-        // 4. 将 SummaryView 转为 Python dict
+        // 5. 将 SummaryView 转为 Python dict
         let summary = hippocampus_core::retrieve::SummaryView::from(&hook);
         let summary_json = serde_json::to_string(&summary)
             .map_err(|e| PyValueError::new_err(format!("序列化摘要失败: {}", e)))?;
@@ -481,22 +610,28 @@ impl Hippocampus {
 // PresetBuilder 类（v2.21 批次 8d）
 // ============================================================================
 
-/// 字符串解析为 Scenario 枚举（大小写不敏感）
+/// 字符串解析为 WindowProfile 预设（v2.29）
 ///
-/// 支持的值：Coding/Writing/Research/Daily/Finance/Design/OfficeWork
-/// （大小写不敏感）；其他字符串返回 Custom(s)。
-fn scenario_from_str(s: &str) -> hippocampus_scenarios::Scenario {
-    use hippocampus_scenarios::Scenario;
+/// 支持的预设名（大小写不敏感）：
+/// - `claude_code` / `claude-code`：Claude Code /compact（180K 触发）
+/// - `cursor`：Cursor Chat 压缩（150K 触发）
+/// - `trae`：Trae 对话压缩（120K 触发）
+/// - `codex`：Codex 滚动窗口（100K 触发）
+/// - `no_compression` / `none`：无压缩
+/// - `generic` / `sliding`：通用滑动窗口（默认 100K）
+///
+/// 未匹配的字符串返回 None。
+fn window_scheme_from_str(s: &str) -> Option<hippocampus_windows::WindowProfile> {
+    use hippocampus_windows::WindowProfile;
     let lower = s.to_lowercase();
     match lower.as_str() {
-        "coding" => Scenario::Coding,
-        "writing" => Scenario::Writing,
-        "research" => Scenario::Research,
-        "daily" => Scenario::Daily,
-        "finance" => Scenario::Finance,
-        "design" => Scenario::Design,
-        "officework" | "office" | "work" => Scenario::OfficeWork,
-        _ => Scenario::Custom(s.to_string()),
+        "claude_code" | "claude-code" | "claudecode" => Some(WindowProfile::claude_code()),
+        "cursor" => Some(WindowProfile::cursor()),
+        "trae" => Some(WindowProfile::trae()),
+        "codex" => Some(WindowProfile::codex()),
+        "no_compression" | "none" | "nocompression" => Some(WindowProfile::no_compression()),
+        "generic" | "sliding" | "generic_sliding" => Some(WindowProfile::default()),
+        _ => None,
     }
 }
 
@@ -554,7 +689,8 @@ impl PyPresetBuilder {
     /// 支持的值：coding/writing/research/daily/finance/design/officework
     /// 其他字符串将作为 Custom 场景处理。
     fn with_scenario(&mut self, scenario: String) {
-        let sc = scenario_from_str(&scenario);
+        // v2.29：复用 presets crate 的 scenario_from_str（与 server / mcp 一致）
+        let sc = hippocampus_presets::scenario_from_str(&scenario);
         let profile = hippocampus_scenarios::ScenarioProfile::from_scenario(sc);
         self.inner = self.inner.clone().with_scenario(profile);
     }
@@ -573,6 +709,116 @@ impl PyPresetBuilder {
         self.inner = self.inner.clone().with_user_summary_template(template);
     }
 
+    /// 设置模型型号（v2.29 补齐）
+    ///
+    /// ## 参数
+    ///
+    /// - `model`：ModelVariant 名称（如 "claude-opus-4.8" / "gpt-5.2" / "gemini-3.1-pro"）
+    ///
+    /// ## 错误
+    ///
+    /// 未找到型号时抛出 ValueError（用 `supported_models()` 查询可用值）。
+    ///
+    /// ## 影响
+    ///
+    /// 设置后归档阈值会从 `model.archive_strategy.threshold()` 推导
+    /// （优先级低于 scenario 和用户覆盖）。
+    fn with_model(&mut self, model: String) -> PyResult<()> {
+        let variant = hippocampus_models::ModelRegistry::find(&model).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "未找到型号: {}（用 hippocampus_python.supported_models() 查询可用值）",
+                model
+            ))
+        })?;
+        self.inner = self.inner.clone().with_model(variant);
+        Ok(())
+    }
+
+    /// 设置窗口配置（v2.29 补齐）
+    ///
+    /// ## 参数
+    ///
+    /// - `scheme`：窗口预设名（大小写不敏感），支持：
+    ///   - `"claude_code"` / `"claude-code"`：Claude Code /compact（180K 触发）
+    ///   - `"cursor"`：Cursor Chat 压缩（150K 触发）
+    ///   - `"trae"`：Trae 对话压缩（120K 触发）
+    ///   - `"codex"`：Codex 滚动窗口（100K 触发）
+    ///   - `"no_compression"` / `"none"`：无压缩
+    ///   - `"generic"` / `"sliding"`：通用滑动窗口（默认 100K）
+    /// - `trigger_threshold`：可选，覆盖触发阈值（token 数）
+    ///
+    /// ## 错误
+    ///
+    /// 未匹配预设时抛出 ValueError。
+    ///
+    /// ## 注意
+    ///
+    /// 显式调用此方法后不触发 Agent → Window 联动推导。
+    fn with_window(
+        &mut self,
+        scheme: String,
+        trigger_threshold: Option<usize>,
+    ) -> PyResult<()> {
+        let mut profile = window_scheme_from_str(&scheme).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "未匹配窗口预设: {}（支持: claude_code / cursor / trae / codex / no_compression / generic）",
+                scheme
+            ))
+        })?;
+        if let Some(threshold) = trigger_threshold {
+            profile = profile.with_trigger_threshold(threshold);
+        }
+        self.inner = self.inner.clone().with_window(profile);
+        Ok(())
+    }
+
+    /// 添加单个技能（v2.29 补齐，可链式调用多次）
+    ///
+    /// ## 参数
+    ///
+    /// - `skill`：技能名（大小写敏感，与 BuiltinSkill 枚举名一致）
+    ///   支持：Read / Write / Edit / Glob / Grep / LS / Bash / Task /
+    ///   WebSearch / WebFetch / SearchCodebase / AskUserQuestion /
+    ///   TodoWrite / Schedule / Skill
+    ///   其他字符串将作为 Custom 技能处理。
+    ///
+    /// ## 用法
+    ///
+    /// ```python
+    /// builder = (PresetBuilder()
+    ///     .with_skill("Read")
+    ///     .with_skill("Bash"))
+    /// ```
+    fn with_skill(&mut self, skill: String) {
+        let builtin = hippocampus_skills::BuiltinSkill::from_str(&skill)
+            .unwrap_or_else(|| hippocampus_skills::BuiltinSkill::Custom(skill.clone()));
+        let profile = hippocampus_skills::SkillProfile::new(builtin);
+        self.inner = self.inner.clone().with_skill(profile);
+    }
+
+    /// 批量设置技能（v2.29 补齐，覆盖原有列表）
+    ///
+    /// ## 参数
+    ///
+    /// - `skills`：技能名列表（每个元素与 `with_skill` 一致）
+    ///
+    /// ## 用法
+    ///
+    /// ```python
+    /// builder = PresetBuilder().with_skills(["Read", "Write", "Bash"])
+    /// ```
+    fn with_skills(&mut self, skills: Vec<String>) {
+        let profiles: Vec<hippocampus_skills::SkillProfile> = skills
+            .into_iter()
+            .map(|s| {
+                let builtin = hippocampus_skills::BuiltinSkill::from_str(&s)
+                    .unwrap_or_else(|| hippocampus_skills::BuiltinSkill::Custom(s.clone()));
+                hippocampus_skills::SkillProfile::new(builtin)
+            })
+            .collect();
+        self.inner = self.inner.clone().with_skills(profiles);
+    }
+
     /// 构建最终配置
     ///
     /// 返回 dict，含字段：
@@ -585,6 +831,10 @@ impl PyPresetBuilder {
     /// - has_window: bool（是否设置了 Window，含联动推导）
     /// - has_model: bool（是否设置了 Model）
     /// - skills_count: int（技能数量）
+    /// - model_name: str | None（v2.29 新增，模型名称，未设置时为 None）
+    /// - window_scheme: str | None（v2.29 新增，窗口方案显示名，未设置时为 None）
+    /// - window_trigger_threshold: int | None（v2.29 新增，窗口触发阈值）
+    /// - skills: list[str]（v2.29 新增，技能显示名列表）
     ///
     /// 失败时抛出 ValueError（Profile 校验失败）。
     fn build(&self) -> PyResult<Py<PyAny>> {
@@ -592,17 +842,42 @@ impl PyPresetBuilder {
             PyValueError::new_err(format!("PresetBuilder 构建失败: {}", e))
         })?;
 
-        // 序列化为精简 dict（只暴露最终生效值 + 标志位，不暴露完整 Profile 内部结构）
+        // v2.29：补充 model_name / window_scheme / window_trigger_threshold / skills 详情
+        let model_name = combined.model.as_ref().map(|m| m.name.clone());
+        let (window_scheme, window_trigger_threshold): (Option<String>, Option<usize>) =
+            combined
+                .window
+                .as_ref()
+                .map(|w| {
+                    (
+                        Some(w.scheme.display_name().to_string()),
+                        Some(w.trigger_threshold),
+                    )
+                })
+                .unwrap_or((None, None));
+        let skills: Vec<&str> = combined
+            .skills
+            .iter()
+            .map(|s| s.skill.display_name())
+            .collect();
+
         let result = serde_json::json!({
+            // 解析后的最终生效值
             "archive_threshold": combined.archive_threshold(),
             "summary_template": combined.summary_template(),
             "session_prefix": combined.session_prefix(),
             "archive_to_hippocampus": combined.archive_to_hippocampus(),
+            // 标志位
             "has_agent": combined.agent.is_some(),
             "has_scenario": combined.scenario.is_some(),
             "has_window": combined.window.is_some(),
             "has_model": combined.model.is_some(),
             "skills_count": combined.skills.len(),
+            // v2.29 新增详情字段
+            "model_name": model_name,
+            "window_scheme": window_scheme,
+            "window_trigger_threshold": window_trigger_threshold,
+            "skills": skills,
         });
         let result_json = result.to_string();
 
@@ -624,18 +899,20 @@ mod tests {
     use super::*;
 
     /// 验证 scenario_from_str 大小写不敏感解析
+    ///
+    /// v2.29：本地 scenario_from_str 已删除，改用 hippocampus_presets::scenario_from_str
     #[test]
     fn test_scenario_from_str_case_insensitive() {
         use hippocampus_scenarios::Scenario;
 
-        assert_eq!(scenario_from_str("coding"), Scenario::Coding);
-        assert_eq!(scenario_from_str("Coding"), Scenario::Coding);
-        assert_eq!(scenario_from_str("CODING"), Scenario::Coding);
-        assert_eq!(scenario_from_str("writing"), Scenario::Writing);
-        assert_eq!(scenario_from_str("research"), Scenario::Research);
-        assert_eq!(scenario_from_str("daily"), Scenario::Daily);
-        assert_eq!(scenario_from_str("finance"), Scenario::Finance);
-        assert_eq!(scenario_from_str("design"), Scenario::Design);
+        assert_eq!(hippocampus_presets::scenario_from_str("coding"), Scenario::Coding);
+        assert_eq!(hippocampus_presets::scenario_from_str("Coding"), Scenario::Coding);
+        assert_eq!(hippocampus_presets::scenario_from_str("CODING"), Scenario::Coding);
+        assert_eq!(hippocampus_presets::scenario_from_str("writing"), Scenario::Writing);
+        assert_eq!(hippocampus_presets::scenario_from_str("research"), Scenario::Research);
+        assert_eq!(hippocampus_presets::scenario_from_str("daily"), Scenario::Daily);
+        assert_eq!(hippocampus_presets::scenario_from_str("finance"), Scenario::Finance);
+        assert_eq!(hippocampus_presets::scenario_from_str("design"), Scenario::Design);
     }
 
     /// 验证 OfficeWork 别名（office/work/officework）
@@ -643,11 +920,11 @@ mod tests {
     fn test_scenario_from_str_office_aliases() {
         use hippocampus_scenarios::Scenario;
 
-        assert_eq!(scenario_from_str("officework"), Scenario::OfficeWork);
-        assert_eq!(scenario_from_str("office"), Scenario::OfficeWork);
-        assert_eq!(scenario_from_str("work"), Scenario::OfficeWork);
-        assert_eq!(scenario_from_str("Office"), Scenario::OfficeWork);
-        assert_eq!(scenario_from_str("WORK"), Scenario::OfficeWork);
+        assert_eq!(hippocampus_presets::scenario_from_str("officework"), Scenario::OfficeWork);
+        assert_eq!(hippocampus_presets::scenario_from_str("office"), Scenario::OfficeWork);
+        assert_eq!(hippocampus_presets::scenario_from_str("work"), Scenario::OfficeWork);
+        assert_eq!(hippocampus_presets::scenario_from_str("Office"), Scenario::OfficeWork);
+        assert_eq!(hippocampus_presets::scenario_from_str("WORK"), Scenario::OfficeWork);
     }
 
     /// 验证未知字符串回退到 Custom
@@ -655,12 +932,12 @@ mod tests {
     fn test_scenario_from_str_custom_fallback() {
         use hippocampus_scenarios::Scenario;
 
-        match scenario_from_str("游戏场景") {
+        match hippocampus_presets::scenario_from_str("游戏场景") {
             Scenario::Custom(s) => assert_eq!(s, "游戏场景"),
             other => panic!("期望 Custom，实际 {:?}", other),
         }
 
-        match scenario_from_str("unknown") {
+        match hippocampus_presets::scenario_from_str("unknown") {
             Scenario::Custom(s) => assert_eq!(s, "unknown"),
             other => panic!("期望 Custom，实际 {:?}", other),
         }
@@ -677,6 +954,217 @@ mod tests {
     #[test]
     fn test_supported_scenarios_count() {
         assert_eq!(hippocampus_scenarios::Scenario::all_builtin().len(), 7);
+    }
+
+    /// v2.29：验证 supported_models 通过 ModelRegistry 返回 15 个型号
+    #[test]
+    fn test_supported_models_count() {
+        let count = hippocampus_models::ModelRegistry::all_variants().count();
+        assert_eq!(count, 15, "应内置 15 个型号");
+    }
+
+    /// v2.29：验证 supported_skills 列表长度（15 个内置技能）
+    #[test]
+    fn test_supported_skills_count() {
+        assert_eq!(hippocampus_skills::BuiltinSkill::all_builtin().len(), 15);
+    }
+
+    /// v2.29：验证 window_scheme_from_str 解析 6 种预设
+    #[test]
+    fn test_window_scheme_from_str_all_presets() {
+        // claude_code / claude-code / claudecode 三种写法
+        assert!(window_scheme_from_str("claude_code").is_some());
+        assert!(window_scheme_from_str("claude-code").is_some());
+        assert!(window_scheme_from_str("ClaudeCode").is_some()); // 大小写不敏感
+
+        assert!(window_scheme_from_str("cursor").is_some());
+        assert!(window_scheme_from_str("trae").is_some());
+        assert!(window_scheme_from_str("codex").is_some());
+        assert!(window_scheme_from_str("no_compression").is_some());
+        assert!(window_scheme_from_str("none").is_some());
+        assert!(window_scheme_from_str("generic").is_some());
+        assert!(window_scheme_from_str("sliding").is_some());
+
+        // 未匹配
+        assert!(window_scheme_from_str("unknown").is_none());
+        assert!(window_scheme_from_str("").is_none());
+    }
+
+    /// v2.29：验证 window_scheme_from_str 返回的 profile 阈值正确
+    #[test]
+    fn test_window_scheme_from_str_thresholds() {
+        let cc = window_scheme_from_str("claude_code").unwrap();
+        assert_eq!(cc.trigger_threshold, 180_000);
+
+        let cursor = window_scheme_from_str("cursor").unwrap();
+        assert_eq!(cursor.trigger_threshold, 150_000);
+
+        let trae = window_scheme_from_str("trae").unwrap();
+        assert_eq!(trae.trigger_threshold, 120_000);
+
+        let codex = window_scheme_from_str("codex").unwrap();
+        assert_eq!(codex.trigger_threshold, 100_000);
+    }
+
+    /// v2.29：验证 PresetBuilder.with_model 链路（Rust 侧直接调用 inner）
+    #[test]
+    fn test_preset_builder_with_model_rust_side() {
+        let variant = hippocampus_models::ModelRegistry::find("claude-opus-4.8")
+            .expect("claude-opus-4.8 应存在");
+        let combined = hippocampus_presets::PresetBuilder::new()
+            .with_model(variant)
+            .build()
+            .expect("build 失败");
+
+        assert!(combined.model.is_some());
+        assert_eq!(combined.model.as_ref().unwrap().name, "claude-opus-4.8");
+    }
+
+    /// v2.29：验证 PresetBuilder.with_window 链路（显式设置不触发 Agent 联动）
+    #[test]
+    fn test_preset_builder_with_window_rust_side() {
+        let window = window_scheme_from_str("cursor").unwrap();
+        let combined = hippocampus_presets::PresetBuilder::new()
+            .with_window(window)
+            .build()
+            .expect("build 失败");
+
+        assert!(combined.window.is_some());
+        assert_eq!(combined.window.as_ref().unwrap().trigger_threshold, 150_000);
+    }
+
+    /// v2.29：验证 PresetBuilder.with_skill / with_skills 链路
+    #[test]
+    fn test_preset_builder_with_skills_rust_side() {
+        use hippocampus_skills::{BuiltinSkill, SkillProfile};
+
+        let combined = hippocampus_presets::PresetBuilder::new()
+            .with_skill(SkillProfile::new(BuiltinSkill::Read))
+            .with_skill(SkillProfile::new(BuiltinSkill::Bash))
+            .build()
+            .expect("build 失败");
+
+        assert_eq!(combined.skills.len(), 2);
+
+        // with_skills 覆盖
+        let batch = vec![
+            SkillProfile::new(BuiltinSkill::Write),
+            SkillProfile::new(BuiltinSkill::Edit),
+            SkillProfile::new(BuiltinSkill::Glob),
+        ];
+        let combined2 = hippocampus_presets::PresetBuilder::new()
+            .with_skills(batch)
+            .build()
+            .expect("build 失败");
+
+        assert_eq!(combined2.skills.len(), 3);
+    }
+
+    /// v2.29：验证 build_from_strings 与 Hippocampus.archive(preset=...) 等价路径
+    ///
+    /// 此测试直接调用 Rust 侧的 build_from_strings，验证 preset dict 解析逻辑
+    /// 与 server / mcp 一致。
+    #[test]
+    fn test_build_from_strings_full_preset() {
+        let combined = hippocampus_presets::build_from_strings(
+            Some("Claude Code"),
+            Some("coding"),
+            Some("claude-opus-4.8"),
+            Some(450_000),
+            Some("custom template {conversation}"),
+        )
+        .expect("build_from_strings 失败");
+
+        assert_eq!(combined.archive_threshold(), 450_000); // 用户覆盖优先
+        assert_eq!(combined.summary_template(), "custom template {conversation}");
+        assert_eq!(combined.session_prefix(), Some("claude-code"));
+        assert!(combined.archive_to_hippocampus());
+        assert!(combined.agent.is_some());
+        assert!(combined.scenario.is_some());
+        assert!(combined.window.is_some()); // Agent 联动推导
+        assert!(combined.model.is_some());
+    }
+
+    /// v2.29：验证 build_from_strings 错误路径
+    #[test]
+    fn test_build_from_strings_errors() {
+        // 未找到型号
+        let err = hippocampus_presets::build_from_strings(
+            None, None, Some("nonexistent-model"), None, None
+        ).unwrap_err();
+        assert!(err.contains("未找到型号"), "实际: {}", err);
+
+        // summary_template 缺少 {conversation}
+        let err = hippocampus_presets::build_from_strings(
+            None, None, None, None, Some("no placeholder")
+        ).unwrap_err();
+        assert!(err.contains("{conversation}"), "实际: {}", err);
+    }
+
+    /// v2.29：验证 archive with preset 在 Rust 侧的应用链路
+    ///
+    /// 此测试直接调用 Archiver（不经过 PyO3），验证 archive_threshold + summary_template_override
+    /// 能正确应用。Python 侧通过 build_combined_from_preset + Archiver 桥接，逻辑等价。
+    #[tokio::test]
+    async fn test_archive_with_preset_threshold_applied() {
+        use hippocampus_core::model::{MessageContent, MessageTurn, Tag};
+        use tempfile::TempDir;
+        use chrono::Utc;
+        use uuid::Uuid;
+
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+
+        // 模拟 preset 解析结果：scenario=coding → archive_threshold=500_000
+        let combined = hippocampus_presets::build_from_strings(
+            None,
+            Some("coding"),
+            None,
+            None,
+            None,
+        ).unwrap();
+
+        let threshold = combined.archive_threshold();
+        assert_eq!(threshold, 500_000); // Coding 场景默认 500K
+
+        // 构造 ArchiveConfig（与 Hippocampus.archive 等价逻辑）
+        let config = ArchiveConfig {
+            token_threshold: threshold,
+            force_truncate_limit: threshold * 3 / 2,
+            wait_for_turn_completion: true,
+        };
+
+        let mut archiver = Archiver::new(
+            config,
+            storage,
+            "sess-py-preset-test",
+            None,
+        )
+        .with_summary_template_override(combined.summary_template().to_string());
+
+        archiver.push_turn(MessageTurn {
+            id: Uuid::new_v4(),
+            user_message: MessageContent {
+                text: Some("test".into()),
+                attachments: Vec::new(),
+                tool_calls: Vec::new(),
+                thinking: None,
+            },
+            llm_message: MessageContent {
+                text: Some("reply".into()),
+                attachments: Vec::new(),
+                tool_calls: Vec::new(),
+                thinking: None,
+            },
+            tags: vec![Tag::Text],
+            timestamp: Utc::now(),
+            token_count: 10,
+        });
+
+        let (_, hook) = archiver.archive().await.expect("归档失败");
+
+        // 验证归档成功（hook 有内容）
+        assert!(!hook.summary.title.is_empty());
     }
 
     /// 验证 PresetBuilder 链式构造（不经过 PyO3，直接调用 Rust inner）

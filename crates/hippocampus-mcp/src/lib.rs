@@ -189,8 +189,39 @@ impl HippocampusMcp {
 // Tool 参数结构体
 // ============================================================================
 
+/// 预设参数（v2.29，archive tool 内联参数）
+///
+/// 所有字段可选，传入后服务端即时构建 CombinedProfile，应用：
+/// - `archive_threshold` 覆盖默认 ArchiveConfig.token_threshold
+/// - `summary_template` 通过 `with_summary_template_override` 注入
+///
+/// 与 `POST /api/v1/presets/build` 的请求体结构一致。
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+struct PresetParams {
+    /// Agent display_name（如 "Claude Code"）
+    #[schemars(description = "Agent display_name（如 \"Claude Code\"），未匹配则视为 Custom Agent")]
+    #[serde(default)]
+    agent: Option<String>,
+    /// Scenario 名称（大小写不敏感）
+    #[schemars(description = "Scenario 名称（大小写不敏感，如 \"coding\" / \"Coding\"）")]
+    #[serde(default)]
+    scenario: Option<String>,
+    /// ModelVariant 名称
+    #[schemars(description = "ModelVariant 名称（如 \"claude-opus-4.8\"），未找到则报错")]
+    #[serde(default)]
+    model: Option<String>,
+    /// 用户覆盖：归档阈值
+    #[schemars(description = "用户覆盖归档阈值（token 数，最高优先级）")]
+    #[serde(default)]
+    archive_threshold: Option<usize>,
+    /// 用户覆盖：摘要模板（需含 {conversation}）
+    #[schemars(description = "用户覆盖摘要模板（最高优先级，需含 {conversation} 占位符）")]
+    #[serde(default)]
+    summary_template: Option<String>,
+}
+
 /// archive tool 参数
-#[derive(Deserialize, schemars::JsonSchema)]
+#[derive(Deserialize, schemars::JsonSchema, Default)]
 struct ArchiveParams {
     /// 会话 ID
     #[schemars(description = "会话 ID（用于隔离不同会话的记忆）")]
@@ -201,6 +232,13 @@ struct ArchiveParams {
     /// 项目 ID（可选）
     #[schemars(description = "项目 ID（可选，用于项目级隔离）")]
     project_id: Option<String>,
+    /// 预设配置（v2.29，可选）
+    ///
+    /// 传入后即时构建 CombinedProfile，应用 archive_threshold + summary_template。
+    /// 未传入时保持原行为（ArchiveConfig::default() + 内部模板）。
+    #[schemars(description = "预设配置（可选，传入后应用 archive_threshold + summary_template 覆盖默认行为）")]
+    #[serde(default)]
+    preset: Option<PresetParams>,
 }
 
 /// retrieve tool 参数
@@ -356,6 +394,38 @@ struct SemanticSearchParams {
     project_id: Option<String>,
 }
 
+/// preset_build tool 参数（v2.29）
+///
+/// 所有字段可选，与 archive tool 的 PresetParams 结构一致，
+/// 但独立定义以便 tool 描述更清晰。
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+struct PresetBuildParams {
+    /// Agent display_name
+    #[schemars(description = "Agent display_name（如 \"Claude Code\"），未匹配则视为 Custom Agent")]
+    #[serde(default)]
+    agent: Option<String>,
+    /// Scenario 名称
+    #[schemars(description = "Scenario 名称（大小写不敏感，如 \"coding\" / \"Coding\"）")]
+    #[serde(default)]
+    scenario: Option<String>,
+    /// ModelVariant 名称
+    #[schemars(description = "ModelVariant 名称（如 \"claude-opus-4.8\"），未找到则报错")]
+    #[serde(default)]
+    model: Option<String>,
+    /// 用户覆盖归档阈值
+    #[schemars(description = "用户覆盖归档阈值（token 数，最高优先级）")]
+    #[serde(default)]
+    archive_threshold: Option<usize>,
+    /// 用户覆盖摘要模板
+    #[schemars(description = "用户覆盖摘要模板（最高优先级，需含 {conversation} 占位符）")]
+    #[serde(default)]
+    summary_template: Option<String>,
+}
+
+/// 空参数（用于无参数 tool，如 preset_list_*）
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+struct NoParams {}
+
 // ============================================================================
 // MCP Tools 实现
 // ============================================================================
@@ -363,7 +433,7 @@ struct SemanticSearchParams {
 #[tool_router(server_handler)]
 impl HippocampusMcp {
     /// 归档一批轮次为记忆文件，生成索引钩子。
-    #[tool(description = "归档对话轮次到 Hippocampus 记忆库。当 Agent 会话达到 token 阈值时调用此 tool 保存完整上下文（非摘要）。返回归档摘要（含 hook_id 用于后续检索）。")]
+    #[tool(description = "归档对话轮次到 Hippocampus 记忆库。当 Agent 会话达到 token 阈值时调用此 tool 保存完整上下文（非摘要）。返回归档摘要（含 hook_id 用于后续检索）。v2.29：支持 preset 参数（内联预设，传入后应用 archive_threshold + summary_template 覆盖默认行为）。")]
     async fn archive(
         &self,
         Parameters(params): Parameters<ArchiveParams>,
@@ -379,13 +449,50 @@ impl HippocampusMcp {
             return Err(McpError::invalid_params("turns 不能为空", None));
         }
 
+        // v2.29：若传入 preset，构建 CombinedProfile 提取 archive_threshold + summary_template
+        // 复用 presets crate 的 build_from_strings 公共函数（与 server 端共享同一套解析逻辑）
+        let (archive_threshold, summary_template) = if let Some(preset_req) = &params.preset {
+            let combined = hippocampus_presets::build_from_strings(
+                preset_req.agent.as_deref(),
+                preset_req.scenario.as_deref(),
+                preset_req.model.as_deref(),
+                preset_req.archive_threshold,
+                preset_req.summary_template.as_deref(),
+            )
+            .map_err(|e| McpError::invalid_params(
+                format!("预设构建失败: {e}"),
+                None,
+            ))?;
+            (
+                Some(combined.archive_threshold()),
+                Some(combined.summary_template().to_string()),
+            )
+        } else {
+            (None, None)
+        };
+
         let storage = self.create_storage();
-        let config = ArchiveConfig::default();
+        // v2.29：archive_threshold 覆盖默认 token_threshold（force_truncate_limit 按比例放大）
+        let config = if let Some(threshold) = archive_threshold {
+            ArchiveConfig {
+                token_threshold: threshold,
+                force_truncate_limit: threshold * 3 / 2,
+                wait_for_turn_completion: true,
+            }
+        } else {
+            ArchiveConfig::default()
+        };
         let mut archiver = Archiver::new(config, storage, &params.session_id, params.project_id);
 
         // v2.21 批次 8c：若注入了 summary_generator，注入到 Archiver
         if let Some(gen) = &self.summary_generator {
             archiver = archiver.with_summary_generator(gen.clone());
+        }
+
+        // v2.29：若构建出 summary_template，注入到 Archiver
+        // 通过 with_summary_template_override 覆盖 HttpSummaryGenerator 的内部模板
+        if let Some(tpl) = summary_template {
+            archiver = archiver.with_summary_template_override(tpl);
         }
 
         for turn in turns {
@@ -1014,6 +1121,116 @@ impl HippocampusMcp {
         });
         Ok(result.to_string())
     }
+
+    // ========================================================================
+    // v2.29 新增：preset_* tools
+    // ========================================================================
+
+    /// 即时构建预设配置。
+    ///
+    /// v2.29：所有参数可选，服务端即时构建 CombinedProfile，返回最终生效值。
+    /// 与 `POST /api/v1/presets/build` 端点行为一致，复用同一套 `build_from_strings` 解析逻辑。
+    #[tool(description = "即时构建预设配置。所有参数可选，未提供的字段使用默认值或联动推导（Agent→Window）。返回 archive_threshold / summary_template / session_prefix 等最终生效值。用于预检预设效果后再调用 archive。")]
+    async fn preset_build(
+        &self,
+        Parameters(params): Parameters<PresetBuildParams>,
+    ) -> Result<String, McpError> {
+        let combined = hippocampus_presets::build_from_strings(
+            params.agent.as_deref(),
+            params.scenario.as_deref(),
+            params.model.as_deref(),
+            params.archive_threshold,
+            params.summary_template.as_deref(),
+        )
+        .map_err(|e| McpError::invalid_params(
+            format!("预设构建失败: {e}"),
+            None,
+        ))?;
+
+        let result = serde_json::json!({
+            // 解析后的最终生效值
+            "archive_threshold": combined.archive_threshold(),
+            "summary_template": combined.summary_template(),
+            "session_prefix": combined.session_prefix(),
+            "archive_to_hippocampus": combined.archive_to_hippocampus(),
+            // 标志位（用于追溯哪些 Profile 参与了叠加）
+            "has_agent": combined.agent.is_some(),
+            "has_scenario": combined.scenario.is_some(),
+            "has_window": combined.window.is_some(),
+            "has_model": combined.model.is_some(),
+            "skills_count": combined.skills.len(),
+        });
+        Ok(result.to_string())
+    }
+
+    /// 列出所有内置 Agent（11 个）。
+    #[tool(description = "列出所有内置 Agent（11 个）。返回每个 Agent 的 name / session_prefix / is_mainstream。用于查询 preset_build 的 agent 参数可选值。")]
+    async fn preset_list_agents(
+        &self,
+        Parameters(_): Parameters<NoParams>,
+    ) -> Result<String, McpError> {
+        let agents: Vec<_> = hippocampus_agents::AgentFamily::all_builtin()
+            .into_iter()
+            .map(|family| serde_json::json!({
+                "name": family.display_name(),
+                "session_prefix": family.default_session_prefix(),
+                "is_mainstream": family.is_mainstream(),
+            }))
+            .collect();
+        let result = serde_json::json!({
+            "total": agents.len(),
+            "agents": agents,
+        });
+        Ok(result.to_string())
+    }
+
+    /// 列出所有内置 Scenario（7 个）。
+    #[tool(description = "列出所有内置 Scenario（7 个）。返回每个 Scenario 的 variant / display_name / archive_threshold。用于查询 preset_build 的 scenario 参数可选值。")]
+    async fn preset_list_scenarios(
+        &self,
+        Parameters(_): Parameters<NoParams>,
+    ) -> Result<String, McpError> {
+        let scenarios: Vec<_> = hippocampus_scenarios::Scenario::all_builtin()
+            .iter()
+            .map(|s| {
+                let profile = hippocampus_scenarios::ScenarioProfile::from_scenario(s.clone());
+                serde_json::json!({
+                    "variant": format!("{:?}", s),
+                    "display_name": s.display_name(),
+                    "archive_threshold": profile.archive_threshold,
+                })
+            })
+            .collect();
+        let result = serde_json::json!({
+            "total": scenarios.len(),
+            "scenarios": scenarios,
+        });
+        Ok(result.to_string())
+    }
+
+    /// 列出所有 ModelVariant。
+    #[tool(description = "列出所有 ModelVariant。返回每个型号的 name / family / context_window / is_default。用于查询 preset_build 的 model 参数可选值。")]
+    async fn preset_list_models(
+        &self,
+        Parameters(_): Parameters<NoParams>,
+    ) -> Result<String, McpError> {
+        let models: Vec<_> = hippocampus_models::ModelRegistry::all_variants()
+            .map(|(name, variant)| {
+                let default = hippocampus_models::ModelRegistry::default_variant(variant.family);
+                serde_json::json!({
+                    "name": name,
+                    "family": variant.family.display_name(),
+                    "context_window": variant.context_window,
+                    "is_default": default.name == *name,
+                })
+            })
+            .collect();
+        let result = serde_json::json!({
+            "total": models.len(),
+            "models": models,
+        });
+        Ok(result.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1172,6 +1389,7 @@ mod tests {
             session_id: session_id.to_string(),
             turns_json,
             project_id: None,
+            ..Default::default()
         });
         let result = mcp.archive(params).await.expect("归档失败");
         let summary: Value = serde_json::from_str(&result).unwrap();
@@ -1199,6 +1417,7 @@ mod tests {
             session_id: "s1".to_string(),
             turns_json: "[]".to_string(),
             project_id: None,
+            ..Default::default()
         });
         let err = mcp.archive(params).await.unwrap_err();
         let msg = err.message.as_ref();
@@ -1214,6 +1433,7 @@ mod tests {
             session_id: "s1".to_string(),
             turns_json: "不是合法 JSON".to_string(),
             project_id: None,
+            ..Default::default()
         });
         let err = mcp.archive(params).await.unwrap_err();
         let msg = err.message.as_ref();
@@ -1241,6 +1461,7 @@ mod tests {
                 session_id: session_id.to_string(),
                 turns_json,
                 project_id: None,
+                ..Default::default()
             });
             mcp.archive(params).await.unwrap();
         }
@@ -1271,6 +1492,7 @@ mod tests {
             session_id: session_id.to_string(),
             turns_json,
             project_id: None,
+            ..Default::default()
         });
         mcp.archive(params).await.unwrap();
 
@@ -1302,6 +1524,7 @@ mod tests {
                 session_id: session_id.to_string(),
                 turns_json,
                 project_id: None,
+                ..Default::default()
             });
             mcp.archive(params).await.unwrap();
         }
@@ -1331,6 +1554,7 @@ mod tests {
             session_id: session_id.to_string(),
             turns_json,
             project_id: None,
+            ..Default::default()
         });
         mcp.archive(params).await.unwrap();
 
@@ -1376,6 +1600,7 @@ mod tests {
             session_id: "session-a".to_string(),
             turns_json,
             project_id: None,
+            ..Default::default()
         });
         let result_a = mcp.archive(params).await.unwrap();
         let summary_a: Value = serde_json::from_str(&result_a).unwrap();
@@ -1387,6 +1612,7 @@ mod tests {
             session_id: "session-b".to_string(),
             turns_json,
             project_id: None,
+            ..Default::default()
         });
         mcp.archive(params).await.unwrap();
 
@@ -1432,6 +1658,7 @@ mod tests {
                 session_id: session_id.to_string(),
                 turns_json,
                 project_id: Some("proj-1".to_string()),
+                ..Default::default()
             });
             let result = mcp.archive(params).await.unwrap();
             let summary: Value = serde_json::from_str(&result).unwrap();
@@ -1496,6 +1723,7 @@ mod tests {
             session_id: "sess-cd".to_string(),
             turns_json: make_turns_json("用户消息", "LLM 回复", 100),
             project_id: None,
+            ..Default::default()
         });
         let result = mcp.archive(params).await.unwrap();
         let result: Value = serde_json::from_str(&result).unwrap();
@@ -1546,6 +1774,7 @@ mod tests {
             session_id: "sess-cd-clean".to_string(),
             turns_json: make_turns_json("用户消息", "LLM 回复", 100),
             project_id: None,
+            ..Default::default()
         });
         let result = mcp.archive(params).await.unwrap();
         let result: Value = serde_json::from_str(&result).unwrap();
@@ -1595,6 +1824,7 @@ mod tests {
             session_id: "sess-gc".to_string(),
             turns_json: make_turns_json("用户消息", "LLM 回复", 100),
             project_id: None,
+            ..Default::default()
         });
         let result = mcp.archive(params).await.unwrap();
         let result: Value = serde_json::from_str(&result).unwrap();
@@ -1644,6 +1874,7 @@ mod tests {
             session_id: "sess-v211-a".to_string(),
             turns_json: make_turns_json("用户消息", "LLM 回复", 100),
             project_id: None,
+            ..Default::default()
         });
         let result = mcp.archive(params).await.unwrap();
         let result: Value = serde_json::from_str(&result).unwrap();
@@ -1710,6 +1941,7 @@ mod tests {
             session_id: "sess-v211-b".to_string(),
             turns_json: make_turns_json("用户消息", "LLM 回复", 100),
             project_id: None,
+            ..Default::default()
         });
         let result = mcp.archive(params).await.unwrap();
         let result: Value = serde_json::from_str(&result).unwrap();
@@ -1779,6 +2011,7 @@ mod tests {
             session_id: "sess-v211-c".to_string(),
             turns_json: make_turns_json("用户消息", "LLM 回复", 100),
             project_id: None,
+            ..Default::default()
         });
         let result = mcp.archive(params).await.unwrap();
         let result: Value = serde_json::from_str(&result).unwrap();
@@ -1853,6 +2086,7 @@ mod tests {
             session_id: session_id.to_string(),
             turns_json,
             project_id: None,
+            ..Default::default()
         });
         let archive_result = mcp.archive(params).await.unwrap();
         let archive_result: Value = serde_json::from_str(&archive_result).unwrap();
@@ -1895,6 +2129,7 @@ mod tests {
             session_id: "session-a".to_string(),
             turns_json,
             project_id: None,
+            ..Default::default()
         });
         mcp.archive(params).await.unwrap();
 
@@ -1904,6 +2139,7 @@ mod tests {
             session_id: "session-b".to_string(),
             turns_json,
             project_id: None,
+            ..Default::default()
         });
         mcp.archive(params).await.unwrap();
 
@@ -1963,6 +2199,7 @@ mod tests {
             session_id: session_id.to_string(),
             turns_json,
             project_id: None,
+            ..Default::default()
         });
         mcp.archive(params).await.unwrap();
 
@@ -1998,6 +2235,7 @@ mod tests {
             session_id: session_id.to_string(),
             turns_json,
             project_id: None,
+            ..Default::default()
         });
         let result = mcp.archive(params).await.expect("归档失败");
         let result: Value = serde_json::from_str(&result).unwrap();
@@ -2033,6 +2271,7 @@ mod tests {
             session_id: session_id.to_string(),
             turns_json,
             project_id: None,
+            ..Default::default()
         });
         // archive 应成功（LLM 失败时降级，不中断主流程）
         mcp.archive(params).await.expect("LLM 失败时应降级为启发式，归档应成功");
@@ -2051,5 +2290,226 @@ mod tests {
             title.contains("降级测试用户消息"),
             "降级后应使用启发式标题（首条消息前 80 字符），实际: {title}"
         );
+    }
+
+    // ========================================================================
+    // v2.29 preset_* tools 测试
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_preset_list_agents_returns_11_builtin() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmpdir);
+        let params = Parameters(NoParams {});
+        let result = mcp.preset_list_agents(params).await.unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["total"], 11, "应有 11 个内置 Agent");
+        // Claude Code 应在列表中且为主流
+        let agents = v["agents"].as_array().unwrap();
+        assert!(agents.iter().any(|a| a["name"] == "Claude Code"));
+        assert!(agents.iter().any(|a| a["is_mainstream"] == true));
+    }
+
+    #[tokio::test]
+    async fn test_preset_list_scenarios_returns_7_builtin() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmpdir);
+        let params = Parameters(NoParams {});
+        let result = mcp.preset_list_scenarios(params).await.unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["total"], 7, "应有 7 个内置 Scenario");
+        // Coding 场景应在列表中，archive_threshold = 500_000
+        let scenarios = v["scenarios"].as_array().unwrap();
+        let coding = scenarios.iter().find(|s| s["variant"] == "Coding").unwrap();
+        assert_eq!(coding["archive_threshold"], 500_000);
+    }
+
+    #[tokio::test]
+    async fn test_preset_list_models_returns_all() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmpdir);
+        let params = Parameters(NoParams {});
+        let result = mcp.preset_list_models(params).await.unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        // 总型号数 >= 15
+        assert!(v["total"].as_u64().unwrap() >= 15, "应至少有 15 个型号");
+        // 至少有一个是家族默认
+        let models = v["models"].as_array().unwrap();
+        assert!(models.iter().any(|m| m["is_default"] == true));
+    }
+
+    #[tokio::test]
+    async fn test_preset_build_empty_uses_defaults() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmpdir);
+        let params = Parameters(PresetBuildParams::default());
+        let result = mcp.preset_build(params).await.unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        // 默认归档阈值 400K
+        assert_eq!(v["archive_threshold"], 400_000);
+        assert_eq!(v["has_agent"], false);
+        assert_eq!(v["has_window"], false);
+    }
+
+    #[tokio::test]
+    async fn test_preset_build_with_agent_triggers_window_linkage() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmpdir);
+        let params = Parameters(PresetBuildParams {
+            agent: Some("Claude Code".into()),
+            ..Default::default()
+        });
+        let result = mcp.preset_build(params).await.unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        // 联动推导 Window
+        assert_eq!(v["has_agent"], true);
+        assert_eq!(v["has_window"], true);
+        assert_eq!(v["session_prefix"], "claude-code");
+    }
+
+    #[tokio::test]
+    async fn test_preset_build_with_scenario_overrides_threshold() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmpdir);
+        let params = Parameters(PresetBuildParams {
+            scenario: Some("coding".into()),
+            ..Default::default()
+        });
+        let result = mcp.preset_build(params).await.unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        // Coding 场景默认 500K
+        assert_eq!(v["archive_threshold"], 500_000);
+        assert_eq!(v["has_scenario"], true);
+    }
+
+    #[tokio::test]
+    async fn test_preset_build_user_threshold_overrides_scenario() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmpdir);
+        let params = Parameters(PresetBuildParams {
+            scenario: Some("coding".into()),
+            archive_threshold: Some(450_000),
+            ..Default::default()
+        });
+        let result = mcp.preset_build(params).await.unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        // 用户覆盖优先
+        assert_eq!(v["archive_threshold"], 450_000);
+    }
+
+    #[tokio::test]
+    async fn test_preset_build_invalid_model_returns_error() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmpdir);
+        let params = Parameters(PresetBuildParams {
+            model: Some("nonexistent-model".into()),
+            ..Default::default()
+        });
+        let err = mcp.preset_build(params).await.unwrap_err();
+        let msg = err.message.as_ref();
+        assert!(msg.contains("未找到型号"), "应报告未找到型号, 实际: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_preset_build_invalid_template_returns_error() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmpdir);
+        let params = Parameters(PresetBuildParams {
+            summary_template: Some("missing placeholder".into()),
+            ..Default::default()
+        });
+        let err = mcp.preset_build(params).await.unwrap_err();
+        let msg = err.message.as_ref();
+        assert!(msg.contains("{conversation}"), "应报告缺少占位符, 实际: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_preset_build_full_combination() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmpdir);
+        let params = Parameters(PresetBuildParams {
+            agent: Some("Claude Code".into()),
+            scenario: Some("coding".into()),
+            model: Some("claude-opus-4.8".into()),
+            archive_threshold: Some(300_000),
+            summary_template: Some("custom {conversation}".into()),
+            ..Default::default()
+        });
+        let result = mcp.preset_build(params).await.unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["archive_threshold"], 300_000);
+        assert_eq!(v["summary_template"], "custom {conversation}");
+        assert_eq!(v["has_agent"], true);
+        assert_eq!(v["has_scenario"], true);
+        assert_eq!(v["has_model"], true);
+    }
+
+    #[tokio::test]
+    async fn test_archive_with_preset_applies_threshold() {
+        // 传入 preset 后 archive 应正常归档（archive_threshold + summary_template 被应用）
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmpdir);
+        let session_id = "test-preset-archive";
+
+        let turns_json = make_turns_json("preset 测试", "LLM 回复", 100);
+        let params = Parameters(ArchiveParams {
+            session_id: session_id.to_string(),
+            turns_json,
+            project_id: None,
+            preset: Some(PresetParams {
+                agent: Some("Claude Code".into()),
+                scenario: Some("coding".into()),
+                archive_threshold: Some(300_000),
+                summary_template: Some("自定义模板 {conversation}".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let result = mcp.archive(params).await.expect("带 preset 的归档应成功");
+        let v: Value = serde_json::from_str(&result).unwrap();
+        // 应返回 hook_id
+        assert!(v["hook_id"].as_str().is_some(), "应返回 hook_id");
+        assert_eq!(v["token_count"], 100);
+    }
+
+    #[tokio::test]
+    async fn test_archive_with_invalid_preset_returns_error() {
+        // preset 中 model 无效时应返回 invalid_params 错误
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmpdir);
+
+        let turns_json = make_turns_json("错误 preset", "LLM 回复", 50);
+        let params = Parameters(ArchiveParams {
+            session_id: "test-invalid-preset".to_string(),
+            turns_json,
+            project_id: None,
+            preset: Some(PresetParams {
+                model: Some("nonexistent-model".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let err = mcp.archive(params).await.unwrap_err();
+        let msg = err.message.as_ref();
+        assert!(msg.contains("未找到型号"), "应报告未找到型号, 实际: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_archive_without_preset_backward_compatible() {
+        // 不传 preset 时应保持原行为（向后兼容）
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmpdir);
+
+        let turns_json = make_turns_json("无 preset", "LLM 回复", 80);
+        let params = Parameters(ArchiveParams {
+            session_id: "test-no-preset".to_string(),
+            turns_json,
+            project_id: None,
+            ..Default::default()
+        });
+        let result = mcp.archive(params).await.expect("无 preset 归档应成功");
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert!(v["hook_id"].as_str().is_some());
+        assert_eq!(v["token_count"], 80);
     }
 }

@@ -17,6 +17,13 @@ hippocampus-core = { path = "../hippocampus-core", version = "0.1.0" }
 hippocampus-llm = { path = "../hippocampus-llm", version = "0.1.0" }
 # v2.18 批次2: 搜索模块（SessionSearchRouter + SearchIndexer）下沉到独立 crate
 hippocampus-search = { path = "../hippocampus-search", version = "0.1.0" }
+# v2.29: 预设组合层（PresetBuilder + CombinedProfile + 5 特配 crate）
+hippocampus-presets = { path = "../hippocampus-presets", version = "0.1.0" }
+hippocampus-agents = { path = "../hippocampus-agents", version = "0.1.0" }
+hippocampus-scenarios = { path = "../hippocampus-scenarios", version = "0.1.0" }
+hippocampus-models = { path = "../hippocampus-models", version = "0.1.0" }
+hippocampus-windows = { path = "../hippocampus-windows", version = "0.1.0" }
+hippocampus-skills = { path = "../hippocampus-skills", version = "0.1.0" }
 axum.workspace = true
 tokio = { version = "1.0", features = ["full"] }
 tower-http.workspace = true

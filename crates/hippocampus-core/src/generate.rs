@@ -116,7 +116,7 @@ pub trait AnchorGenerator: Send + Sync {
     async fn generate_anchors(&self, file: &MemoryFile) -> crate::Result<Vec<String>>;
 }
 
-/// 摘要生成器 trait（v2.16 IMP-10）
+/// 摘要生成器 trait（v2.16 IMP-10 / v2.29 模板覆盖）
 ///
 /// 用于在归档/周级合并/月级合并时为记忆文件生成结构化 [`Summary`]。
 ///
@@ -132,8 +132,34 @@ pub trait AnchorGenerator: Send + Sync {
 /// - 月级合并：`Compactor::monthly_evict` 生成 monthly 钩子的 summary
 ///
 /// 注入后所有层级均可使用 LLM 生成；未注入时退化为启发式。
+///
+/// ## v2.29 模板覆盖
+///
+/// 新增默认方法 [`generate_summary_with_template`](Self::generate_summary_with_template)
+/// 支持 per-request 覆盖摘要模板（来自 PresetBuilder 解析的 CombinedProfile.summary_template）。
+/// 默认实现忽略 template 调用原方法（向后兼容旧实现）；
+/// `HttpSummaryGenerator` 覆盖此方法以应用传入的模板。
 #[async_trait::async_trait]
 pub trait SummaryGenerator: Send + Sync {
     /// 为记忆文件生成结构化摘要
+    ///
+    /// 使用实现内部固定的模板（构造时通过 `with_summary_template` 注入）。
     async fn generate_summary(&self, file: &MemoryFile) -> crate::Result<Summary>;
+
+    /// 为记忆文件生成结构化摘要（v2.29，支持 per-request 模板覆盖）
+    ///
+    /// - `template_override`：`Some(template)` 时使用此模板覆盖内部模板
+    ///   （需含 `{conversation}` 占位符）
+    /// - `None`：等价于调用 [`generate_summary`](Self::generate_summary)
+    ///
+    /// 默认实现忽略 template 调用 `generate_summary`（向后兼容旧实现）。
+    /// `HttpSummaryGenerator` 覆盖此方法以应用传入的模板。
+    async fn generate_summary_with_template(
+        &self,
+        file: &MemoryFile,
+        template_override: Option<&str>,
+    ) -> crate::Result<Summary> {
+        let _ = template_override; // 默认实现忽略，避免 unused 警告
+        self.generate_summary(file).await
+    }
 }

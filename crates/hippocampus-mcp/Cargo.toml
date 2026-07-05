@@ -22,6 +22,11 @@ hippocampus-core = { path = "../hippocampus-core" }
 hippocampus-llm = { path = "../hippocampus-llm" }
 # v2.18 批次2：复用 SessionSearchRouter（从 hippocampus-search，避免引入 axum 重依赖）
 hippocampus-search = { path = "../hippocampus-search" }
+# v2.29：预设组合层（build_from_strings 公共函数 + Agent/Scenario/Model 枚举）
+hippocampus-presets = { path = "../hippocampus-presets" }
+hippocampus-agents = { path = "../hippocampus-agents" }
+hippocampus-scenarios = { path = "../hippocampus-scenarios" }
+hippocampus-models = { path = "../hippocampus-models" }
 rmcp = { workspace = true }
 tokio = { version = "1.0", features = ["full"] }
 serde = { workspace = true }

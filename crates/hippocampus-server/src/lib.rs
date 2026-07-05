@@ -22,6 +22,7 @@
 mod error;
 mod handlers;
 pub mod middleware;
+mod presets;
 
 // v2.18 批次2：搜索模块下沉到 hippocampus-search crate
 // v2.5 批次 7: SearchIndexer（归档后自动索引）
@@ -174,6 +175,11 @@ pub fn create_router(state: AppState) -> axum::Router {
             "/api/v1/sessions/{sid}/memories/{hook_id}/detect-conflicts",
             post(handlers::detect_conflicts),
         )
+        // v2.29：预设端点（无状态，即时构建）
+        .route("/api/v1/presets/agents", get(presets::list_agents))
+        .route("/api/v1/presets/scenarios", get(presets::list_scenarios))
+        .route("/api/v1/presets/models", get(presets::list_models))
+        .route("/api/v1/presets/build", post(presets::build_preset))
         // v2.24：API Key 鉴权中间件（对所有路由生效）
         // 顺序：路由定义 → 鉴权中间件 → TraceLayer（在 main.rs 中添加）
         // 注意：axum::middleware 与 crate::middleware 同名，用别名 axum_mw 消歧
