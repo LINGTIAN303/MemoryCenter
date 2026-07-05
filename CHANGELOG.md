@@ -7,6 +7,79 @@
 ### 计划中
 - v2.4：WASM 组件（待生态成熟）+ Node/Go/Java 绑定
 
+### v2.27.1 - batch_update/update_memory key_facts 注入统一（2026-07-05）
+
+#### 修复
+- **`update_memory` key_facts 注入**（`crates/hippocampus-server/src/handlers.rs`）
+  - 改用 `find_hook_by_id` 获取完整 IndexHook
+  - 若 `memory.updates` 为空，从 `IndexHook.summary.key_facts` 注入虚拟 `MemoryUpdateRecord`
+  - 逐条 `add_fact` 保持事实粒度（替代 `join("\n")`）
+- **`batch_update` key_facts 注入**（同上文件）
+  - 同样改用 `find_hook_by_id` + key_facts 注入逻辑
+  - 与 `detect_conflicts` / `update_memory` 行为对齐
+  - 解决批量更新时 `historical_facts` 为空导致检测失效的问题
+
+#### 风险点（未修复，待决策）
+- **HybridDetector 去重逻辑**：合并 LLM 与启发式报告时只比较 `(kind, new_fact)`
+  - 可能丢失 LLM 在 `severity` / `description` / `existing_fact` 上的增量信息
+  - 启发式优先级高于 LLM，LLM 版本可能被丢弃
+  - 代码无 bug，属于设计取舍，是否调整待用户决策
+
+### v2.27 - 服务器端 detect_conflicts HTTP 端点（2026-07-05）
+
+#### 新增
+- **`POST /api/v1/sessions/{sid}/memories/{hook_id}/detect-conflicts`**
+  - 检测单次记忆更新的潜在冲突（不实际写入）
+  - 与 MCP 端 `detect_conflicts` tool 行为一致
+  - 复用 `UpdateMemoryRequest` 请求体，返回 `ConflictsResponse`
+  - 使用 `find_hook_by_id` 从 IndexHook.key_facts 注入历史事实
+- **生产环境 LLM 配置脚本**（`deploy/setup-llm-env.sh`）
+  - Generator: SenseNova sensenova-6.7-flash-lite
+  - Detector: DeepSeek deepseek-v4-flash
+  - 备份 + sed 插入 + daemon-reload + 重启
+
+#### 端点分工
+| 端点 | 方法 | 行为 |
+|------|------|------|
+| `.../conflicts` | GET | 查询已持久化的冲突记录 |
+| `.../memories/{hook_id}` | PATCH | 实际写入更新 + 检测 + 持久化冲突 |
+| `.../detect-conflicts` | POST | 仅检测，不写入（预检测） |
+
+### v2.26 - 自动部署配置（2026-07-05）
+
+#### 新增
+- **`deploy/setup-auto-deploy.sh`**：服务器端一次性配置脚本
+  - 创建裸仓库 `/root/hippocampus.git`
+  - 创建 post-receive hook
+- **`deploy/post-receive.sh`**：自动部署 hook
+  - 流程：checkout → cargo build → stop → cp → start → verify
+  - 解决 "Text file busy" 问题：先 `systemctl stop` 再 `cp` 再 `start`
+- **本地 production remote**：`__REDACTED_SERVER__:/root/hippocampus.git`
+- 日常部署：`git push production main`（自动触发编译+重启，约 5 分钟）
+
+### v2.25 - Detector 检测失效修复 + LLM 思考模式（2026-07-05）
+
+#### 修复
+- **v2.24: 关闭 LLM 思考模式**
+  - 3 个 LLM 客户端请求体加 `"thinking": {"type": "disabled"}`
+    - `crates/hippocampus-llm/src/detector.rs`
+    - `crates/hippocampus-llm/src/scorer.rs`
+    - `crates/hippocampus-llm/src/summary_generator.rs`
+  - 根因：DeepSeek V4 Flash 默认启用思考模式，输出进入 `reasoning_content` 而 `content` 为空
+  - 对不支持 thinking 的 API（OpenAI/SenseNova）无害，会被忽略
+- **v2.25: 从 IndexHook 注入 key_facts**
+  - `retrieve.rs` 新增 `find_hook_by_id()` 返回完整 IndexHook
+  - `detect_conflicts`（MCP 端）读取 `IndexHook.summary.key_facts`
+  - 作为虚拟 `MemoryUpdateRecord` 注入到 `memory.updates`
+  - 解决 archive 只写 turns 不写 updates 的设计缺陷
+- **v2.25.1: 事实粒度优化**
+  - 逐条 `add_fact` 替代 `join("\n")`
+  - 避免多条 key_facts 被合并成 1 条粗粒度事实
+
+#### 验证
+- 修复前：`detect_conflicts` 返回 `total=0, has_critical=false`
+- 修复后：`total=1, has_critical=true`，`existing_fact`/`new_fact` 均为单条精确事实
+
 ### v2.24 - API Key 鉴权中间件 + 生产部署文档（2026-07-05）
 
 #### 新增

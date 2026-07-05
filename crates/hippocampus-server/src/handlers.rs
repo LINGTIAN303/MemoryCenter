@@ -308,16 +308,23 @@ pub async fn update_memory(
     let storage = create_storage(&state);
     let retriever = Retriever::new(storage.clone(), &sid, req.project_id.clone());
 
-    // 通过 hook_id 找到 memory_id
-    let memory_id = retriever.find_memory_id_by_hook(&hook_id).await.ok_or_else(|| {
+    // v2.27.1：使用 find_hook_by_id 获取完整 IndexHook（含 summary.key_facts）
+    let hook = retriever.find_hook_by_id(&hook_id).await.ok_or_else(|| {
         AppError::NotFound(format!("未找到钩子 ID: {}", hook_id))
     })?;
+    let memory_id = hook.memory_id.clone();
 
-    // 构造 MemoryUpdate
-    let updates = hippocampus_core::model::MemoryUpdate::new()
-        .add_fact(req.added_facts.join("\n"))
-        .revise_fact(req.revised_facts.join("\n"))
-        .deprecate_fact(req.deprecated_facts.join("\n"));
+    // 构造 MemoryUpdate（逐条添加保持事实粒度，v2.25.1）
+    let mut updates = hippocampus_core::model::MemoryUpdate::new();
+    for fact in &req.added_facts {
+        updates = updates.add_fact(fact.clone());
+    }
+    for fact in &req.revised_facts {
+        updates = updates.revise_fact(fact.clone());
+    }
+    for fact in &req.deprecated_facts {
+        updates = updates.deprecate_fact(fact.clone());
+    }
 
     let added_count = req.added_facts.len();
     let revised_count = req.revised_facts.len();
@@ -329,7 +336,20 @@ pub async fn update_memory(
     // 未配置时：跳过检测，直接 update_memory（向后兼容）
     let conflicts: Vec<hippocampus_core::conflict::ConflictRecord> =
         if let Some(detector) = &state.conflict_detector {
-            let existing = storage.read_memory(&memory_id).await?;
+            let mut existing = storage.read_memory(&memory_id).await?;
+            // v2.27.1：从 IndexHook.key_facts 注入历史事实（与 detect_conflicts 一致）
+            if existing.updates.is_empty() && !hook.summary.key_facts.is_empty() {
+                use hippocampus_core::model::MemoryUpdateRecord;
+                let mut virtual_update = hippocampus_core::model::MemoryUpdate::new();
+                for fact in &hook.summary.key_facts {
+                    virtual_update = virtual_update.add_fact(fact.clone());
+                }
+                existing.updates.push(MemoryUpdateRecord {
+                    updated_at: hook.archived_at,
+                    update: virtual_update,
+                    conflicts: vec![],
+                });
+            }
             let report = detector.detect(&updates, &existing).await;
             let conflict_count = report.count();
             let has_critical = report.has_critical();
@@ -859,18 +879,25 @@ pub async fn batch_update(
     // 1. 将 hook_id 转为 memory_id，构造更新对
     let mut pairs: Vec<UpdatePair> = Vec::new();
     for entry in &req.updates {
-        let mid = retriever.find_memory_id_by_hook(&entry.hook_id).await;
-        match mid {
-            Some(memory_id) => {
+        let hook = retriever.find_hook_by_id(&entry.hook_id).await;
+        match hook {
+            Some(h) => {
                 let added = entry.added_facts.len();
                 let revised = entry.revised_facts.len();
                 let deprecated = entry.deprecated_facts.len();
-                let update = hippocampus_core::model::MemoryUpdate::new()
-                    .add_fact(entry.added_facts.join("\n"))
-                    .revise_fact(entry.revised_facts.join("\n"))
-                    .deprecate_fact(entry.deprecated_facts.join("\n"));
+                // v2.27.1：逐条 add_fact 保持事实粒度（与 detect_conflicts 一致）
+                let mut update = hippocampus_core::model::MemoryUpdate::new();
+                for fact in &entry.added_facts {
+                    update = update.add_fact(fact.clone());
+                }
+                for fact in &entry.revised_facts {
+                    update = update.revise_fact(fact.clone());
+                }
+                for fact in &entry.deprecated_facts {
+                    update = update.deprecate_fact(fact.clone());
+                }
                 pairs.push(UpdatePair {
-                    memory_id,
+                    memory_id: h.memory_id.clone(),
                     hook_id: entry.hook_id.clone(),
                     update,
                     added,
@@ -906,7 +933,25 @@ pub async fn batch_update(
                 continue;
             }
             let result = match storage.read_memory(&pair.memory_id).await {
-                Ok(existing) => {
+                Ok(mut existing) => {
+                    // v2.27.1：从 IndexHook.key_facts 注入历史事实（与 detect_conflicts 一致）
+                    // 解决 archive 只写 turns 不写 updates 的设计缺陷
+                    if existing.updates.is_empty() {
+                        if let Some(h) = retriever.find_hook_by_id(&pair.hook_id).await {
+                            if !h.summary.key_facts.is_empty() {
+                                use hippocampus_core::model::MemoryUpdateRecord;
+                                let mut virtual_update = hippocampus_core::model::MemoryUpdate::new();
+                                for fact in &h.summary.key_facts {
+                                    virtual_update = virtual_update.add_fact(fact.clone());
+                                }
+                                existing.updates.push(MemoryUpdateRecord {
+                                    updated_at: h.archived_at,
+                                    update: virtual_update,
+                                    conflicts: vec![],
+                                });
+                            }
+                        }
+                    }
                     let report = detector.detect(&pair.update, &existing).await;
                     pair.conflicts_count = report.count();
                     pair.has_critical = report.has_critical();
