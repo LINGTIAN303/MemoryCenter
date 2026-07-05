@@ -451,6 +451,70 @@ impl HybridDetector {
         false
     }
 
+    /// 查找重复的现有冲突索引（v2.28 字段级 merge 前置）
+    ///
+    /// 返回 `Some(idx)` 表示 `conflict` 与 `report.conflicts[idx]` 语义重复，
+    /// `None` 表示无重复（应直接 push）。
+    async fn find_duplicate_index(
+        &self,
+        conflict: &ConflictRecord,
+        existing: &[ConflictRecord],
+    ) -> Option<usize> {
+        for (idx, existing_conflict) in existing.iter().enumerate() {
+            if conflict.kind != existing_conflict.kind {
+                continue;
+            }
+            if conflict.new_fact == existing_conflict.new_fact {
+                return Some(idx);
+            }
+            if self.dedup_threshold > 0.0 {
+                let sim = self
+                    .compute_similarity(&conflict.new_fact, &existing_conflict.new_fact)
+                    .await;
+                if sim >= self.dedup_threshold {
+                    return Some(idx);
+                }
+            }
+        }
+        None
+    }
+
+    /// 字段级合并冲突记录（v2.28 新增）
+    ///
+    /// 当 LLM 与启发式检测到"同一冲突"（kind 相同 + new_fact 匹配）时，
+    /// 不再"二选一丢弃 LLM 版本"，而是字段级合并：
+    ///
+    /// | 字段 | 合并规则 | 理由 |
+    /// |------|---------|------|
+    /// | `kind` | 相同（前提） | 已通过去重判定 |
+    /// | `new_fact` | 保留现有（启发式） | 已通过去重判定 |
+    /// | `severity` | `max(existing, incoming)` | 取更严重的级别，避免低估风险 |
+    /// | `description` | 优先 incoming（LLM，非空时） | LLM 描述更语义化 |
+    /// | `existing_fact` | 优先 incoming（LLM，Some 时） | LLM 可能引用更准确的历史事实 |
+    ///
+    /// ## 参数
+    ///
+    /// - `existing`：报告中已有的冲突记录（启发式版本，将被原地修改）
+    /// - `incoming`：LLM 报告中的冲突记录（增量信息来源，不被修改）
+    fn merge_conflict_fields(existing: &mut ConflictRecord, incoming: &ConflictRecord) {
+        // severity：取更严重的（Severity derive Ord，Critical > Warning > Info）
+        if incoming.severity > existing.severity {
+            existing.severity = incoming.severity;
+        }
+
+        // description：优先 LLM（非空且更长时替换，避免空字符串覆盖）
+        if !incoming.description.is_empty()
+            && incoming.description.len() > existing.description.len()
+        {
+            existing.description = incoming.description.clone();
+        }
+
+        // existing_fact：优先 LLM（Some 时替换，None 不覆盖）
+        if incoming.existing_fact.is_some() {
+            existing.existing_fact = incoming.existing_fact.clone();
+        }
+    }
+
     /// 根据当前 `dedup_mode` 计算相似度（v2.15 新增）
     ///
     /// 内部辅助方法，封装三种模式的分支与降级逻辑。
@@ -659,14 +723,23 @@ impl ConflictDetector for HybridDetector {
         // 2. 再跑 LLM（语义级补充，失败时返回空报告不阻塞）
         let llm_report = self.llm.detect(update, existing_memory).await;
 
-        // 3. 合并报告：语义去重（v2.12 精确匹配 + v2.14 相似度 + v2.15 多模式）
-        //    - 启发式报告全部保留
-        //    - LLM 报告中与启发式冲突（kind 相同 + new_fact 精确匹配或相似度 >= 阈值）不重复加入
+        // 3. 合并报告：语义去重 + 字段级 merge（v2.28）
+        //    - LLM 报告中与启发式冲突（kind 相同 + new_fact 匹配/相似）：
+        //      字段级 merge（severity 取 max / description / existing_fact 优先 LLM）
+        //    - LLM 报告中独有的冲突：直接 push
         //    - LLM 报告为空时（降级或无冲突）不影响启发式结果
-        //    - v2.15：is_semantically_duplicate 改为 async（Embedding 模式需 await）
+        //    - v2.15：相似度比较 async（Embedding 模式需 await）
+        //    - v2.28：从"二选一丢弃 LLM"升级为"字段级 merge"
         for conflict in llm_report.conflicts {
-            if !self.is_semantically_duplicate(&conflict, &report.conflicts).await {
-                report.push(conflict);
+            match self.find_duplicate_index(&conflict, &report.conflicts).await {
+                Some(idx) => {
+                    // 语义重复：字段级 merge（LLM 增量信息合并到启发式版本）
+                    Self::merge_conflict_fields(&mut report.conflicts[idx], &conflict);
+                }
+                None => {
+                    // 独有冲突：直接 push
+                    report.push(conflict);
+                }
             }
         }
 
@@ -1660,5 +1733,310 @@ mod tests {
                 Self::Failing => Err(crate::Error::Storage("MockEmbedder batch 故意失败".into())),
             }
         }
+    }
+}
+
+// ============================================================================
+// v2.28 字段级 merge 单元测试
+// ============================================================================
+
+#[cfg(test)]
+mod v2_28_merge_tests {
+    use super::*;
+    use crate::model::{ArchivePeriod, MessageContent, MessageTurn};
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    /// 构造测试用 MemoryFile（复用主测试模块的结构）
+    fn make_test_memory() -> MemoryFile {
+        let turn = MessageTurn {
+            id: Uuid::new_v4(),
+            user_message: MessageContent {
+                text: Some("用户消息".to_string()),
+                attachments: vec![],
+                tool_calls: vec![],
+                thinking: None,
+            },
+            llm_message: MessageContent {
+                text: Some("助手回复".to_string()),
+                attachments: vec![],
+                tool_calls: vec![],
+                thinking: None,
+            },
+            tags: vec![],
+            timestamp: Utc::now(),
+            token_count: 100,
+        };
+        MemoryFile {
+            id: Uuid::new_v4(),
+            schema_version: 1,
+            archived_at: Utc::now(),
+            session_id: "test-sess".to_string(),
+            project_id: None,
+            turns: vec![turn],
+            tags: vec![],
+            total_tokens: 100,
+            truncated: false,
+            period: ArchivePeriod::Daily,
+            access_count: 0,
+            importance: 0,
+            updates: vec![],
+        }
+    }
+
+    /// 简单 mock 检测器：返回预设报告
+    struct MockDetector {
+        report: ConflictReport,
+    }
+    impl MockDetector {
+        fn new(report: ConflictReport) -> Self {
+            Self { report }
+        }
+    }
+    #[async_trait]
+    impl ConflictDetector for MockDetector {
+        async fn detect(
+            &self,
+            _update: &MemoryUpdate,
+            _existing: &MemoryFile,
+        ) -> ConflictReport {
+            self.report.clone()
+        }
+    }
+
+    #[test]
+    fn test_merge_severity_takes_higher() {
+        // 启发式 Warning + LLM Critical → 应取 Critical
+        let mut existing = ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Warning,
+            description: "启发式：反义词匹配".to_string(),
+            existing_fact: Some("用户喜欢咖啡".to_string()),
+            new_fact: "用户不喜欢咖啡".to_string(),
+        };
+        let incoming = ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "LLM：立场反转".to_string(),
+            existing_fact: Some("用户明确表达喜欢咖啡".to_string()),
+            new_fact: "用户不喜欢咖啡".to_string(),
+        };
+        HybridDetector::merge_conflict_fields(&mut existing, &incoming);
+        assert_eq!(existing.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn test_merge_severity_keeps_higher_when_existing_is_higher() {
+        // 启发式 Critical + LLM Warning → 应保留 Critical
+        let mut existing = ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "启发式：反义词匹配".to_string(),
+            existing_fact: None,
+            new_fact: "用户不喜欢咖啡".to_string(),
+        };
+        let incoming = ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Warning,
+            description: "LLM：可能矛盾".to_string(),
+            existing_fact: Some("用户喜欢咖啡".to_string()),
+            new_fact: "用户不喜欢咖啡".to_string(),
+        };
+        HybridDetector::merge_conflict_fields(&mut existing, &incoming);
+        assert_eq!(existing.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn test_merge_description_prefers_llm_when_longer() {
+        let mut existing = ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "短".to_string(),
+            existing_fact: None,
+            new_fact: "用户不喜欢咖啡".to_string(),
+        };
+        let incoming = ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "LLM 提供的更详细的语义化描述".to_string(),
+            existing_fact: None,
+            new_fact: "用户不喜欢咖啡".to_string(),
+        };
+        HybridDetector::merge_conflict_fields(&mut existing, &incoming);
+        assert_eq!(existing.description, "LLM 提供的更详细的语义化描述");
+    }
+
+    #[test]
+    fn test_merge_description_keeps_existing_when_llm_shorter() {
+        let mut existing = ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "启发式提供了较长的描述".to_string(),
+            existing_fact: None,
+            new_fact: "用户不喜欢咖啡".to_string(),
+        };
+        let incoming = ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "短".to_string(),
+            existing_fact: None,
+            new_fact: "用户不喜欢咖啡".to_string(),
+        };
+        HybridDetector::merge_conflict_fields(&mut existing, &incoming);
+        assert_eq!(existing.description, "启发式提供了较长的描述");
+    }
+
+    #[test]
+    fn test_merge_existing_fact_prefers_llm_some() {
+        // 启发式 None + LLM Some → 应取 LLM 的
+        let mut existing = ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "测试".to_string(),
+            existing_fact: None,
+            new_fact: "用户不喜欢咖啡".to_string(),
+        };
+        let incoming = ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "测试".to_string(),
+            existing_fact: Some("用户明确表达过喜欢咖啡".to_string()),
+            new_fact: "用户不喜欢咖啡".to_string(),
+        };
+        HybridDetector::merge_conflict_fields(&mut existing, &incoming);
+        assert_eq!(
+            existing.existing_fact,
+            Some("用户明确表达过喜欢咖啡".to_string())
+        );
+    }
+
+    #[test]
+    fn test_merge_existing_fact_keeps_existing_when_llm_none() {
+        // 启发式 Some + LLM None → 应保留启发式的
+        let mut existing = ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "测试".to_string(),
+            existing_fact: Some("启发式引用的历史事实".to_string()),
+            new_fact: "用户不喜欢咖啡".to_string(),
+        };
+        let incoming = ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "测试".to_string(),
+            existing_fact: None,
+            new_fact: "用户不喜欢咖啡".to_string(),
+        };
+        HybridDetector::merge_conflict_fields(&mut existing, &incoming);
+        assert_eq!(
+            existing.existing_fact,
+            Some("启发式引用的历史事实".to_string())
+        );
+    }
+
+    #[test]
+    fn test_merge_empty_description_does_not_overwrite() {
+        // LLM description 为空 → 不覆盖启发式
+        let mut existing = ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "启发式描述".to_string(),
+            existing_fact: None,
+            new_fact: "用户不喜欢咖啡".to_string(),
+        };
+        let incoming = ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "".to_string(),
+            existing_fact: None,
+            new_fact: "用户不喜欢咖啡".to_string(),
+        };
+        HybridDetector::merge_conflict_fields(&mut existing, &incoming);
+        assert_eq!(existing.description, "启发式描述");
+    }
+
+    /// v2.28 集成测试：HybridDetector 字段级 merge 完整流程
+    #[tokio::test]
+    async fn test_hybrid_detector_field_merge_integration() {
+        // 启发式：Warning + 短描述 + 无 existing_fact
+        let mut heuristic_report = ConflictReport::empty();
+        heuristic_report.push(ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Warning,
+            description: "反义词".to_string(),
+            existing_fact: None,
+            new_fact: "用户不喜欢咖啡".to_string(),
+        });
+        let heuristic: Arc<dyn ConflictDetector> = Arc::new(MockDetector::new(heuristic_report));
+
+        // LLM：Critical + 长描述 + 有 existing_fact（同 kind + 同 new_fact → 触发字段级 merge）
+        let mut llm_report = ConflictReport::empty();
+        llm_report.push(ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Critical,
+            description: "LLM 语义分析：用户立场明确反转".to_string(),
+            existing_fact: Some("用户上周明确说喜欢咖啡".to_string()),
+            new_fact: "用户不喜欢咖啡".to_string(),
+        });
+        let llm: Arc<dyn ConflictDetector> = Arc::new(MockDetector::new(llm_report));
+
+        // dedup_threshold=0.0 → 仅精确匹配（new_fact 完全相同 → 重复 → 触发 merge）
+        let hybrid = HybridDetector::with_dedup_threshold(heuristic, llm, 0.0);
+
+        let update = MemoryUpdate::new().add_fact("用户不喜欢咖啡".to_string());
+        let memory = make_test_memory();
+
+        let report = hybrid.detect(&update, &memory).await;
+
+        // 应该只有 1 条冲突（重复触发 merge，而非 push 两条）
+        assert_eq!(report.count(), 1, "字段级 merge 后应只有 1 条冲突");
+        // severity 应升级为 Critical（取 max）
+        assert_eq!(report.conflicts[0].severity, Severity::Critical);
+        // description 应为 LLM 的（更长）
+        assert_eq!(
+            report.conflicts[0].description,
+            "LLM 语义分析：用户立场明确反转"
+        );
+        // existing_fact 应为 LLM 的 Some
+        assert_eq!(
+            report.conflicts[0].existing_fact,
+            Some("用户上周明确说喜欢咖啡".to_string())
+        );
+    }
+
+    /// v2.28 集成测试：LLM 独有冲突仍正常 push
+    #[tokio::test]
+    async fn test_hybrid_detector_llm_unique_conflict_still_pushed() {
+        // 启发式：1 条 DirectContradict
+        let mut heuristic_report = ConflictReport::empty();
+        heuristic_report.push(ConflictRecord {
+            kind: ConflictKind::DirectContradict,
+            severity: Severity::Warning,
+            description: "启发式检测".to_string(),
+            existing_fact: None,
+            new_fact: "用户不喜欢咖啡".to_string(),
+        });
+        let heuristic: Arc<dyn ConflictDetector> = Arc::new(MockDetector::new(heuristic_report));
+
+        // LLM：1 条 StanceReversal（不同 kind → 不重复 → 直接 push）
+        let mut llm_report = ConflictReport::empty();
+        llm_report.push(ConflictRecord {
+            kind: ConflictKind::StanceReversal,
+            severity: Severity::Critical,
+            description: "LLM 检测到立场反转".to_string(),
+            existing_fact: Some("历史记录显示用户喜欢咖啡".to_string()),
+            new_fact: "用户不喜欢咖啡".to_string(),
+        });
+        let llm: Arc<dyn ConflictDetector> = Arc::new(MockDetector::new(llm_report));
+
+        let hybrid = HybridDetector::with_dedup_threshold(heuristic, llm, 0.0);
+
+        let update = MemoryUpdate::new().add_fact("用户不喜欢咖啡".to_string());
+        let memory = make_test_memory();
+
+        let report = hybrid.detect(&update, &memory).await;
+
+        // 应有 2 条冲突（启发式 1 + LLM 独有 1）
+        assert_eq!(report.count(), 2, "独有冲突应直接 push，共 2 条");
     }
 }
