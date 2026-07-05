@@ -78,8 +78,10 @@
 
 pub mod builder;
 pub mod combined;
+pub mod detect;
 pub mod linkage;
 
 pub use builder::{build_from_strings, scenario_from_str, PresetBuilder};
-pub use combined::CombinedProfile;
+pub use combined::{CombinedProfile, TriggerRule, UsageProtocol};
+pub use detect::{detect_agent_client, default_scenario_for_agent, resolve_scenario_name, DetectedAgent, DetectionSource};
 pub use linkage::derive_window_from_agent;

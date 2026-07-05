@@ -131,6 +131,118 @@ impl AgentFamily {
             Self::Custom(_) => "custom",
         }
     }
+
+    /// 返回该 family 的识别指纹（v2.30 新增）
+    ///
+    /// 用于 MCP server 启动时自动识别 Agent 客户端：
+    /// - `client_info_keywords`：MCP 协议 `initialize` 请求中 `client_info.name` 的匹配关键词（小写）
+    /// - `parent_process_keywords`：父进程名匹配关键词（小写）
+    /// - `env_var_prefixes`：环境变量名前缀指纹
+    ///
+    /// 4 主流 family 有专属指纹，其他返回空数组（generic）。
+    /// 详见 `hippocampus_presets::detect::detect_agent_client`。
+    pub fn fingerprint(&self) -> AgentFingerprint {
+        match self {
+            Self::ClaudeCode => AgentFingerprint {
+                client_info_keywords: &["claude-code", "claude_code", "claudecode"],
+                parent_process_keywords: &["claude", "claude-code"],
+                env_var_prefixes: &["CLAUDE_CODE_", "CLAUDE_"],
+            },
+            Self::Cursor => AgentFingerprint {
+                client_info_keywords: &["cursor"],
+                parent_process_keywords: &["cursor"],
+                env_var_prefixes: &["CURSOR_"],
+            },
+            Self::Trae => AgentFingerprint {
+                client_info_keywords: &["trae"],
+                parent_process_keywords: &["trae"],
+                env_var_prefixes: &["TRAE_"],
+            },
+            Self::Codex => AgentFingerprint {
+                client_info_keywords: &["codex", "openai-codex"],
+                parent_process_keywords: &["codex"],
+                env_var_prefixes: &["CODEX_"],
+            },
+            _ => AgentFingerprint::generic(),
+        }
+    }
+}
+
+/// Agent 客户端识别指纹（v2.30 新增）
+///
+/// 用于 MCP server 启动时自动识别拉起自己的 Agent 客户端。
+/// 3 层信号融合：MCP 协议 client_info → 父进程名 → 环境变量前缀。
+///
+/// ## 字段说明
+///
+/// - `client_info_keywords`：MCP `initialize` 请求 `client_info.name` 的小写匹配关键词
+/// - `parent_process_keywords`：父进程名的小写匹配关键词
+/// - `env_var_prefixes`：环境变量名前缀（如 `CLAUDE_CODE_`）
+///
+/// ## 使用方式
+///
+/// 通常不直接使用，通过 [`AgentFamily::fingerprint`] 获取，
+/// 再由 `hippocampus_presets::detect::detect_agent_client` 进行多信号融合识别。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AgentFingerprint {
+    /// MCP 协议 `client_info.name` 匹配关键词（小写）
+    pub client_info_keywords: &'static [&'static str],
+    /// 父进程名匹配关键词（小写）
+    pub parent_process_keywords: &'static [&'static str],
+    /// 环境变量指纹（变量名前缀）
+    pub env_var_prefixes: &'static [&'static str],
+}
+
+impl AgentFingerprint {
+    /// 通用空指纹（未识别的 family 使用）
+    pub const fn generic() -> Self {
+        Self {
+            client_info_keywords: &[],
+            parent_process_keywords: &[],
+            env_var_prefixes: &[],
+        }
+    }
+
+    /// 是否为空指纹（无任何识别信号）
+    pub fn is_empty(&self) -> bool {
+        self.client_info_keywords.is_empty()
+            && self.parent_process_keywords.is_empty()
+            && self.env_var_prefixes.is_empty()
+    }
+
+    /// 检查 MCP client_info.name 是否匹配（大小写不敏感）
+    pub fn matches_client_info(&self, client_info_name: &str) -> bool {
+        if self.client_info_keywords.is_empty() {
+            return false;
+        }
+        let lower = client_info_name.to_lowercase();
+        self.client_info_keywords
+            .iter()
+            .any(|kw| lower.contains(kw))
+    }
+
+    /// 检查父进程名是否匹配（大小写不敏感）
+    pub fn matches_parent_process(&self, parent_process_name: &str) -> bool {
+        if self.parent_process_keywords.is_empty() {
+            return false;
+        }
+        let lower = parent_process_name.to_lowercase();
+        self.parent_process_keywords
+            .iter()
+            .any(|kw| lower.contains(kw))
+    }
+
+    /// 检查环境变量集合是否包含任一前缀（大小写敏感，环境变量名通常大写）
+    pub fn matches_env_vars(&self, mut env_vars: impl Iterator<Item = String>) -> bool {
+        if self.env_var_prefixes.is_empty() {
+            return false;
+        }
+        env_vars.any(|name| {
+            self.env_var_prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
+    }
 }
 
 impl Default for AgentFamily {
@@ -245,5 +357,127 @@ mod tests {
         set.insert(AgentFamily::Cursor);
         set.insert(AgentFamily::ClaudeCode); // 重复，不会增加
         assert_eq!(set.len(), 2);
+    }
+
+    // =========================================================================
+    // v2.30 新增：AgentFingerprint 识别指纹测试
+    // =========================================================================
+
+    #[test]
+    fn test_fingerprint_mainstream_non_empty() {
+        // 4 主流 family 必须有专属指纹
+        for family in [AgentFamily::ClaudeCode, AgentFamily::Cursor, AgentFamily::Trae, AgentFamily::Codex] {
+            let fp = family.fingerprint();
+            assert!(!fp.is_empty(), "{} 指纹为空", family.display_name());
+            assert!(!fp.client_info_keywords.is_empty(), "{} client_info_keywords 为空", family.display_name());
+            assert!(!fp.parent_process_keywords.is_empty(), "{} parent_process_keywords 为空", family.display_name());
+            assert!(!fp.env_var_prefixes.is_empty(), "{} env_var_prefixes 为空", family.display_name());
+        }
+    }
+
+    #[test]
+    fn test_fingerprint_generic_for_non_mainstream() {
+        // 7 待补 family 返回空指纹
+        for family in [
+            AgentFamily::Zcode,
+            AgentFamily::OpenCode,
+            AgentFamily::Qoder,
+            AgentFamily::WorkBuddy,
+            AgentFamily::CatPaw,
+            AgentFamily::OpenClaw,
+            AgentFamily::Marvis,
+        ] {
+            let fp = family.fingerprint();
+            assert!(fp.is_empty(), "{} 不应有指纹", family.display_name());
+        }
+    }
+
+    #[test]
+    fn test_fingerprint_generic_for_custom() {
+        let custom = AgentFamily::Custom("MyAgent".into());
+        assert!(custom.fingerprint().is_empty());
+    }
+
+    #[test]
+    fn test_fingerprint_matches_client_info() {
+        // Claude Code：多种写法都应匹配
+        let fp = AgentFamily::ClaudeCode.fingerprint();
+        assert!(fp.matches_client_info("claude-code"));
+        assert!(fp.matches_client_info("Claude-Code"));
+        assert!(fp.matches_client_info("claudecode"));
+        assert!(fp.matches_client_info("claude-code-cli"));
+        assert!(!fp.matches_client_info("cursor"));
+
+        // Cursor
+        let fp = AgentFamily::Cursor.fingerprint();
+        assert!(fp.matches_client_info("cursor"));
+        assert!(fp.matches_client_info("Cursor"));
+        assert!(!fp.matches_client_info("trae"));
+
+        // Trae
+        let fp = AgentFamily::Trae.fingerprint();
+        assert!(fp.matches_client_info("trae"));
+        assert!(fp.matches_client_info("Trae IDE"));
+
+        // Codex
+        let fp = AgentFamily::Codex.fingerprint();
+        assert!(fp.matches_client_info("codex"));
+        assert!(fp.matches_client_info("openai-codex"));
+    }
+
+    #[test]
+    fn test_fingerprint_matches_parent_process() {
+        let fp = AgentFamily::ClaudeCode.fingerprint();
+        assert!(fp.matches_parent_process("claude"));
+        assert!(fp.matches_parent_process("claude-code"));
+        assert!(fp.matches_parent_process("claude-code.exe"));
+        assert!(!fp.matches_parent_process("node"));
+
+        let fp = AgentFamily::Trae.fingerprint();
+        assert!(fp.matches_parent_process("trae"));
+        assert!(fp.matches_parent_process("Trae.exe"));
+    }
+
+    #[test]
+    fn test_fingerprint_matches_env_vars() {
+        let fp = AgentFamily::ClaudeCode.fingerprint();
+        let env_vars = vec!["CLAUDE_CODE_VERSION".to_string(), "PATH".to_string()];
+        assert!(fp.matches_env_vars(env_vars.into_iter()));
+
+        let env_vars = vec!["CURSOR_DEBUG_DIR".to_string()];
+        assert!(!fp.matches_env_vars(env_vars.into_iter()));
+
+        let fp = AgentFamily::Cursor.fingerprint();
+        let env_vars = vec!["CURSOR_DEBUG_DIR".to_string()];
+        assert!(fp.matches_env_vars(env_vars.into_iter()));
+    }
+
+    #[test]
+    fn test_fingerprint_generic_is_empty() {
+        let fp = AgentFingerprint::generic();
+        assert!(fp.is_empty());
+        assert!(!fp.matches_client_info("anything"));
+        assert!(!fp.matches_parent_process("anything"));
+        assert!(!fp.matches_env_vars(std::iter::empty()));
+    }
+
+    #[test]
+    fn test_fingerprint_all_mainstream_distinct() {
+        // 4 主流的 client_info_keywords 不应有重叠
+        let cc = AgentFamily::ClaudeCode.fingerprint();
+        let cursor = AgentFamily::Cursor.fingerprint();
+        let trae = AgentFamily::Trae.fingerprint();
+        let codex = AgentFamily::Codex.fingerprint();
+
+        // Claude Code 的关键词不应匹配其他 family
+        for kw in cc.client_info_keywords {
+            assert!(!cursor.matches_client_info(kw), "Cursor 误匹配 {}", kw);
+            assert!(!trae.matches_client_info(kw), "Trae 误匹配 {}", kw);
+            assert!(!codex.matches_client_info(kw), "Codex 误匹配 {}", kw);
+        }
+        // 反向验证
+        for kw in cursor.client_info_keywords {
+            assert!(!cc.matches_client_info(kw), "ClaudeCode 误匹配 {}", kw);
+        }
     }
 }

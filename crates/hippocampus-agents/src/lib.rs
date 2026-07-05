@@ -51,5 +51,5 @@
 pub mod agent_family;
 pub mod agent_profile;
 
-pub use agent_family::AgentFamily;
+pub use agent_family::{AgentFamily, AgentFingerprint};
 pub use agent_profile::AgentProfile;

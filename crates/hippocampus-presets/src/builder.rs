@@ -3,11 +3,11 @@
 //! 链式收集 5 个可选 Profile + 用户覆盖参数，调用 [`build`](PresetBuilder::build)
 //! 时应用联动机制 + 优先级链，生成 [`CombinedProfile`]。
 
-use crate::combined::{CombinedProfile, DEFAULT_ARCHIVE_THRESHOLD, DEFAULT_SUMMARY_TEMPLATE};
+use crate::combined::{CombinedProfile, DEFAULT_ARCHIVE_THRESHOLD, DEFAULT_SUMMARY_TEMPLATE, TriggerRule, UsageProtocol};
 use crate::linkage::{derive_window_from_agent, should_derive_window};
 use hippocampus_agents::AgentProfile;
 use hippocampus_models::ModelVariant;
-use hippocampus_scenarios::ScenarioProfile;
+use hippocampus_scenarios::{Scenario, ScenarioProfile, SummaryFocus};
 use hippocampus_skills::SkillProfile;
 use hippocampus_windows::WindowProfile;
 
@@ -190,6 +190,14 @@ impl PresetBuilder {
             agent_flag && window_flag
         };
 
+        // 7. 生成 usage_protocol（v2.30 新增）
+        let usage_protocol = generate_usage_protocol(
+            self.agent.as_ref(),
+            self.scenario.as_ref().map(|s| &s.scenario),
+            resolved_window.as_ref(),
+            archive_threshold,
+        );
+
         Ok(CombinedProfile::new(
             self.model,
             self.scenario,
@@ -200,7 +208,99 @@ impl PresetBuilder {
             summary_template,
             session_prefix,
             archive_to_hippocampus,
+            usage_protocol,
         ))
+    }
+}
+
+/// 生成 LLM 可读的行为契约（v2.30 新增）
+///
+/// 根据 Agent + Scenario + Window 自动生成 `UsageProtocol`：
+/// - `instructions`：注入 MCP server_info.description，LLM 启动即看到
+/// - `session_id_pattern`：session_id 派生规则
+/// - `trigger_rules`：工具触发规则列表
+///
+/// 未识别 Agent 时返回空协议（`UsageProtocol::empty()`）。
+fn generate_usage_protocol(
+    agent: Option<&AgentProfile>,
+    scenario: Option<&Scenario>,
+    _window: Option<&WindowProfile>,
+    archive_threshold: usize,
+) -> UsageProtocol {
+    let agent_family = match agent {
+        Some(a) if a.family.is_mainstream() => &a.family,
+        _ => return UsageProtocol::empty(),
+    };
+
+    let scenario_name = scenario
+        .map(|s| format!("{:?}", s))
+        .unwrap_or_else(|| "Coding".to_string());
+
+    let session_prefix = agent_family.default_session_prefix();
+    let session_id_pattern = format!("{}-{{项目名}}-{{日期}}", session_prefix);
+
+    // 触发阈值描述
+    let threshold_desc = format!("上下文接近 {}K tokens 时", archive_threshold / 1000);
+
+    // 摘要 focus 维度
+    let focus = scenario
+        .map(SummaryFocus::from_scenario)
+        .unwrap_or_default();
+    let focus_dims = focus.focus_dimensions();
+
+    // 构建 instructions 文本
+    let instructions = format!(
+        "你正在 {agent_name} + {scenario_lower} 场景下工作，已接入 hippocampus 记忆库。\n\
+         \n\
+         ## 记忆协议（无需用户提示，主动执行）\n\
+         \n\
+         1. **会话开始**：第一步调用 `mcp_hippocampus.prompt(session_id)` 获取历史记忆摘要，拼接到 system prompt\n\
+         2. **{threshold_desc}**：调用 `mcp_hippocampus.archive(session_id, turns_json)` 归档完整上下文\n\
+         3. **用户提到过去事件**：先调 `mcp_hippocampus.semantic_search(query, session_id)` 检索，再回复\n\
+         4. **用户陈述与记忆可能矛盾**：先调 `mcp_hippocampus.detect_conflicts(session_id, statement)` 检测\n\
+         \n\
+         ## session_id 约定\n\
+         {session_id_pattern}\n\
+         \n\
+         ## 摘要 focus\n\
+         {scenario_name} 场景关注：{focus_dims}\n\
+         \n\
+         记忆管理是 Agent 的自动职责，无需用户显式要求。",
+        agent_name = agent_family.display_name(),
+        scenario_lower = scenario_name.to_lowercase(),
+        threshold_desc = threshold_desc,
+        session_id_pattern = session_id_pattern,
+        scenario_name = scenario_name,
+        focus_dims = focus_dims.join(" / "),
+    );
+
+    let trigger_rules = vec![
+        TriggerRule {
+            condition: "会话第一次回复前".to_string(),
+            tool: "prompt".to_string(),
+            example: Some("新会话开始时获取历史记忆".to_string()),
+        },
+        TriggerRule {
+            condition: threshold_desc,
+            tool: "archive".to_string(),
+            example: Some(format!("累计 token 接近 {} 时归档", archive_threshold)),
+        },
+        TriggerRule {
+            condition: "用户提到\"之前\"\"上次\"\"还记得\"等词".to_string(),
+            tool: "semantic_search".to_string(),
+            example: Some("用户问\"上次我们讨论的方案是什么\"".to_string()),
+        },
+        TriggerRule {
+            condition: "用户陈述与记忆可能矛盾".to_string(),
+            tool: "detect_conflicts".to_string(),
+            example: Some("用户说\"我用的是 Python\"但记忆里是 Rust".to_string()),
+        },
+    ];
+
+    UsageProtocol {
+        instructions,
+        session_id_pattern,
+        trigger_rules,
     }
 }
 
@@ -313,7 +413,6 @@ mod tests {
     use hippocampus_agents::{AgentFamily, AgentProfile};
     use hippocampus_scenarios::{Scenario, ScenarioProfile};
     use hippocampus_skills::{BuiltinSkill, SkillProfile};
-
     #[test]
     fn test_empty_builder_uses_defaults() {
         let combined = PresetBuilder::new().build().unwrap();
@@ -563,5 +662,127 @@ mod tests {
 
         assert_eq!(combined.session_prefix(), Some("cursor"));
         assert_eq!(combined.summary_template(), "writing template {conversation}");
+    }
+
+    // =========================================================================
+    // v2.30 新增：usage_protocol 行为契约测试
+    // =========================================================================
+
+    #[test]
+    fn test_usage_protocol_empty_when_no_agent() {
+        // 未设置 agent 时，usage_protocol 为空
+        let combined = PresetBuilder::new().build().unwrap();
+        assert!(combined.usage_protocol().is_empty());
+    }
+
+    #[test]
+    fn test_usage_protocol_empty_when_non_mainstream_agent() {
+        // 7 待补 family 不是主流，usage_protocol 为空
+        let combined = PresetBuilder::new()
+            .with_agent(AgentProfile::from_family(AgentFamily::Zcode))
+            .build()
+            .unwrap();
+        assert!(combined.usage_protocol().is_empty());
+    }
+
+    #[test]
+    fn test_usage_protocol_generated_for_claude_code() {
+        let combined = PresetBuilder::new()
+            .with_agent(AgentProfile::claude_code())
+            .with_scenario(ScenarioProfile::from_scenario(Scenario::Coding))
+            .build()
+            .unwrap();
+
+        let protocol = combined.usage_protocol();
+        assert!(!protocol.is_empty());
+        assert!(protocol.instructions.contains("Claude Code"));
+        assert!(protocol.instructions.contains("coding"));
+        assert!(protocol.instructions.contains("mcp_hippocampus.prompt"));
+        assert!(protocol.instructions.contains("mcp_hippocampus.archive"));
+        assert!(protocol.session_id_pattern.contains("claude-code"));
+        assert_eq!(protocol.trigger_rules.len(), 4);
+
+        // 验证触发规则
+        let tools: Vec<&str> = protocol.trigger_rules.iter().map(|r| r.tool.as_str()).collect();
+        assert!(tools.contains(&"prompt"));
+        assert!(tools.contains(&"archive"));
+        assert!(tools.contains(&"semantic_search"));
+        assert!(tools.contains(&"detect_conflicts"));
+    }
+
+    #[test]
+    fn test_usage_protocol_generated_for_trae() {
+        let combined = PresetBuilder::new()
+            .with_agent(AgentProfile::trae())
+            .build()
+            .unwrap();
+
+        let protocol = combined.usage_protocol();
+        assert!(!protocol.is_empty());
+        assert!(protocol.instructions.contains("Trae"));
+        assert!(protocol.session_id_pattern.starts_with("trae-"));
+    }
+
+    #[test]
+    fn test_usage_protocol_threshold_in_instructions() {
+        // Coding 场景默认 500K，instructions 应包含 500K
+        let combined = PresetBuilder::new()
+            .with_agent(AgentProfile::claude_code())
+            .with_scenario(ScenarioProfile::from_scenario(Scenario::Coding))
+            .build()
+            .unwrap();
+
+        let protocol = combined.usage_protocol();
+        // Coding 默认 500K，但 ClaudeCode 联动推导的 Window 是 180K，
+        // archive_threshold 优先级：scenario(500K) > window，所以是 500K
+        assert!(protocol.instructions.contains("500K") || protocol.instructions.contains("500k"));
+    }
+
+    #[test]
+    fn test_usage_protocol_user_threshold_override() {
+        // 用户覆盖阈值，instructions 应反映新阈值
+        let combined = PresetBuilder::new()
+            .with_agent(AgentProfile::cursor())
+            .with_user_archive_threshold(300_000)
+            .build()
+            .unwrap();
+
+        let protocol = combined.usage_protocol();
+        assert!(protocol.instructions.contains("300K") || protocol.instructions.contains("300k"));
+    }
+
+    #[test]
+    fn test_usage_protocol_focus_dims_in_instructions() {
+        // Writing 场景的 focus 维度应出现在 instructions
+        let combined = PresetBuilder::new()
+            .with_agent(AgentProfile::claude_code())
+            .with_scenario(ScenarioProfile::from_scenario(Scenario::Writing))
+            .build()
+            .unwrap();
+
+        let protocol = combined.usage_protocol();
+        assert!(protocol.instructions.contains("核心观点") || protocol.instructions.contains("论据"));
+    }
+
+    #[test]
+    fn test_usage_protocol_serialize_deserialize() {
+        let combined = PresetBuilder::new()
+            .with_agent(AgentProfile::claude_code())
+            .with_scenario(ScenarioProfile::from_scenario(Scenario::Coding))
+            .build()
+            .unwrap();
+
+        let json = serde_json::to_string(&combined).unwrap();
+        let back: CombinedProfile = serde_json::from_str(&json).unwrap();
+
+        assert!(!back.usage_protocol().is_empty());
+        assert_eq!(
+            back.usage_protocol().session_id_pattern,
+            combined.usage_protocol().session_id_pattern
+        );
+        assert_eq!(
+            back.usage_protocol().trigger_rules.len(),
+            combined.usage_protocol().trigger_rules.len()
+        );
     }
 }

@@ -62,6 +62,13 @@ use hippocampus_core::heuristic::HeuristicDetector;
 use hippocampus_core::storage::{LocalStorage, Storage};
 use hippocampus_mcp::HippocampusMcp;
 use hippocampus_llm::{HttpLlmDetector, LlmDetectorConfig};
+// v2.30：启动时识别 Agent 客户端 + 注入 CombinedProfile（行为契约）
+use hippocampus_agents::AgentProfile;
+use hippocampus_presets::{
+    detect_agent_client, resolve_scenario_name, scenario_from_str, CombinedProfile,
+    PresetBuilder,
+};
+use hippocampus_scenarios::ScenarioProfile;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 
@@ -176,6 +183,106 @@ fn build_summary_generator() -> Option<Arc<dyn hippocampus_core::generate::Summa
     Some(Arc::new(HttpSummaryGenerator::new(config)))
 }
 
+/// 启动时识别 Agent 客户端 + 构建 CombinedProfile（v2.30 新增）
+///
+/// 执行流程：
+/// 1. 调用 `detect_agent_client(None)` 进行 3 层信号融合识别
+///    （Layer 1 显式 env > Layer 2 MCP ClientInfo > Layer 3 父进程/env 前缀 > Layer 4 降级）
+/// 2. 若识别为 mainstream family（ClaudeCode/Cursor/Trae/Codex）：
+///    - 按 family 推导 scenario（HIPPOCAMPUS_PRESET_SCENARIO 优先，否则 coding/daily）
+///    - 调用 PresetBuilder 构建 CombinedProfile（含 usage_protocol）
+/// 3. 若识别为 Custom/降级：返回 None（tool 行为与 v2.29 一致）
+///
+/// ## 降级策略
+///
+/// - PresetBuilder::build 失败：日志警告，返回 None（不阻塞启动）
+/// - 识别为 Custom：返回 None（向后兼容）
+///
+/// ## 注入路径（v2.30 1.5 + 1.8 已完成）
+///
+/// - `usage_protocol.instructions` → MCP `InitializeResult.instructions` 顶层字段
+///   （由 `HippocampusMcp::get_info()` 注入，客户端把它注入 LLM system prompt）
+/// - 不写入 SERVER_METADATA.json 文件（避免多 MCP 进程并发写入冲突）
+/// - debug 级日志输出完整 instructions，方便调试（`RUST_LOG=debug` 可查看）
+///
+/// ## 日志输出
+///
+/// 启动时输出识别结果 + 应用的 preset 摘要：
+/// ```text
+/// Agent 客户端识别：family=Trae, source=EnvVarPrefix
+/// 应用预设：scenario=Coding, archive_threshold=400000, session_prefix=trae
+/// 行为契约生成完成：usage_protocol 已注入 MCP InitializeResult.instructions（LLM 启动即看到）
+/// ```
+fn build_combined_profile() -> Option<CombinedProfile> {
+    let detected = detect_agent_client(None);
+
+    tracing::info!(
+        family = ?detected.family,
+        source = ?detected.source,
+        "Agent 客户端识别：3 层信号融合完成"
+    );
+
+    // 非 mainstream agent：降级，不构建 CombinedProfile
+    if !detected.family.is_mainstream() {
+        tracing::info!(
+            family = ?detected.family,
+            "未识别为主流 Agent（ClaudeCode/Cursor/Trae/Codex），跳过 preset 注入（向后兼容 v2.29）"
+        );
+        return None;
+    }
+
+    // 推导 scenario（环境变量 HIPPOCAMPUS_PRESET_SCENARIO 优先）
+    let scenario_str = resolve_scenario_name(&detected.family);
+    let scenario = scenario_from_str(&scenario_str);
+
+    tracing::info!(
+        family = ?detected.family,
+        scenario = %scenario_str,
+        "应用预设：按 Agent family 推导 scenario"
+    );
+
+    // 构建 CombinedProfile（Agent + Scenario，联动推导 Window）
+    let agent_profile = AgentProfile::from_family(detected.family);
+    let scenario_profile = ScenarioProfile::from_scenario(scenario);
+
+    match PresetBuilder::new()
+        .with_agent(agent_profile)
+        .with_scenario(scenario_profile)
+        .build()
+    {
+        Ok(combined) => {
+            let protocol = combined.usage_protocol();
+            tracing::info!(
+                archive_threshold = combined.archive_threshold(),
+                session_prefix = ?combined.session_prefix(),
+                instructions_len = protocol.instructions.len(),
+                trigger_rules_count = protocol.trigger_rules.len(),
+                "行为契约生成完成：usage_protocol 已注入 MCP InitializeResult.instructions（LLM 启动即看到）"
+            );
+            // v2.30 1.8：debug 级输出完整 instructions，方便调试和验证注入内容
+            // 生产环境 RUST_LOG=info 不会输出，RUST_LOG=debug 可查看完整行为契约
+            tracing::debug!(
+                instructions = %protocol.instructions,
+                session_id_pattern = %protocol.session_id_pattern,
+                trigger_rules = ?protocol
+                    .trigger_rules
+                    .iter()
+                    .map(|r| format!("{}/{}", r.condition, r.tool))
+                    .collect::<Vec<_>>(),
+                "完整 usage_protocol 内容（debug 级）"
+            );
+            Some(combined)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "CombinedProfile 构建失败：跳过 preset 注入（不阻塞启动，tool 行为与 v2.29 一致）"
+            );
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 初始化日志
@@ -200,8 +307,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // v2.21 批次 8c：构造 LLM 摘要生成器（环境变量驱动：未配置时返回 None，使用启发式）
     let summary_generator = build_summary_generator();
 
+    // v2.30：启动时识别 Agent 客户端 + 构建 CombinedProfile（注入行为契约）
+    let combined_profile = build_combined_profile();
+
     tracing::info!(
         root = %storage_root.display(),
+        has_combined_profile = combined_profile.is_some(),
         "启动 Hippocampus MCP server (stdio 传输)"
     );
 
@@ -212,6 +323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .with_session_search(session_search)
     .with_summary_generator(summary_generator)
+    .with_combined_profile(combined_profile)
     .serve(stdio())
     .await?;
 

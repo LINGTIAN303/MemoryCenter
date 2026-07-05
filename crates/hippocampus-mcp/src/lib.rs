@@ -36,8 +36,11 @@
 //! ```
 
 use rmcp::handler::server::wrapper::Parameters;
+use rmcp::handler::server::ServerHandler;
+use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::schemars;
 use rmcp::tool;
+use rmcp::tool_handler;
 use rmcp::tool_router;
 use rmcp::ErrorData as McpError;
 use serde::Deserialize;
@@ -54,6 +57,8 @@ use hippocampus_core::score::DefaultScorer;
 use hippocampus_core::storage::{LocalStorage, Storage};
 // v2.18 批次2：复用 hippocampus-search 的 SessionSearchRouter（不引入 axum 重依赖）
 use hippocampus_search::SessionSearchRouter;
+// v2.30：启动时识别 Agent 客户端 + 注入 CombinedProfile（行为契约）
+use hippocampus_presets::CombinedProfile;
 
 /// MCP server 主结构体
 #[derive(Clone)]
@@ -80,6 +85,15 @@ pub struct HippocampusMcp {
     /// - `None`：使用启发式 `Summary::from_title`（首条消息前 80 字符，向后兼容）
     /// - LLM 调用失败：降级为启发式，归档主流程不中断
     summary_generator: Option<Arc<dyn SummaryGenerator>>,
+    /// 启动时识别 + 注入的 CombinedProfile（v2.30 新增）
+    ///
+    /// 由 `main()` 调用 `detect_agent_client()` + `PresetBuilder::build()` 生成，
+    /// 包含 `usage_protocol`（LLM 可读的行为契约）。
+    ///
+    /// - `Some`：MCP server 启动时已识别 Agent 客户端（ClaudeCode/Cursor/Trae/Codex），
+    ///   后续 tool 可读取 `usage_protocol.instructions` 注入 server_info.description
+    /// - `None`：未识别（Custom/降级），tool 行为与 v2.29 一致（向后兼容）
+    combined_profile: Option<CombinedProfile>,
 }
 
 impl HippocampusMcp {
@@ -92,6 +106,7 @@ impl HippocampusMcp {
             conflict_detector: None,
             session_search: None,
             summary_generator: None,
+            combined_profile: None,
         }
     }
 
@@ -113,6 +128,7 @@ impl HippocampusMcp {
             conflict_detector,
             session_search: None,
             summary_generator: None,
+            combined_profile: None,
         }
     }
 
@@ -166,6 +182,55 @@ impl HippocampusMcp {
     ) -> Self {
         self.summary_generator = summary_generator;
         self
+    }
+
+    /// 链式注入启动时识别的 CombinedProfile（v2.30 builder 模式）
+    ///
+    /// 由 `main()` 在启动时调用 `detect_agent_client()` + `PresetBuilder::build()`
+    /// 生成 CombinedProfile 后注入。后续 tool 可通过 `combined_profile()` 访问器
+    /// 读取 `usage_protocol.instructions` 等字段。
+    ///
+    /// ## 降级策略
+    ///
+    /// - 识别成功（mainstream agent）：注入完整 CombinedProfile（含 usage_protocol）
+    /// - 识别失败（Custom/降级）：传 `None`，tool 行为与 v2.29 一致（向后兼容）
+    ///
+    /// ## 使用示例
+    ///
+    /// ```rust,ignore
+    /// use hippocampus_presets::{detect_agent_client, resolve_scenario_name, PresetBuilder};
+    /// use hippocampus_agents::AgentProfile;
+    /// use hippocampus_scenarios::ScenarioProfile;
+    ///
+    /// let detected = detect_agent_client(None);
+    /// let scenario = resolve_scenario_name(&detected.family);
+    /// let combined = PresetBuilder::new()
+    ///     .with_agent(AgentProfile::from_family(detected.family))
+    ///     .with_scenario(ScenarioProfile::from_scenario(scenario_from_str(&scenario)))
+    ///     .build()?;
+    ///
+    /// let mcp = HippocampusMcp::with_conflict_detector(root, detector)
+    ///     .with_combined_profile(Some(combined));
+    /// ```
+    ///
+    /// ## 参数
+    ///
+    /// - `combined_profile`：注入的 CombinedProfile，传 `None` 走旧逻辑（向后兼容）
+    pub fn with_combined_profile(
+        mut self,
+        combined_profile: Option<CombinedProfile>,
+    ) -> Self {
+        self.combined_profile = combined_profile;
+        self
+    }
+
+    /// 获取启动时识别 + 注入的 CombinedProfile（v2.30）
+    ///
+    /// 返回 `Option<&CombinedProfile>`：
+    /// - `Some`：已识别 Agent 客户端，可读取 `usage_protocol` 等字段
+    /// - `None`：未识别（Custom/降级），tool 按旧逻辑处理
+    pub fn combined_profile(&self) -> Option<&CombinedProfile> {
+        self.combined_profile.as_ref()
     }
 
     /// 创建 Storage 实例（每次 tool 调用创建，无状态）
@@ -430,7 +495,9 @@ struct NoParams {}
 // MCP Tools 实现
 // ============================================================================
 
-#[tool_router(server_handler)]
+// v2.30：去掉 server_handler 标志，改用两段式（tool_router + 独立 tool_handler impl），
+// 以便手写 ServerHandler::get_info() 注入 usage_protocol.instructions
+#[tool_router]
 impl HippocampusMcp {
     /// 归档一批轮次为记忆文件，生成索引钩子。
     #[tool(description = "归档对话轮次到 Hippocampus 记忆库。当 Agent 会话达到 token 阈值时调用此 tool 保存完整上下文（非摘要）。返回归档摘要（含 hook_id 用于后续检索）。v2.29：支持 preset 参数（内联预设，传入后应用 archive_threshold + summary_template 覆盖默认行为）。")]
@@ -441,12 +508,19 @@ impl HippocampusMcp {
         // 解析 turns_json
         let turns: Vec<MessageTurn> = serde_json::from_str(&params.turns_json)
             .map_err(|e| McpError::invalid_params(
-                format!("turns_json 解析失败: {e}"),
+                format!(
+                    "turns_json 解析失败: {e}\n\n\
+                     合法格式：MessageTurn 数组的 JSON 字符串，每条含 id（UUID）/user_message/llm_message/tags/timestamp/token_count。\n\
+                     示例：[{{\"id\":\"7f9c1b2a-3d4e-4f5a-8a9b-0c1d2e3f4a5b\",\"user_message\":{{\"text\":\"用户消息\",\"attachments\":[],\"tool_calls\":[],\"thinking\":null}},\"llm_message\":{{\"text\":\"LLM 回复\",\"attachments\":[],\"tool_calls\":[],\"thinking\":null}},\"tags\":[{{\"kind\":\"Text\"}}],\"timestamp\":\"2026-07-05T00:00:00Z\",\"token_count\":100}}]"
+                ),
                 None,
             ))?;
 
         if turns.is_empty() {
-            return Err(McpError::invalid_params("turns 不能为空", None));
+            return Err(McpError::invalid_params(
+                "turns 不能为空。请传入至少一条 MessageTurn。",
+                None,
+            ));
         }
 
         // v2.29：若传入 preset，构建 CombinedProfile 提取 archive_threshold + summary_template
@@ -460,7 +534,10 @@ impl HippocampusMcp {
                 preset_req.summary_template.as_deref(),
             )
             .map_err(|e| McpError::invalid_params(
-                format!("预设构建失败: {e}"),
+                format!(
+                    "预设构建失败: {e}\n\n\
+                     提示：调用 preset_list_agents / preset_list_scenarios / preset_list_models 查询合法值。"
+                ),
                 None,
             ))?;
             (
@@ -622,12 +699,20 @@ impl HippocampusMcp {
     ) -> Result<String, McpError> {
         let hook_ids: Vec<String> = serde_json::from_str(&params.hook_ids_json)
             .map_err(|e| McpError::invalid_params(
-                format!("hook_ids_json 解析失败: {e}"),
+                format!(
+                    "hook_ids_json 解析失败: {e}\n\n\
+                     合法格式：字符串数组的 JSON 字符串。\n\
+                     示例：[\"7f9c1b2a-3d4e-4f5a-8a9b-0c1d2e3f4a5b\",\"abc123\"]\n\
+                     提示：hook_id 可从 summaries 工具获取。"
+                ),
                 None,
             ))?;
 
         if hook_ids.is_empty() {
-            return Err(McpError::invalid_params("hook_ids 不能为空", None));
+            return Err(McpError::invalid_params(
+                "hook_ids 不能为空。请传入至少一个 hook_id。",
+                None,
+            ));
         }
 
         let storage = self.create_storage();
@@ -706,12 +791,20 @@ impl HippocampusMcp {
     ) -> Result<String, McpError> {
         let hook_ids: Vec<String> = serde_json::from_str(&params.hook_ids_json)
             .map_err(|e| McpError::invalid_params(
-                format!("hook_ids_json 解析失败: {e}"),
+                format!(
+                    "hook_ids_json 解析失败: {e}\n\n\
+                     合法格式：字符串数组的 JSON 字符串。\n\
+                     示例：[\"7f9c1b2a-3d4e-4f5a-8a9b-0c1d2e3f4a5b\",\"abc123\"]\n\
+                     提示：hook_id 可从 summaries 工具获取。"
+                ),
                 None,
             ))?;
 
         if hook_ids.is_empty() {
-            return Err(McpError::invalid_params("hook_ids 不能为空", None));
+            return Err(McpError::invalid_params(
+                "hook_ids 不能为空。请传入至少一个 hook_id。",
+                None,
+            ));
         }
 
         let storage = self.create_storage();
@@ -800,12 +893,20 @@ impl HippocampusMcp {
 
         let entries: Vec<UpdateEntry> = serde_json::from_str(&params.updates_json)
             .map_err(|e| McpError::invalid_params(
-                format!("updates_json 解析失败: {e}"),
+                format!(
+                    "updates_json 解析失败: {e}\n\n\
+                     合法格式：UpdateEntry 数组的 JSON 字符串，每条含 hook_id（必填）+ added_facts/revised_facts/deprecated_facts（可选数组）。\n\
+                     示例：[{{\"hook_id\":\"7f9c1b2a-3d4e-4f5a-8a9b-0c1d2e3f4a5b\",\"added_facts\":[\"新事实\"],\"revised_facts\":[],\"deprecated_facts\":[]}}]\n\
+                     提示：hook_id 可从 summaries 工具获取。"
+                ),
                 None,
             ))?;
 
         if entries.is_empty() {
-            return Err(McpError::invalid_params("updates 不能为空", None));
+            return Err(McpError::invalid_params(
+                "updates 不能为空。请传入至少一条 UpdateEntry。",
+                None,
+            ));
         }
 
         let storage = self.create_storage();
@@ -956,7 +1057,11 @@ impl HippocampusMcp {
             Some(h) => h,
             None => {
                 return Err(McpError::invalid_params(
-                    format!("未找到 hook_id: {}", params.hook_id),
+                    format!(
+                        "未找到 hook_id: {}\n\n\
+                         提示：调用 summaries(session_id) 查询当前 session 的所有 hook_id 列表。",
+                        params.hook_id
+                    ),
                     None,
                 ));
             }
@@ -1035,7 +1140,11 @@ impl HippocampusMcp {
             Some(mid) => mid,
             None => {
                 return Err(McpError::invalid_params(
-                    format!("未找到 hook_id: {}", params.hook_id),
+                    format!(
+                        "未找到 hook_id: {}\n\n\
+                         提示：调用 summaries(session_id) 查询当前 session 的所有 hook_id 列表。",
+                        params.hook_id
+                    ),
                     None,
                 ));
             }
@@ -1143,7 +1252,10 @@ impl HippocampusMcp {
             params.summary_template.as_deref(),
         )
         .map_err(|e| McpError::invalid_params(
-            format!("预设构建失败: {e}"),
+            format!(
+                "预设构建失败: {e}\n\n\
+                 提示：调用 preset_list_agents / preset_list_scenarios / preset_list_models 查询合法值。"
+            ),
             None,
         ))?;
 
@@ -1230,6 +1342,65 @@ impl HippocampusMcp {
             "models": models,
         });
         Ok(result.to_string())
+    }
+}
+
+// ============================================================================
+// ServerHandler 手写实现（v2.30 新增）
+// ============================================================================
+//
+// 改用两段式（`#[tool_router]` + 独立 `#[tool_handler] impl ServerHandler`），
+// 以便手写 `get_info()` 在运行时把 `usage_protocol.instructions` 注入 MCP 规范的
+// 顶层 `instructions` 字段（InitializeResult.instructions）。
+//
+// ## 为何用顶层 `instructions` 而非 `Implementation.description`
+//
+// - MCP 规范定义 `InitializeResult.instructions` 为「服务器给客户端/LLM 的使用说明」，
+//   语义最贴切 `usage_protocol.instructions`（行为契约）
+// - 客户端（Claude Code / Cursor / Trae）通常把顶层 `instructions` 注入 system prompt，
+//   让 LLM 启动即看到记忆协议
+// - `Implementation.description` 是「服务器实现本身的描述」（元数据），语义偏元信息
+//
+// ## 降级路径
+//
+// - `combined_profile` 为 None（Custom/降级）：返回与原宏生成等价的最小 ServerInfo
+//   （仅 `enable_tools()` + `Implementation::from_build_env()`，无 instructions）
+// - 向后兼容 v2.29：未识别 Agent 时 LLM 看到的 server 元信息与 v2.29 一致
+#[tool_handler]
+impl ServerHandler for HippocampusMcp {
+    /// 手写 get_info：注入 usage_protocol.instructions 到顶层 instructions 字段
+    ///
+    /// 宏的 `has_method` 检查会跳过此手写实现，但仍自动生成
+    /// `call_tool` / `list_tools` / `get_tool`，工具路由功能不受影响。
+    ///
+    /// ## server_info.name 修正
+    ///
+    /// v2.29 之前用宏自动生成的 get_info 调 `Implementation::from_build_env()`，
+    /// 但 `from_build_env` 内部的 `env!("CARGO_CRATE_NAME")` 在 rmcp crate 编译期
+    /// 展开，取到 "rmcp" 而非调用方 crate 名。v2.30 改用 `Implementation::new`
+    /// 在 hippocampus-mcp 上下文展开 `env!`，让客户端看到正确的 "hippocampus-mcp"。
+    fn get_info(&self) -> ServerInfo {
+        let capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .build();
+
+        // 基础 ServerInfo（name/version 在 hippocampus-mcp 上下文取，修正 v2.29 的 "rmcp" 问题）
+        let server_impl = Implementation::new(
+            env!("CARGO_CRATE_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let mut info = ServerInfo::new(capabilities).with_server_info(server_impl);
+
+        // 若注入了 CombinedProfile，把 usage_protocol.instructions 作为顶层 instructions
+        // 让 MCP 客户端把它注入 LLM 的 system prompt
+        if let Some(profile) = self.combined_profile() {
+            let protocol = profile.usage_protocol();
+            if !protocol.instructions.is_empty() {
+                info = info.with_instructions(protocol.instructions.clone());
+            }
+        }
+
+        info
     }
 }
 
@@ -2511,5 +2682,248 @@ mod tests {
         let v: Value = serde_json::from_str(&result).unwrap();
         assert!(v["hook_id"].as_str().is_some());
         assert_eq!(v["token_count"], 80);
+    }
+
+    // ========================================================================
+    // v2.30 启动时识别 + 注入 CombinedProfile 测试
+    // ========================================================================
+
+    /// 测试默认构造（new / with_conflict_detector）combined_profile 为 None（向后兼容）
+    #[test]
+    fn test_combined_profile_default_none() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = HippocampusMcp::new(tmpdir.path().to_path_buf());
+        assert!(
+            mcp.combined_profile().is_none(),
+            "new() 默认不应注入 combined_profile"
+        );
+
+        let mcp2 = HippocampusMcp::with_conflict_detector(tmpdir.path().to_path_buf(), None);
+        assert!(
+            mcp2.combined_profile().is_none(),
+            "with_conflict_detector() 默认不应注入 combined_profile"
+        );
+    }
+
+    /// 测试 with_combined_profile(Some) 注入后可读取（链式 builder）
+    #[test]
+    fn test_with_combined_profile_injection() {
+        use hippocampus_agents::{AgentFamily, AgentProfile};
+        use hippocampus_presets::{PresetBuilder, CombinedProfile};
+        use hippocampus_scenarios::{Scenario, ScenarioProfile};
+
+        let tmpdir = TempDir::new().unwrap();
+
+        // 模拟 main.rs 中 build_combined_profile 的核心流程：
+        // 识别（直接构造 ClaudeCode family）→ 构建 CombinedProfile → 注入
+        let family = AgentFamily::ClaudeCode;
+        let combined: CombinedProfile = PresetBuilder::new()
+            .with_agent(AgentProfile::from_family(family))
+            .with_scenario(ScenarioProfile::from_scenario(Scenario::Coding))
+            .build()
+            .expect("ClaudeCode + Coding 应构建成功");
+
+        let mcp = HippocampusMcp::new(tmpdir.path().to_path_buf())
+            .with_combined_profile(Some(combined));
+
+        let read = mcp.combined_profile().expect("应能读取注入的 combined_profile");
+        assert_eq!(read.session_prefix(), Some("claude-code"));
+        // usage_protocol 应非空（mainstream agent + Coding scenario）
+        let protocol = read.usage_protocol();
+        assert!(!protocol.is_empty(), "mainstream agent 应生成非空 usage_protocol");
+        assert!(!protocol.instructions.is_empty());
+        assert!(!protocol.trigger_rules.is_empty());
+        assert!(protocol.session_id_pattern.contains("claude-code"));
+    }
+
+    /// 测试 with_combined_profile(None) 显式传 None（向后兼容）
+    #[test]
+    fn test_with_combined_profile_none() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = HippocampusMcp::new(tmpdir.path().to_path_buf())
+            .with_combined_profile(None);
+        assert!(mcp.combined_profile().is_none());
+    }
+
+    /// 测试识别 → 构建 → 注入完整链路（Trae family）
+    /// 验证 v2.30 1.4 验收标准：启动时识别 + 应用的 preset 可被 tool 读取
+    #[test]
+    fn test_detection_to_injection_full_chain_trae() {
+        use hippocampus_presets::{detect_agent_client, resolve_scenario_name, scenario_from_str, PresetBuilder};
+        use hippocampus_agents::AgentProfile;
+        use hippocampus_scenarios::ScenarioProfile;
+
+        let tmpdir = TempDir::new().unwrap();
+
+        // 模拟 build_combined_profile 流程（不依赖环境变量，直接验证链路）
+        // 注意：测试环境的识别结果可能是 Trae 也可能是 Custom（取决于运行环境），
+        // 这里手动指定 family 为 Trae 来验证链路完整性
+        let detected = detect_agent_client(Some("trae-cli/1.0"));
+        let family = detected.family;
+
+        // 非 mainstream 时跳过（测试环境可能识别不到 Trae）
+        if !family.is_mainstream() {
+            eprintln!("测试环境未识别为 mainstream agent（family={:?}），跳过链路验证", family);
+            return;
+        }
+
+        let scenario_str = resolve_scenario_name(&family);
+        let scenario = scenario_from_str(&scenario_str);
+        let combined = PresetBuilder::new()
+            .with_agent(AgentProfile::from_family(family))
+            .with_scenario(ScenarioProfile::from_scenario(scenario))
+            .build()
+            .expect("mainstream family 应构建成功");
+
+        let mcp = HippocampusMcp::new(tmpdir.path().to_path_buf())
+            .with_combined_profile(Some(combined));
+
+        // 验证注入的 preset 可被读取
+        let read = mcp.combined_profile().expect("应能读取注入的 combined_profile");
+        let protocol = read.usage_protocol();
+        assert!(!protocol.is_empty(), "mainstream agent 应有非空 usage_protocol");
+        // instructions 应包含「记忆协议」关键词（来自 generate_usage_protocol）
+        assert!(
+            protocol.instructions.contains("记忆协议"),
+            "instructions 应包含记忆协议说明，实际: {}",
+            protocol.instructions.chars().take(100).collect::<String>()
+        );
+        // trigger_rules 应有 4 条（prompt/archive/semantic_search/detect_conflicts）
+        assert_eq!(
+            protocol.trigger_rules.len(),
+            4,
+            "应有 4 条触发规则"
+        );
+    }
+
+    /// 测试 archive tool 在注入 CombinedProfile 后行为不回归
+    /// （注入的 preset 不应影响 archive 的正常调用，preset 字段仍可独立工作）
+    #[tokio::test]
+    async fn test_archive_with_injected_combined_profile_works() {
+        use hippocampus_agents::{AgentFamily, AgentProfile};
+        use hippocampus_presets::{PresetBuilder, CombinedProfile};
+        use hippocampus_scenarios::{Scenario, ScenarioProfile};
+
+        let tmpdir = TempDir::new().unwrap();
+
+        let combined: CombinedProfile = PresetBuilder::new()
+            .with_agent(AgentProfile::from_family(AgentFamily::Trae))
+            .with_scenario(ScenarioProfile::from_scenario(Scenario::Coding))
+            .build()
+            .unwrap();
+
+        let mcp = HippocampusMcp::new(tmpdir.path().to_path_buf())
+            .with_combined_profile(Some(combined));
+
+        // archive 应正常工作（注入的 combined_profile 不影响 archive 调用）
+        let turns_json = make_turns_json("注入 preset 测试", "LLM 回复", 100);
+        let params = Parameters(ArchiveParams {
+            session_id: "test-injected-preset".to_string(),
+            turns_json,
+            project_id: None,
+            ..Default::default()
+        });
+        let result = mcp.archive(params).await.expect("注入 combined_profile 后 archive 应成功");
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert!(v["hook_id"].as_str().is_some());
+    }
+
+    /// 测试 get_info() 在有 combined_profile 时注入 instructions（v2.30 1.5 核心）
+    ///
+    /// 验证：MCP 客户端调用 initialize 时拿到的 ServerInfo.instructions
+    /// 包含 usage_protocol.instructions 内容（让 LLM 启动即看到记忆协议）
+    #[test]
+    fn test_get_info_injects_instructions_when_combined_profile_present() {
+        use hippocampus_agents::{AgentFamily, AgentProfile};
+        use hippocampus_presets::{PresetBuilder, CombinedProfile};
+        use hippocampus_scenarios::{Scenario, ScenarioProfile};
+
+        let tmpdir = TempDir::new().unwrap();
+
+        let combined: CombinedProfile = PresetBuilder::new()
+            .with_agent(AgentProfile::from_family(AgentFamily::ClaudeCode))
+            .with_scenario(ScenarioProfile::from_scenario(Scenario::Coding))
+            .build()
+            .unwrap();
+        let expected_instructions = combined.usage_protocol().instructions.clone();
+        assert!(!expected_instructions.is_empty(), "前置条件：usage_protocol 应非空");
+
+        let mcp = HippocampusMcp::new(tmpdir.path().to_path_buf())
+            .with_combined_profile(Some(combined));
+
+        let info = mcp.get_info();
+
+        // 顶层 instructions 应被注入
+        let instructions = info.instructions.expect("应有 instructions");
+        assert!(
+            instructions.contains("记忆协议"),
+            "instructions 应包含「记忆协议」，实际: {}",
+            instructions.chars().take(100).collect::<String>()
+        );
+        // 应与 usage_protocol.instructions 完全一致
+        assert_eq!(instructions, expected_instructions);
+
+        // server_info.name 应保持 build_env 默认值（hippocampus-mcp）
+        assert!(
+            info.server_info.name.contains("hippocampus"),
+            "server_info.name 应含 hippocampus，实际: {}",
+            info.server_info.name
+        );
+    }
+
+    /// 测试 get_info() 在无 combined_profile 时 instructions 为 None（向后兼容）
+    ///
+    /// 验证：未识别 Agent 时 LLM 看到的 server 元信息与 v2.29 一致
+    #[test]
+    fn test_get_info_no_instructions_when_combined_profile_absent() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = HippocampusMcp::new(tmpdir.path().to_path_buf());
+
+        let info = mcp.get_info();
+
+        // 无 combined_profile 时 instructions 应为 None（与原宏生成等价）
+        assert!(
+            info.instructions.is_none(),
+            "无 combined_profile 时不应有 instructions，实际: {:?}",
+            info.instructions
+        );
+        // capabilities 应启用 tools
+        assert!(
+            info.capabilities.tools.is_some(),
+            "capabilities 应启用 tools"
+        );
+    }
+
+    /// 测试 get_info() 在 combined_profile 但 usage_protocol 为空时的降级
+    ///
+    /// 验证：即使注入了 combined_profile，若 usage_protocol.instructions 为空
+    /// （未识别为 mainstream agent，generate_usage_protocol 返回 empty），
+    /// get_info 也不应注入空字符串
+    #[test]
+    fn test_get_info_no_instructions_when_usage_protocol_empty() {
+        use hippocampus_presets::PresetBuilder;
+
+        let tmpdir = TempDir::new().unwrap();
+
+        // 用 PresetBuilder 不传 agent 构造空协议的 CombinedProfile
+        // （generate_usage_protocol 在无 agent 或非 mainstream 时返回 empty）
+        let empty_combined = PresetBuilder::new()
+            .build()
+            .expect("空 PresetBuilder 应构建成功");
+
+        assert!(
+            empty_combined.usage_protocol().is_empty(),
+            "前置条件：无 agent 时 usage_protocol 应为空"
+        );
+
+        let mcp = HippocampusMcp::new(tmpdir.path().to_path_buf())
+            .with_combined_profile(Some(empty_combined));
+
+        let info = mcp.get_info();
+        // usage_protocol.instructions 为空时不应注入
+        assert!(
+            info.instructions.is_none(),
+            "空 usage_protocol 不应注入 instructions"
+        );
     }
 }
