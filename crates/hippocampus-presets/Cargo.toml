@@ -15,3 +15,8 @@ hippocampus-scenarios = { path = "../hippocampus-scenarios", version = "0.1.0" }
 hippocampus-windows = { path = "../hippocampus-windows", version = "0.1.0" }
 hippocampus-agents = { path = "../hippocampus-agents", version = "0.1.0" }
 hippocampus-skills = { path = "../hippocampus-skills", version = "0.1.0" }
+hippocampus-llm = { path = "../hippocampus-llm", version = "0.1.0" }
+
+[dev-dependencies]
+chrono = { workspace = true }
+uuid = { workspace = true }
