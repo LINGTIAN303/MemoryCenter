@@ -166,6 +166,7 @@ trae-{项目名}-{日期}
 | 时机 | 工具 | 说明 |
 |------|------|------|
 | 会话第一次回复前 | `prompt` | 获取历史记忆摘要 |
+| 会话开始时 / 调 semantic_search 前 | `get_config` | 查询运行时配置快照（归档阈值 / Agent / scenario / **降级状态**），scope=runtime\|preset\|degraded\|all |
 | 上下文接近 400K | `archive` | 归档完整上下文（非摘要） |
 | 用户提到过去事件 | `semantic_search` | 检索相关记忆 |
 | 用户陈述与记忆矛盾 | `detect_conflicts` | 检测事实冲突 |
