@@ -601,7 +601,7 @@ impl HippocampusMcp {
                 format!(
                     "turns_json 解析失败: {e}\n\n\
                      合法格式：MessageTurn 数组的 JSON 字符串。\n\
-                     v2.30.1 简化：仅需 user_message/llm_message，其余字段（id/timestamp/tags/token_count）可省略，服务端自动补全。\n\
+                     简化格式：仅需 user_message/llm_message，其余字段（id/timestamp/tags/token_count）可省略，服务端自动补全。\n\
                      最简示例：[{{\"user_message\":{{\"text\":\"用户消息\"}},\"llm_message\":{{\"text\":\"LLM 回复\"}}}}]\n\
                      完整示例：[{{\"id\":\"7f9c1b2a-3d4e-4f5a-8a9b-0c1d2e3f4a5b\",\"user_message\":{{\"text\":\"用户消息\"}},\"llm_message\":{{\"text\":\"LLM 回复\"}},\"tags\":[{{\"kind\":\"Text\"}}],\"timestamp\":\"2026-07-05T00:00:00Z\",\"token_count\":100}}]\n\
                      说明：MessageContent 的 attachments/tool_calls/thinking 也可省略（默认空）。"
