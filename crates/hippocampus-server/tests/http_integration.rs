@@ -274,7 +274,7 @@ async fn test_retrieve_nonexistent_hook_returns_404() {
     assert!(err["error"]["message"]
         .as_str()
         .unwrap()
-        .contains("未找到"));
+        .contains("不存在"));
 }
 
 // ============================================================================

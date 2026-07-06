@@ -711,6 +711,24 @@ impl LocalStorage {
 
         Ok(())
     }
+
+    /// 写入索引文档的无锁内部版本（v2.31 修复死锁）
+    ///
+    /// 调用方必须已持有 session 写锁，否则会有并发写竞争。
+    /// 供 `write_index`（自动获取锁）和 `delete_memory_complete`（已持有锁）复用。
+    async fn write_index_locked(&self, doc: &IndexDocument) -> crate::Result<String> {
+        // v2.4: session 级索引始终存到 sessions/{session_id}/index/
+        let relative = self.session_index_path(&doc.session_id, doc.period);
+        let abs = self.abs_path(&relative);
+        self.ensure_parent_dir(&abs).await?;
+
+        let json = serde_json::to_vec_pretty(doc)
+            .map_err(|e| crate::Error::Serialize(format!("序列化 IndexDocument 失败: {}", e)))?;
+
+        self.atomic_write(&abs, &json).await?;
+
+        Ok(Self::to_posix_string(&relative))
+    }
 }
 
 #[async_trait::async_trait]
@@ -768,17 +786,8 @@ impl Storage for LocalStorage {
         let lock = self.session_write_lock(&doc.session_id);
         let _guard = lock.write().await;
 
-        // v2.4: session 级索引始终存到 sessions/{session_id}/index/
-        let relative = self.session_index_path(&doc.session_id, doc.period);
-        let abs = self.abs_path(&relative);
-        self.ensure_parent_dir(&abs).await?;
-
-        let json = serde_json::to_vec_pretty(doc)
-            .map_err(|e| crate::Error::Serialize(format!("序列化 IndexDocument 失败: {}", e)))?;
-
-        self.atomic_write(&abs, &json).await?;
-
-        Ok(Self::to_posix_string(&relative))
+        // 委托给无锁版本（避免 delete_memory_complete 等持锁场景下重入死锁）
+        self.write_index_locked(doc).await
     }
 
     async fn delete_memory_complete(
@@ -845,7 +854,8 @@ impl Storage for LocalStorage {
                     // 不返回错误，因为文件已删，主要目标已达成
                 } else {
                     // 写回索引文档（失败时仅警告，不回滚文件删除）
-                    if let Err(e) = self.write_index(&doc).await {
+                    // v2.31：调用无锁版本（已持有 session 写锁，避免重入死锁）
+                    if let Err(e) = self.write_index_locked(&doc).await {
                         tracing::warn!(
                             error = %e,
                             hook_id = %hook_id,

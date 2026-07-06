@@ -58,8 +58,11 @@ impl IntoResponse for AppError {
 impl From<hippocampus_core::Error> for AppError {
     fn from(e: hippocampus_core::Error) -> Self {
         match e {
-            // 索引错误中含「未找到」视为 404
-            hippocampus_core::Error::Index(msg) if msg.contains("未找到") => {
+            // 索引错误中含「未找到」「不存在」「已删除」视为 404
+            // （如 hook_id 精确+前缀匹配均无结果、记忆文件已软删除）
+            hippocampus_core::Error::Index(msg)
+                if msg.contains("未找到") || msg.contains("不存在") || msg.contains("已删除") =>
+            {
                 AppError::NotFound(msg)
             }
             // 存储错误中含「不存在」或「读取记忆文件失败」视为 404
