@@ -404,6 +404,18 @@ pub trait Storage: Send + Sync {
     ) -> crate::Result<()> {
         Ok(())
     }
+
+    /// 列出所有 session_id（v2.31 新增）
+    ///
+    /// 扫描 `sessions/` 目录下所有子目录名，返回 session_id 列表。
+    /// 用于 prompt 工具返回可用 session 列表，引导 LLM 用正确的 session_id。
+    ///
+    /// ## 默认实现
+    ///
+    /// 默认返回空 Vec（旧后端不支持 session 列表）。
+    async fn list_sessions(&self) -> crate::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 /// 本地文件树存储后端
@@ -977,6 +989,39 @@ impl Storage for LocalStorage {
         );
 
         Ok(())
+    }
+
+    /// 列出所有 session_id（v2.31 新增）
+    ///
+    /// 扫描 `sessions/` 目录下所有子目录名。
+    /// 目录不存在时返回空 Vec（首次使用前）。
+    async fn list_sessions(&self) -> crate::Result<Vec<String>> {
+        let sessions_dir = self.abs_path(&PathBuf::from("sessions"));
+
+        let mut sessions = Vec::new();
+        match tokio::fs::read_dir(&sessions_dir).await {
+            Ok(mut entries) => {
+                while let Some(entry) = entries.next_entry().await.map_err(|e| {
+                    crate::Error::Storage(format!("读取 sessions/ 目录失败: {e}"))
+                })? {
+                    if entry.file_type().await.map_err(|e| {
+                        crate::Error::Storage(format!("读取目录项类型失败: {e}"))
+                    })?.is_dir() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            sessions.push(name.to_string());
+                        }
+                    }
+                }
+                // 按名称排序，便于 LLM 阅读
+                sessions.sort();
+                Ok(sessions)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(crate::Error::Storage(format!(
+                "读取 sessions/ 目录失败 {:?}: {}",
+                sessions_dir, e
+            ))),
+        }
     }
 
     /// 删除索引文档（v2.16 IMP-02：LocalStorage 实现）

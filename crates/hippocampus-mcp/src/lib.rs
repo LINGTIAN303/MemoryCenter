@@ -826,7 +826,7 @@ impl HippocampusMcp {
 
         // v2.31 动手点 2：若存在 task_state_snapshot，追加到 prompt 末尾
         // 让 LLM 在压缩后调 prompt 时自然看到任务状态，用于校准 Trae Summary
-        let final_prompt = match storage.read_session_state(&params.session_id).await {
+        let mut final_prompt = match storage.read_session_state(&params.session_id).await {
             Ok(Some(snapshot)) => {
                 let mut s = prompt;
                 s.push_str("\n\n--- Task State Snapshot (v2.31) ---\n");
@@ -853,6 +853,34 @@ impl HippocampusMcp {
                 prompt
             }
         };
+
+        // v2.31 新增：追加可用 session 列表（兜底：引导 LLM 用正确 session_id）
+        // 当 LLM 用错 session_id 时，让它能看到现有 session 列表，自行修正
+        match storage.list_sessions().await {
+            Ok(sessions) if !sessions.is_empty() => {
+                // 检查当前 session_id 是否在列表中
+                let current_in_list = sessions.iter().any(|s| s == &params.session_id);
+                if !current_in_list {
+                    final_prompt.push_str("\n\n--- Available Sessions (v2.31) ---\n");
+                    final_prompt.push_str(&format!("⚠️ 当前 session_id `{}` 不在已有列表中。\n", params.session_id));
+                    final_prompt.push_str("若你是新会话，这是正常的。若你想检索历史记忆，请从以下列表选择正确的 session_id：\n");
+                    for s in &sessions {
+                        final_prompt.push_str(&format!("- {}\n", s));
+                    }
+                    final_prompt.push_str("\n提示：session_id 约定为 `{客户端前缀}-{项目名}-{日期}`，如 `catpaw-myapp-20260706`。");
+                    final_prompt.push_str("禁止使用 `项目名-session` 这种格式（会导致 retrieve 找不到记忆）。");
+                }
+            }
+            Ok(_) => {
+                // sessions 为空（首次使用），无需追加
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "列出 sessions 失败（不影响 prompt 返回）"
+                );
+            }
+        }
 
         Ok(final_prompt)
     }
@@ -1595,9 +1623,10 @@ impl HippocampusMcp {
         Ok(result.to_string())
     }
 
-    /// v2.31：首次接入时调用，自动写入 Rules 模板到 Agent 客户端的 rules 目录。
+    /// v2.31：首次接入时调用，自动写入 Rules 模板 + AGENTS.md。
     /// 支持 catpaw/trae/claude-code 三种客户端，覆盖策略按客户端类型自动决定。
-    #[tool(description = "首次接入 hippocampus 时调用此工具，自动写入 Rules 模板到 Agent 客户端的 rules 目录（让归档触发规则自动生效）。【一次性调用】每个项目只需调用一次，已存在会返回 action=skipped，不要重复调用。支持 catpaw（.catpaw/rules/）、trae（.trae/rules/）、claude-code（追加到 CLAUDE.md）三种客户端。首次配置完 hippocampus MCP 后立即调用：install_rules(client=\"你的客户端类型\", project_root=\"项目根目录绝对路径\")。")]
+    /// v2.31 新增：同时写入项目根目录的 AGENTS.md（含 session_id 约定 + 核心协议速查）。
+    #[tool(description = "首次接入 hippocampus 时调用此工具，自动写入 Rules 模板 + AGENTS.md。【一次性调用】每个项目只需调用一次，已存在会返回 action=skipped，不要重复调用。支持 catpaw（.catpaw/rules/）、trae（.trae/rules/）、claude-code（追加到 CLAUDE.md）三种客户端。【v2.31 新增】同时写入项目根目录的 AGENTS.md，包含 session_id 约定（治本：让 LLM 知道规范格式，避免用'项目名-session'这种错误格式）+ 核心协议速查表。AGENTS.md 用标记隔离，force=true 时只更新标记内容，不影响用户手动写入的部分。首次配置完 hippocampus MCP 后立即调用：install_rules(client=\"你的客户端类型\", project_root=\"项目根目录绝对路径\")。")]
     async fn install_rules(
         &self,
         Parameters(params): Parameters<InstallRulesParams>,
@@ -2161,6 +2190,88 @@ claude-code-{项目名}-{日期}
 const HIPPOCAMPUS_RULES_BEGIN: &str = "<!-- hippocampus-rules begin -->";
 const HIPPOCAMPUS_RULES_END: &str = "<!-- hippocampus-rules end -->";
 
+/// AGENTS.md 标记（用于检测是否已安装）
+const HIPPOCAMPUS_AGENTS_BEGIN: &str = "<!-- hippocampus-agents begin -->";
+const HIPPOCAMPUS_AGENTS_END: &str = "<!-- hippocampus-agents end -->";
+
+/// AGENTS.md 模板（v2.31 新增）
+///
+/// 写入项目根目录的 AGENTS.md，被 Trae/CatPaw/Cursor/Claude Code 等 IDE 自动读取。
+/// 包含 session_id 约定（治本）+ 核心协议速查（让 LLM 知道规范格式）。
+const AGENTS_MD_TEMPLATE: &str = r#"<!-- hippocampus-agents begin -->
+# Hippocampus 记忆协议（项目级硬性规则）
+
+> 本文件由 install_rules 自动写入，被 IDE 自动读取注入 LLM system prompt。
+> 完整规则详见 `.trae/rules/hippocampus-archive.md`（或 `.catpaw/rules/`）。
+
+## session_id 约定（必须遵守）
+
+```
+{客户端前缀}-{项目名}-{日期}
+```
+
+**客户端前缀**：
+- CatPaw: `catpaw`
+- Trae: `trae`
+- Claude Code: `claudecode`
+- Cursor: `cursor`
+
+**示例**：
+- `catpaw-myapp-20260706`
+- `trae-hippocampus-20260706`
+- `claudecode-worldsmith-20260706`
+
+> 一个 session_id 对应一个独立的记忆空间。同会话内复用同一 session_id，
+> 切换项目或日期时换新 session_id。
+>
+> **禁止使用 `项目名-session` 这种格式**（如 `worldsmith-session`），
+> 会导致 retrieve 找不到记忆。若不确定用哪个 session_id，先调 `prompt` 工具
+> 查看可用 session 列表，或询问用户。
+
+## 记忆协议（Agent 必须遵守，无需用户提示主动执行）
+
+### 1. 会话开始：调 prompt 获取历史记忆
+每个新会话的第一次回复前，必须先调用 `mcp_hippocampus.prompt(session_id)`。
+返回的摘要拼接到 system prompt。若返回空列表，说明该 session 无历史记忆。
+
+### 2. 上下文接近阈值：主动调 archive 归档
+触发条件（满足任一）：
+- 对话超过 20 轮（用户消息 + LLM 回复算 1 轮）
+- 包含大量代码 / 长文档 / 多次工具调用
+- 感觉"上下文开始变重"、"前面说过但记不清细节"
+- 每 30 轮兜底归档一次
+
+### 3. 用户提到过去事件：先调 semantic_search
+当用户消息中出现"之前"、"上次"、"还记得"等指代词时，先用用户原话作为 query
+检索相关记忆，把检索结果作为上下文再回复。
+
+### 4. project_memory 反向写入（v2.31）
+完成开发阶段/关键决策/风险点时，调 `update_project_memory` 更新 project_memory.md。
+拿到 full_content 后用 Write 工具写入 Trae 的 memory 文件夹。
+
+### 5. 上下文被压缩后：执行压缩后行为协议
+当系统消息中出现 `This session continues a previous conversation that lost its context.` 时，
+立即执行 4 步强制流程（详见 rules/hippocampus-archive.md）：
+1. 归档压缩前未持久化的轮次
+2. 调 prompt 拉取 hippocampus 一手记忆
+3. 交叉校准 Summary 第8章节 Current Work
+4. 执行 Next Step 决策协议
+
+## 工具触发规则速查表
+
+| 时机 | 工具 |
+|------|------|
+| 会话第一次回复前 | `prompt` |
+| 上下文接近阈值 | `archive` |
+| 用户提到过去事件 | `semantic_search` |
+| 需要查特定记忆 | `retrieve` |
+| 需要查所有记忆列表 | `summaries` |
+| 完成开发阶段/关键决策 | `update_project_memory` |
+| 上下文被压缩后 | `archive` + `prompt` |
+| 周级去重合并 | `compaction` period="weekly" |
+| 月级评分淘汰 | `compaction` period="monthly" |
+<!-- hippocampus-agents end -->"#;
+
 /// 安装 Rules 模板到项目目录
 ///
 /// 参数：
@@ -2285,13 +2396,68 @@ pub fn install_rules_to_project(
         }
     };
 
-    // 3. 返回 JSON 结果
+    // 3. 额外写入 AGENTS.md（v2.31 新增，所有客户端通用）
+    // AGENTS.md 是 IDE 通用约定，被 Trae/CatPaw/Cursor/Claude Code 自动读取
+    let agents_md_path = root.join("AGENTS.md");
+    let agents_content_with_markers = format!(
+        "{begin}\n{template}\n{end}",
+        begin = HIPPOCAMPUS_AGENTS_BEGIN,
+        template = AGENTS_MD_TEMPLATE,
+        end = HIPPOCAMPUS_AGENTS_END,
+    );
+
+    let agents_action = if !agents_md_path.exists() {
+        // 不存在 → 创建
+        fs::write(&agents_md_path, &agents_content_with_markers)
+            .map_err(|e| format!("写入 AGENTS.md 失败: {e}"))?;
+        "created"
+    } else {
+        let existing = fs::read_to_string(&agents_md_path)
+            .map_err(|e| format!("读取 AGENTS.md 失败: {e}"))?;
+
+        if existing.contains(HIPPOCAMPUS_AGENTS_BEGIN) {
+            // 已有 hippocampus 标记
+            if !force {
+                "skipped"
+            } else {
+                // 替换标记内容
+                let start_idx = existing.find(HIPPOCAMPUS_AGENTS_BEGIN)
+                    .ok_or("AGENTS.md 找不到开始标记")?;
+                let end_idx = existing.find(HIPPOCAMPUS_AGENTS_END)
+                    .ok_or("AGENTS.md 找不到结束标记")?;
+                let end_idx = end_idx + HIPPOCAMPUS_AGENTS_END.len();
+                let new_content = format!(
+                    "{}{}{}",
+                    &existing[..start_idx],
+                    agents_content_with_markers,
+                    &existing[end_idx..],
+                );
+                fs::write(&agents_md_path, new_content)
+                    .map_err(|e| format!("写入 AGENTS.md 失败: {e}"))?;
+                "updated"
+            }
+        } else {
+            // 无标记 → 追加
+            let new_content = format!(
+                "{}\n\n{}\n",
+                existing.trim_end(),
+                agents_content_with_markers,
+            );
+            fs::write(&agents_md_path, new_content)
+                .map_err(|e| format!("写入 AGENTS.md 失败: {e}"))?;
+            "appended"
+        }
+    };
+
+    // 4. 返回 JSON 结果
     let result = serde_json::json!({
         "success": true,
         "client": client,
         "file_path": file_path.to_string_lossy(),
         "action": action,
         "message": message,
+        "agents_md_path": agents_md_path.to_string_lossy(),
+        "agents_md_action": agents_action,
         "force": force,
     });
 

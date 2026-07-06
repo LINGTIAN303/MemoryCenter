@@ -205,8 +205,6 @@ async fn main() {
 
     let state = AppState {
         storage_root: config.storage_root.clone(),
-        retriever: None,            // v2.8 起由 session_search 替代
-        search_indexer: None,       // v2.8 起由 session_search 替代
         session_search,
         conflict_detector,
         summary_generator,
