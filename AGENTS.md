@@ -19,17 +19,49 @@ mcp_hippocampus.prompt(session_id)
 
 把返回的历史记忆摘要拼接到 system prompt。若返回空列表，说明该 session 无历史记忆，正常继续。
 
-### 2. 上下文超阈值：调 archive 归档
+### 2. 上下文接近阈值：主动调 archive 归档（伪钩子方案）
 
-当对话 token 数接近 **400K**（或当前 preset 的 `archive_threshold`）时，主动调用：
+#### 2.1 触发条件（满足任一即调用）
+
+- **对话长度**：已进行超过 20 轮（用户消息 + LLM 回复算 1 轮）
+- **内容复杂度**：包含大量代码 / 长文档 / 多次工具调用
+- **主观判断**：你感觉到"上下文开始变重"、"前面说过但记不清细节"
+- **Token 反馈**：上次 archive 返回的 `threshold_ratio_percent >= 80`
+- **兜底**：每 30 轮对话主动归档一次（即使未达阈值）
+
+#### 2.2 调用方式（v2.30.1+ 简化格式）
 
 ```
-mcp_hippocampus.archive(session_id, turns_json)
+mcp_hippocampus.archive(
+    session_id,                  // 必填
+    turns_json                   // 必填，最简格式：[{"user_message":{"text":"..."},"llm_message":{"text":"..."}}]
+    // id/timestamp/tags/token_count 可省略，服务端自动补全
+)
 ```
 
-归档完整上下文（非摘要）。返回 `hook_id` 用于后续检索。
+#### 2.3 Token 反馈循环（v2.31 新增）
 
-> Trae 的窗口压缩机制是 chat-based，建议在 350K 时就开始归档，避免被 Trae 强制压缩丢失上下文。
+归档后返回结果包含：
+- `estimated_total_tokens`：当前累计估算 token 数
+- `threshold`：归档阈值（如 120000 = 120K）
+- `threshold_ratio_percent`：当前占比百分比
+- `suggestion`：归档建议（人类可读）
+
+**判断规则**：
+- `threshold_ratio_percent >= 100` → 立即归档或触发上下文压缩
+- `threshold_ratio_percent >= 80` → 提示用户准备归档
+- `< 80` → 继续对话，记录累计值作为后续判断依据
+
+> 你（LLM）无法直接感知自身 token 消耗，但通过 archive 返回的 `estimated_total_tokens`
+> 可以建立"token 意识"——这是伪钩子方案的核心：通过外部反馈循环模拟主动感知。
+
+#### 2.4 客户端压缩前主动归档
+
+当用户即将手动触发上下文压缩（如 Trae 对话框上方的"压缩"按钮），
+或你预判客户端即将自动压缩时，**先调 archive 归档完整上下文**，
+避免压缩时丢失原始轮次信息。
+
+> Trae/Cursor 的自动压缩机制会丢弃旧轮次，归档可保留被丢弃的内容。
 
 ### 3. 用户提到过去事件：先调 semantic_search 再回复
 
@@ -50,6 +82,26 @@ mcp_hippocampus.detect_conflicts(session_id, hook_id, added_facts, revised_facts
 ```
 
 检测冲突。若检测到冲突，向用户确认后再更新记忆。
+
+### 5. 上下文被压缩后：执行压缩后行为协议（v2.31 新增）
+
+当系统消息中出现以下固定文本时：
+
+```
+This session continues a previous conversation that lost its context.
+```
+
+表明 Trae 客户端刚压缩了上下文，必须立即执行**压缩后行为协议**（详见 `.trae/rules/hippocampus-archive.md` 的「压缩后行为协议」章节）：
+
+1. 归档压缩前未持久化的轮次（如有）
+2. 调用 `prompt` 拉取 hippocampus 一手记忆
+3. 交叉校准 Summary 第8章节"Current Work"与 hippocampus 记忆
+4. 执行「Next Step 决策协议」：用 Pending todos 校准 Summary 第10章节建议
+
+**核心原则**：
+- hippocampus 记忆优先级 > Trae Summary
+- Pending todos 状态 > Summary 第10章节建议
+- in_progress 任务必须从断点继续，禁止重复提问已完成决策
 
 ---
 
@@ -82,6 +134,7 @@ trae-{项目名}-{日期}
 | 月级评分淘汰 | `compaction` | period="monthly" |
 | 批量检索/删除/更新 | `batch_retrieve` / `batch_delete` / `batch_update` | 批量操作 |
 | 查询冲突记录 | `get_conflicts` | 获取已持久化的冲突记录 |
+| **上下文被压缩后**（v2.31） | `archive` + `prompt` | 归档断层轮次 + 拉取一手记忆校准 Summary，详见「压缩后行为协议」 |
 
 ---
 

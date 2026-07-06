@@ -42,6 +42,9 @@ eval/hippo_data/
 # MCP 本地测试数据（stdio 模式归档的记忆文件，不提交）
 .mcp-data/
 
+# 本地测试归档数据（capability test 产物，不提交）
+test-data/
+
 # 本地测试脚本（含服务器地址，不提交）
 test_mcp_e2e.ps1
 

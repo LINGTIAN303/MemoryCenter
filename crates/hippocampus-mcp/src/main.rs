@@ -285,6 +285,36 @@ fn build_combined_profile() -> Option<CombinedProfile> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // v2.31：CLI 子命令支持
+    // 用法：
+    //   hippocampus-mcp                           → 启动 MCP server（默认）
+    //   hippocampus-mcp install-rules --client <type> --project-root <path> [--force]
+    //   hippocampus-mcp --help
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 {
+        match args[1].as_str() {
+            "install-rules" => {
+                return run_install_rules_cli(&args[2..]);
+            }
+            "--help" | "-h" => {
+                eprintln!("Hippocampus MCP server v2.31\n");
+                eprintln!("用法:");
+                eprintln!("  hippocampus-mcp                           启动 MCP server (stdio 传输)");
+                eprintln!("  hippocampus-mcp install-rules --client <type> --project-root <path> [--force]");
+                eprintln!("                                           安装 Rules 模板到 Agent 客户端");
+                eprintln!("\ninstall-rules 参数:");
+                eprintln!("  --client <type>          客户端类型: catpaw / trae / claude-code");
+                eprintln!("  --project-root <path>    项目根目录的绝对路径");
+                eprintln!("  --force                   强制覆盖已存在的文件");
+                eprintln!("\n环境变量:");
+                eprintln!("  HIPPOCAMPUS_ROOT          存储根目录 (默认 ./data)");
+                eprintln!("  RUST_LOG                  日志级别 (默认 info)");
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     // 初始化日志
     // v2.30 修复：tracing 必须输出到 stderr（MCP 协议要求 stdout 只能输出 JSON-RPC）
     // tracing_subscriber::fmt() 默认输出到 stdout，会污染 JSON-RPC 流
@@ -292,6 +322,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let stderr = std::io::stderr.with_max_level(tracing::Level::TRACE);
     tracing_subscriber::fmt()
         .with_writer(stderr)
+        .with_ansi(false) // v2.30.1：禁用 ANSI 颜色码，避免 CatPaw 等客户端合并 stdout/stderr 时污染 JSON-RPC
+        .with_target(false) // 去掉模块名前缀，让日志更干净
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "hippocampus_mcp=info".into()),
@@ -335,4 +367,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     service.waiting().await?;
 
     Ok(())
+}
+
+// ============================================================================
+// v2.31：install-rules CLI 子命令
+// ============================================================================
+//
+// 用法：
+//   hippocampus-mcp install-rules --client <type> --project-root <path> [--force]
+//
+// 复用 lib.rs 的 install_rules_to_project 公共函数
+
+/// 解析 install-rules CLI 参数并执行安装
+fn run_install_rules_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut client = String::new();
+    let mut project_root = String::new();
+    let mut force = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--client" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("错误: --client 需要参数");
+                    eprintln!("用法: hippocampus-mcp install-rules --client <catpaw|trae|claude-code> --project-root <path> [--force]");
+                    std::process::exit(1);
+                }
+                client = args[i].clone();
+            }
+            "--project-root" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("错误: --project-root 需要参数");
+                    eprintln!("用法: hippocampus-mcp install-rules --client <catpaw|trae|claude-code> --project-root <path> [--force]");
+                    std::process::exit(1);
+                }
+                project_root = args[i].clone();
+            }
+            "--force" => {
+                force = true;
+            }
+            "--help" | "-h" => {
+                eprintln!("安装 Hippocampus Rules 模板到 Agent 客户端\n");
+                eprintln!("用法: hippocampus-mcp install-rules --client <type> --project-root <path> [--force]\n");
+                eprintln!("参数:");
+                eprintln!("  --client <type>          客户端类型: catpaw / trae / claude-code");
+                eprintln!("  --project-root <path>    项目根目录的绝对路径");
+                eprintln!("  --force                   强制覆盖已存在的文件（默认 false）\n");
+                eprintln!("示例:");
+                eprintln!("  hippocampus-mcp install-rules --client catpaw --project-root D:/myapp");
+                eprintln!("  hippocampus-mcp install-rules --client trae --project-root /home/user/myapp");
+                eprintln!("  hippocampus-mcp install-rules --client claude-code --project-root ./myapp --force");
+                return Ok(());
+            }
+            other => {
+                eprintln!("错误: 未知参数 {other}");
+                eprintln!("用法: hippocampus-mcp install-rules --client <catpaw|trae|claude-code> --project-root <path> [--force]");
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    // 验证必填参数
+    if client.is_empty() {
+        eprintln!("错误: 缺少 --client 参数");
+        eprintln!("用法: hippocampus-mcp install-rules --client <catpaw|trae|claude-code> --project-root <path> [--force]");
+        std::process::exit(1);
+    }
+    if project_root.is_empty() {
+        eprintln!("错误: 缺少 --project-root 参数");
+        eprintln!("用法: hippocampus-mcp install-rules --client <catpaw|trae|claude-code> --project-root <path> [--force]");
+        std::process::exit(1);
+    }
+
+    // 调用公共函数
+    match hippocampus_mcp::install_rules_to_project(&client, &project_root, force) {
+        Ok(result_json) => {
+            println!("{result_json}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("错误: {e}");
+            std::process::exit(1);
+        }
+    }
 }

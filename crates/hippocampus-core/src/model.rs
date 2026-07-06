@@ -14,6 +14,167 @@ use uuid::Uuid;
 /// Schema 版本号，用于未来迁移
 pub const SCHEMA_VERSION: u32 = 1;
 
+// v2.30.1：以下默认值生成函数供 MessageTurn 字段级 #[serde(default = "...")] 使用
+// 让 Agent 调用 archive 时可省略 id/timestamp/tags/token_count，服务端反序列化时自动补全
+
+/// 生成新 UUID（用于 MessageTurn.id 缺省时）
+fn default_uuid() -> Uuid {
+    Uuid::new_v4()
+}
+
+/// 取当前时间（用于 MessageTurn.timestamp 缺省时）
+fn default_timestamp() -> DateTime<Utc> {
+    Utc::now()
+}
+
+/// 默认标签集合（空，用于 MessageTurn.tags 缺省时）
+/// v2.30.1：改为空 Vec，由 apply_turn_defaults 在反序列化后根据内容推断
+fn default_tags() -> Vec<Tag> {
+    Vec::new()
+}
+
+// v2.30.1：以下函数用于反序列化后的二次补全
+// 当 Agent 未传 tags（空 Vec）或未传 token_count（0）时，根据内容启发式推断
+
+/// 根据 MessageContent 内容启发式推断标签
+///
+/// 判定规则（按优先级，可叠加）：
+/// 1. `tool_calls` 非空 → `ToolCall` + `AgentTool`
+/// 2. `attachments` 含图片 → `Image`
+/// 3. `attachments` 含视频 → `Video`
+/// 4. `attachments` 含语音 → `Voice`
+/// 5. `attachments` 含文件 → `FileAttachment`
+/// 6. `thinking` 非空 → `Thinking`
+/// 7. `text` 含代码块（``` ） → `CodeBlock`
+/// 8. `text` 含 URL（http:// 或 https://） → `Url`
+/// 9. 以上都不匹配 → `Text`（兜底）
+pub fn infer_tags(content: &MessageContent) -> Vec<Tag> {
+    let mut tags: Vec<Tag> = Vec::new();
+
+    // 1. 工具调用（最高优先级，通常意味着 Agent 执行了动作）
+    if !content.tool_calls.is_empty() {
+        tags.push(Tag::ToolCall);
+        tags.push(Tag::AgentTool);
+    }
+
+    // 2-5. 附件类型
+    for att in &content.attachments {
+        match att.kind {
+            AttachmentKind::Image => {
+                if !tags.contains(&Tag::Image) {
+                    tags.push(Tag::Image);
+                }
+            }
+            AttachmentKind::Video => {
+                if !tags.contains(&Tag::Video) {
+                    tags.push(Tag::Video);
+                }
+            }
+            AttachmentKind::Voice => {
+                if !tags.contains(&Tag::Voice) {
+                    tags.push(Tag::Voice);
+                }
+            }
+            AttachmentKind::File => {
+                if !tags.contains(&Tag::FileAttachment) {
+                    tags.push(Tag::FileAttachment);
+                }
+            }
+        }
+    }
+
+    // 6. 思考过程（reasoning model 的思考链）
+    if content.thinking.as_ref().is_some_and(|s| !s.is_empty()) {
+        tags.push(Tag::Thinking);
+    }
+
+    // 7-8. 文本特征检测
+    if let Some(text) = &content.text {
+        // 代码块检测（``` 或缩进 4 空格的代码风格）
+        if text.contains("```") {
+            tags.push(Tag::CodeBlock);
+        }
+        // URL 检测（简单的 http/https 协议匹配）
+        if text.contains("http://") || text.contains("https://") {
+            tags.push(Tag::Url);
+        }
+    }
+
+    // 9. 兜底：如果没有任何特征标签，标为 Text
+    if tags.is_empty() {
+        tags.push(Tag::Text);
+    }
+
+    tags
+}
+
+/// 估算 MessageContent 的 token 数
+///
+/// 经验值：英文 4 char ≈ 1 token，中文 1.5 char ≈ 1 token
+/// 取折中：3 char ≈ 1 token（中文偏高，英文偏低，整体可接受）
+///
+/// 估算范围：text + thinking + tool_calls(arguments + result)
+pub fn estimate_tokens(content: &MessageContent) -> usize {
+    let mut chars: usize = 0;
+
+    // 文本部分
+    if let Some(text) = &content.text {
+        chars += text.chars().count();
+    }
+
+    // 思考过程
+    if let Some(thinking) = &content.thinking {
+        chars += thinking.chars().count();
+    }
+
+    // 工具调用的参数和结果
+    for tc in &content.tool_calls {
+        chars += tc.name.chars().count();
+        chars += tc.arguments.chars().count();
+        chars += tc.result.chars().count();
+    }
+
+    // 3 char ≈ 1 token（折中估算）
+    // 最小 1，避免完全空消息返回 0
+    (chars / 3).max(1)
+}
+
+/// 对 MessageTurn 应用自动补全（反序列化后调用）
+///
+/// 规则：
+/// - `tags` 为空（Agent 未传或传了空数组）→ 根据 user_message + llm_message 推断
+/// - `token_count` 为 0（Agent 未传）→ 根据内容估算
+/// - 已传入的值不覆盖（向后兼容 + Agent 显式优先）
+pub fn apply_turn_defaults(turn: &mut MessageTurn) {
+    // tags 为空时，合并 user_message + llm_message 的推断标签
+    if turn.tags.is_empty() {
+        let mut inferred = infer_tags(&turn.user_message);
+        let llm_tags = infer_tags(&turn.llm_message);
+        for t in llm_tags {
+            if !inferred.contains(&t) {
+                inferred.push(t);
+            }
+        }
+        // 如果两边都只推断出 Text，保持单个 Text
+        if inferred.iter().all(|t| *t == Tag::Text) {
+            turn.tags = vec![Tag::Text];
+        } else {
+            // 有非 Text 标签时，移除多余的 Text（避免工具调用也带 Text）
+            turn.tags = inferred.into_iter().filter(|t| *t != Tag::Text).collect();
+            // 如果过滤后为空（理论上不会，因为 infer_tags 有兜底），补 Text
+            if turn.tags.is_empty() {
+                turn.tags = vec![Tag::Text];
+            }
+        }
+    }
+
+    // token_count 为 0 时，估算
+    if turn.token_count == 0 {
+        let estimated = estimate_tokens(&turn.user_message) + estimate_tokens(&turn.llm_message);
+        turn.token_count = estimated.max(1); // 最小 1，避免全 0
+    }
+}
+
 /// 17 类细粒度标签（索引钩子细粒度）
 ///
 /// 标签可叠加（一条消息可有多个标签），非互斥。
@@ -61,19 +222,29 @@ pub enum Tag {
 ///
 /// 记忆文件内部的基本单元。每轮消息被打上类型标签（[`Tag`]），
 /// 标签将被用于索引钩子。
+///
+/// v2.30.1：除 user_message/llm_message 外，其余字段均可省略，服务端反序列化时自动补全：
+/// - `id` 缺省 → 生成新 UUID（`Uuid::new_v4()`）
+/// - `timestamp` 缺省 → 取当前时间（`Utc::now()`）
+/// - `tags` 缺省 → `[Tag::Text]`（纯对话场景默认标签）
+/// - `token_count` 缺省 → `0`（不影响归档，但阈值检测会按 0 计算）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageTurn {
-    /// 轮次唯一 ID
+    /// 轮次唯一 ID（缺省时服务端自动生成）
+    #[serde(default = "default_uuid")]
     pub id: Uuid,
     /// 用户消息内容（原始完整内容，非摘要）
     pub user_message: MessageContent,
     /// LLM 消息内容（原始完整内容，非摘要）
     pub llm_message: MessageContent,
-    /// 该轮次的标签集合（可叠加）
+    /// 该轮次的标签集合（可叠加，缺省时为 `[Tag::Text]`）
+    #[serde(default = "default_tags")]
     pub tags: Vec<Tag>,
-    /// 时间戳
+    /// 时间戳（缺省时取服务端当前时间）
+    #[serde(default = "default_timestamp")]
     pub timestamp: DateTime<Utc>,
-    /// 该轮次消耗的 token 数（用于归档阈值计量）
+    /// 该轮次消耗的 token 数（用于归档阈值计量，缺省时为 0）
+    #[serde(default)]
     pub token_count: usize,
 }
 
@@ -81,12 +252,16 @@ pub struct MessageTurn {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageContent {
     /// 文本部分（可能为空，如纯图片消息）
+    #[serde(default)]
     pub text: Option<String>,
     /// 附件列表（文件/图片/视频/语音等）
+    #[serde(default)]
     pub attachments: Vec<Attachment>,
     /// 工具调用列表
+    #[serde(default)]
     pub tool_calls: Vec<ToolInvocation>,
     /// 思考过程（如 reasoning model 的思考链）
+    #[serde(default)]
     pub thinking: Option<String>,
 }
 
@@ -203,6 +378,37 @@ pub struct IndexHook {
     pub period: ArchivePeriod,
     /// Token 数（供检索参考）
     pub token_count: usize,
+    /// 关联文件状态（v2.31 新增，支持软删除）
+    ///
+    /// - `Normal`：文件可读（默认）
+    /// - `Deleted`：文件已删除，索引钩子保留元数据供 LLM 知晓"曾经存在"
+    /// - `Corrupted`：文件存在但读取失败（未来扩展）
+    ///
+    /// 旧索引文件未序列化此字段时，`#[serde(default)]` 自动填充为 `Normal`，向后兼容。
+    #[serde(default)]
+    pub file_status: FileStatus,
+}
+
+/// 索引钩子关联文件的状态（v2.31 新增，软删除支持）
+///
+/// 设计动机：原 `delete_memory` 只删文件不清索引，导致索引与存储不一致。
+/// v2.31 改为软删除——在索引钩子上标记 `Deleted`，保留元数据（summary/key_facts），
+/// 让 LLM 知道"该记忆曾经存在但已被删除"，而非崩溃或返回幽灵记忆。
+///
+/// ## 序列化兼容
+///
+/// 使用 `#[serde(rename_all = "lowercase")]`，序列化为 `normal` / `deleted` / `corrupted`。
+/// 旧索引文件未包含此字段时，`#[serde(default)]` 自动填充为 `Normal`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FileStatus {
+    /// 正常，文件可读
+    #[default]
+    Normal,
+    /// 已删除（软删除标记，文件不存在但索引钩子保留元数据）
+    Deleted,
+    /// 损坏（文件存在但读取失败，未来扩展用）
+    Corrupted,
 }
 
 /// 结构化摘要（借鉴 Memora 线索锚点设计）
@@ -439,6 +645,170 @@ impl ArchivePeriod {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v2.30.1：验证最简调用——Agent 只传 user_message/llm_message
+    /// serde 层：id/timestamp 自动补全，tags 为空 Vec，token_count 为 0
+    /// apply_turn_defaults 层：tags 推断为 [Text]，token_count 估算
+    #[test]
+    fn test_minimal_message_turn_deserialize() {
+        let json = r#"{"user_message":{"text":"用户问"},"llm_message":{"text":"AI答"}}"#;
+        let mut turn: MessageTurn = serde_json::from_str(json).unwrap();
+
+        // serde 层：id 应自动生成（非全 0 UUID）
+        assert_ne!(turn.id, Uuid::nil(), "id 应被自动补全为非 nil UUID");
+
+        // serde 层：timestamp 应为近期时间（非 1970）
+        let now = Utc::now();
+        let diff = now.signed_duration_since(turn.timestamp);
+        assert!(
+            diff.num_seconds().abs() < 60,
+            "timestamp 应为当前时间附近，实际差值: {}s",
+            diff.num_seconds()
+        );
+
+        // serde 层：tags 应为空 Vec（等待 apply_turn_defaults 推断）
+        assert!(turn.tags.is_empty(), "serde 层 tags 应为空 Vec");
+
+        // serde 层：token_count 应为 0（等待 apply_turn_defaults 估算）
+        assert_eq!(turn.token_count, 0, "serde 层 token_count 应为 0");
+
+        // 应用自动补全
+        apply_turn_defaults(&mut turn);
+
+        // apply_turn_defaults 后：tags 应为 [Text]（纯文本对话）
+        assert_eq!(turn.tags.len(), 1, "应用后 tags 应为 [Text]");
+        assert_eq!(turn.tags[0], Tag::Text);
+
+        // apply_turn_defaults 后：token_count 应 > 0（估算值）
+        assert!(turn.token_count > 0, "应用后 token_count 应 > 0");
+    }
+
+    /// v2.30.1：验证完整调用仍然兼容（向后兼容性）
+    /// Agent 传了完整字段，apply_turn_defaults 不应覆盖
+    #[test]
+    fn test_full_message_turn_deserialize_backward_compat() {
+        let json = r#"{
+            "id":"7f9c1b2a-3d4e-4f5a-8a9b-0c1d2e3f4a5b",
+            "user_message":{"text":"用户消息","attachments":[],"tool_calls":[],"thinking":null},
+            "llm_message":{"text":"LLM 回复","attachments":[],"tool_calls":[],"thinking":null},
+            "tags":[{"kind":"Text"}],
+            "timestamp":"2026-07-05T00:00:00Z",
+            "token_count":100
+        }"#;
+        let mut turn: MessageTurn = serde_json::from_str(json).unwrap();
+
+        // 应使用传入的 id，不覆盖
+        assert_eq!(
+            turn.id.to_string(),
+            "7f9c1b2a-3d4e-4f5a-8a9b-0c1d2e3f4a5b"
+        );
+        // 应使用传入的 token_count
+        assert_eq!(turn.token_count, 100);
+
+        // 应用 apply_turn_defaults —— 不应覆盖已传入的值
+        apply_turn_defaults(&mut turn);
+
+        // tags 不应被覆盖（Agent 传了 [Text]，保持）
+        assert_eq!(turn.tags.len(), 1);
+        assert_eq!(turn.tags[0], Tag::Text);
+        // token_count 不应被覆盖（Agent 传了 100，保持）
+        assert_eq!(turn.token_count, 100);
+    }
+
+    /// v2.30.1：验证缺 user_message 应报错（必填字段保护）
+    #[test]
+    fn test_missing_user_message_should_fail() {
+        let json = r#"{"llm_message":{"text":"AI答"}}"#;
+        let result: Result<MessageTurn, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "缺 user_message 时应反序列化失败");
+    }
+
+    /// v2.30.1：验证工具调用记录的 tags 自动推断
+    /// Agent 未传 tags 时，应自动推断为 [ToolCall, AgentTool]
+    #[test]
+    fn test_infer_tags_tool_call() {
+        let json = r#"{
+            "user_message":{"text":"请帮我搜索资料"},
+            "llm_message":{
+                "text":"我帮你搜索了",
+                "tool_calls":[{"name":"WebSearch","arguments":"{\"q\":\"rust\"}","result":"[]","duration_ms":100}]
+            }
+        }"#;
+        let mut turn: MessageTurn = serde_json::from_str(json).unwrap();
+        assert!(turn.tags.is_empty(), "未传 tags 时 serde 层应为空");
+
+        apply_turn_defaults(&mut turn);
+
+        // 应推断出 ToolCall + AgentTool（不含 Text）
+        assert!(turn.tags.contains(&Tag::ToolCall), "应含 ToolCall");
+        assert!(turn.tags.contains(&Tag::AgentTool), "应含 AgentTool");
+        assert!(
+            !turn.tags.contains(&Tag::Text),
+            "有工具调用时不应兜底 Text"
+        );
+
+        // token_count 应 > 0（估算）
+        assert!(turn.token_count > 0);
+    }
+
+    /// v2.30.1：验证代码块的 tags 自动推断
+    #[test]
+    fn test_infer_tags_code_block() {
+        let json = r#"{
+            "user_message":{"text":"写个函数"},
+            "llm_message":{"text":"```rust\nfn hello() {}\n```"}
+        }"#;
+        let mut turn: MessageTurn = serde_json::from_str(json).unwrap();
+        apply_turn_defaults(&mut turn);
+
+        assert!(turn.tags.contains(&Tag::CodeBlock), "应含 CodeBlock");
+    }
+
+    /// v2.30.1：验证 URL 的 tags 自动推断
+    #[test]
+    fn test_infer_tags_url() {
+        let json = r#"{
+            "user_message":{"text":"看看这个 https://example.com"},
+            "llm_message":{"text":"好的"}
+        }"#;
+        let mut turn: MessageTurn = serde_json::from_str(json).unwrap();
+        apply_turn_defaults(&mut turn);
+
+        assert!(turn.tags.contains(&Tag::Url), "应含 Url");
+    }
+
+    /// v2.30.1：验证思考过程的 tags 自动推断
+    #[test]
+    fn test_infer_tags_thinking() {
+        let json = r#"{
+            "user_message":{"text":"复杂问题"},
+            "llm_message":{"text":"答案是...","thinking":"让我想想..."}
+        }"#;
+        let mut turn: MessageTurn = serde_json::from_str(json).unwrap();
+        apply_turn_defaults(&mut turn);
+
+        assert!(turn.tags.contains(&Tag::Thinking), "应含 Thinking");
+    }
+
+    /// v2.30.1：验证 token_count 估算（Agent 传了不覆盖）
+    #[test]
+    fn test_token_count_not_overwritten() {
+        let json = r#"{
+            "user_message":{"text":"短文本"},
+            "llm_message":{"text":"回复"},
+            "token_count":999
+        }"#;
+        let mut turn: MessageTurn = serde_json::from_str(json).unwrap();
+        apply_turn_defaults(&mut turn);
+
+        // Agent 传了 999，不应被估算值覆盖
+        assert_eq!(turn.token_count, 999);
+    }
+}
+
 impl MemoryFile {
     /// 创建新的记忆文件
     ///
@@ -526,6 +896,7 @@ impl IndexHook {
             archived_at: file.archived_at,
             period: file.period,
             token_count: file.total_tokens,
+            file_status: FileStatus::Normal,
         }
     }
 }

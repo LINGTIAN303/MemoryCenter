@@ -211,6 +211,7 @@ impl SqliteStorage {
             archived_at,
             period,
             token_count: token_count as usize,
+            file_status: crate::model::FileStatus::Normal,
         })
     }
 

@@ -416,41 +416,6 @@ impl HybridDetector {
         self.embedder.as_ref()
     }
 
-    /// 判断 `conflict` 是否与 `existing` 列表中的某条冲突语义重复
-    /// （v2.14 新增，v2.15 多模式 + async 化）
-    ///
-    /// 判定规则：
-    /// 1. `kind` 必须相同（不同 kind 不去重）
-    /// 2. `new_fact` 精确匹配（v2.12 兼容，快速路径）
-    /// 3. `new_fact` 相似度 >= `dedup_threshold`（v2.14 语义去重，v2.15 多模式）
-    ///    - `Char`：字符集合 Jaccard
-    ///    - `Word`：多语言词级 Jaccard
-    ///    - `Embedding`：嵌入余弦，失败降级到 `Word`
-    async fn is_semantically_duplicate(
-        &self,
-        conflict: &ConflictRecord,
-        existing: &[ConflictRecord],
-    ) -> bool {
-        for existing_conflict in existing {
-            // 1. kind 必须相同
-            if conflict.kind != existing_conflict.kind {
-                continue;
-            }
-            // 2. 精确匹配（快速路径，兼容 v2.12）
-            if conflict.new_fact == existing_conflict.new_fact {
-                return true;
-            }
-            // 3. 语义相似度比较（v2.14，仅在阈值 > 0 时启用）
-            if self.dedup_threshold > 0.0 {
-                let sim = self.compute_similarity(&conflict.new_fact, &existing_conflict.new_fact).await;
-                if sim >= self.dedup_threshold {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     /// 查找重复的现有冲突索引（v2.28 字段级 merge 前置）
     ///
     /// 返回 `Some(idx)` 表示 `conflict` 与 `report.conflicts[idx]` 语义重复，

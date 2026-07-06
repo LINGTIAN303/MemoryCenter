@@ -283,6 +283,40 @@ pub trait Storage: Send + Sync {
         results
     }
 
+    /// 完整删除记忆（v2.31 新增，软删除方案）
+    ///
+    /// 删除记忆文件 + 将索引钩子标记为 `FileStatus::Deleted`（软删除）。
+    ///
+    /// ## 事务边界（不回滚）
+    ///
+    /// 1. 先删记忆文件（失败则直接返回错误，不继续）
+    /// 2. 再读取索引文档，将对应 hook 的 `file_status` 标记为 `Deleted`，写回索引
+    /// 3. 若索引更新失败：仅记录警告，**不回滚文件删除**
+    ///
+    /// **不回滚的理由**：文件已删 + 索引残留是脏数据（不影响正确性，retrieve 会防御性降级）；
+    /// 反之文件残留 + 索引清了会导致 retrieve 崩溃，更危险。
+    ///
+    /// ## 软删除的价值
+    ///
+    /// 索引钩子保留 `summary` / `key_facts` 等元数据，让 LLM 知道"该记忆曾经存在但已被删除"，
+    /// 而非崩溃或返回幽灵记忆。semantic_search 会过滤 `Deleted` 状态的 hook。
+    ///
+    /// ## 向后兼容
+    ///
+    /// 默认实现仅调 `delete_memory`（与旧行为一致）。LocalStorage 覆写为完整软删除逻辑。
+    async fn delete_memory_complete(
+        &self,
+        memory_id: &str,
+        hook_id: &str,
+        session_id: &str,
+        project_id: Option<&str>,
+        period: crate::model::ArchivePeriod,
+    ) -> crate::Result<()> {
+        // 默认实现：仅删文件（与旧行为一致，向后兼容）
+        let _ = (hook_id, session_id, project_id, period);
+        self.delete_memory(memory_id).await
+    }
+
     /// 批量更新记忆文件（added/revised/deprecated facts）
     ///
     /// 按传入的 `(memory_id, updates)` 顺序返回结果，单个失败不影响其他条目。
@@ -661,6 +695,92 @@ impl Storage for LocalStorage {
         self.atomic_write(&abs, &json).await?;
 
         Ok(Self::to_posix_string(&relative))
+    }
+
+    async fn delete_memory_complete(
+        &self,
+        memory_id: &str,
+        hook_id: &str,
+        session_id: &str,
+        project_id: Option<&str>,
+        period: ArchivePeriod,
+    ) -> crate::Result<()> {
+        // v2.31：完整删除 = 删文件 + 标记索引钩子为 Deleted（软删除）
+        //
+        // 事务边界：不回滚。文件已删 + 索引更新失败 = 脏数据（不影响正确性）；
+        // 反之文件残留 + 索引清了 = retrieve 崩溃，更危险。
+
+        use crate::model::FileStatus;
+
+        // 1. 获取 session 写锁（整个流程在锁内，保证原子性）
+        let lock = self.session_write_lock(session_id);
+        let _guard = lock.write().await;
+
+        // 2. 删除记忆文件（NotFound 视为已删除，幂等）
+        let abs = self.root.join(memory_id);
+        match tokio::fs::remove_file(&abs).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    memory_id = %memory_id,
+                    "记忆文件不存在（视为已删除，继续标记索引）"
+                );
+            }
+            Err(e) => {
+                return Err(crate::Error::Storage(format!(
+                    "删除记忆文件失败 {:?}: {}",
+                    memory_id, e
+                )));
+            }
+        }
+
+        // 3. 读取索引文档 → 标记 hook 为 Deleted → 写回
+        match self.read_index(session_id, project_id, period).await? {
+            Some(mut doc) => {
+                let mut found = false;
+                for hook in &mut doc.hooks {
+                    if hook.id.to_string() == hook_id {
+                        hook.file_status = FileStatus::Deleted;
+                        found = true;
+                        tracing::info!(
+                            hook_id = %hook_id,
+                            memory_id = %memory_id,
+                            session_id = %session_id,
+                            "索引钩子已标记为 Deleted（软删除）"
+                        );
+                        break;
+                    }
+                }
+
+                if !found {
+                    tracing::warn!(
+                        hook_id = %hook_id,
+                        session_id = %session_id,
+                        "索引文档中未找到 hook，无法标记 Deleted（文件已删除）"
+                    );
+                    // 不返回错误，因为文件已删，主要目标已达成
+                } else {
+                    // 写回索引文档（失败时仅警告，不回滚文件删除）
+                    if let Err(e) = self.write_index(&doc).await {
+                        tracing::warn!(
+                            error = %e,
+                            hook_id = %hook_id,
+                            "索引写回失败：文件已删除但索引未标记为 Deleted，可能产生脏数据"
+                        );
+                        // 不返回错误：文件已删，主要目标已达成
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    hook_id = %hook_id,
+                    session_id = %session_id,
+                    "索引文档不存在，无法标记 Deleted（文件已删除）"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     async fn read_index(

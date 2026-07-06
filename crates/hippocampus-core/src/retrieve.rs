@@ -23,6 +23,7 @@
 
 use crate::model::{ArchivePeriod, IndexHook, MemoryFile};
 use crate::storage::Storage;
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 
 /// 摘要视图（用于注入 system prompt）
@@ -516,8 +517,18 @@ impl Retriever {
     /// 2. 获取该钩子指向的 memory_id
     /// 3. 从 Storage 读取完整 MemoryFile
     /// 4. v2.16（IMP-01）：异步自增 access_count（失败容忍，不影响主流程）
+    ///
+    /// v2.31 新增：
+    /// - **前缀匹配**：精确匹配失败时，若 hook_id >= 4 字符，做前缀匹配
+    ///   - 0 个匹配：报错"hook_id 不存在"
+    ///   - 1 个匹配：直接返回
+    ///   - N>1 个匹配：报错"前缀歧义"并列出候选
+    /// - **软删除感知**：跳过 `FileStatus::Deleted` 的 hook
+    /// - **防御性降级**：read_memory 失败时返回清晰错误，不崩溃传播 IO error
     pub async fn retrieve_memory(&self, hook_id: &str) -> crate::Result<MemoryFile> {
-        // 在所有周期中查找钩子
+        use crate::model::FileStatus;
+
+        // 1. 精确匹配（优先）
         for period in ArchivePeriod::all() {
             if let Some(doc) = self
                 .storage
@@ -526,11 +537,23 @@ impl Retriever {
             {
                 for hook in &doc.hooks {
                     if hook.id.to_string() == hook_id {
-                        // 找到钩子，读取对应的记忆文件
-                        let memory = self.storage.read_memory(&hook.memory_id).await?;
+                        // v2.31：检查文件状态
+                        if hook.file_status == FileStatus::Deleted {
+                            return Err(crate::Error::Index(format!(
+                                "记忆文件已删除（hook_id: {}，memory_id: {}）。索引钩子保留元数据，但文件不可读。",
+                                hook_id, hook.memory_id
+                            )));
+                        }
+
+                        // v2.31：防御性降级——read_memory 失败时返回清晰错误
+                        let memory = self.storage.read_memory(&hook.memory_id).await.map_err(|e| {
+                            crate::Error::Storage(format!(
+                                "读取记忆文件失败（hook_id: {}，memory_id: {}）：{}。索引可能已损坏，建议调 find_hook_by_prefix 重建上下文",
+                                hook_id, hook.memory_id, e
+                            ))
+                        })?;
 
                         // v2.16 IMP-01：自增 access_count（失败容忍）
-                        // 错误仅记录日志，不影响 retrieve 主流程
                         if let Err(e) = self.storage.update_access_count(&hook.memory_id).await {
                             tracing::warn!(
                                 hook_id = %hook_id,
@@ -546,8 +569,67 @@ impl Retriever {
             }
         }
 
+        // 2. 前缀匹配（v2.31 新增，最小 4 字符）
+        if hook_id.len() >= 4 {
+            let mut matches: Vec<(ArchivePeriod, crate::model::IndexHook)> = Vec::new();
+            for period in ArchivePeriod::all() {
+                if let Ok(Some(doc)) = self
+                    .storage
+                    .read_index(&self.session_id, self.project_id.as_deref(), period)
+                    .await
+                {
+                    for hook in &doc.hooks {
+                        if hook.id.to_string().starts_with(hook_id)
+                            && hook.file_status != FileStatus::Deleted
+                        {
+                            matches.push((period, hook.clone()));
+                        }
+                    }
+                }
+            }
+
+            return match matches.len() {
+                0 => Err(crate::Error::Index(format!(
+                    "hook_id 不存在：{}（精确和前缀匹配均无结果）",
+                    hook_id
+                ))),
+                1 => {
+                    let (_, hook) = matches.into_iter().next().unwrap();
+                    let memory = self.storage.read_memory(&hook.memory_id).await.map_err(|e| {
+                        crate::Error::Storage(format!(
+                            "读取记忆文件失败（hook_id: {}，memory_id: {}）：{}",
+                            hook.id, hook.memory_id, e
+                        ))
+                    })?;
+
+                    if let Err(e) = self.storage.update_access_count(&hook.memory_id).await {
+                        tracing::warn!(
+                            hook_id = %hook.id,
+                            memory_id = %hook.memory_id,
+                            error = %e,
+                            "access_count 自增失败（不影响 retrieve 主流程）"
+                        );
+                    }
+
+                    Ok(memory)
+                }
+                n => {
+                    let candidates: Vec<String> = matches
+                        .iter()
+                        .map(|(_, h)| h.id.to_string())
+                        .take(5)
+                        .collect();
+                    Err(crate::Error::Index(format!(
+                        "前缀歧义：hook_id '{}' 匹配到 {} 个候选，请补全。候选列表（最多 5 个）：{}",
+                        hook_id, n, candidates.join(", ")
+                    )))
+                }
+            };
+        }
+
+        // 3. 前缀长度不足，直接报错
         Err(crate::Error::Index(format!(
-            "未找到钩子 ID: {}",
+            "hook_id 不存在：{}（前缀长度 < 4，不做前缀匹配）",
             hook_id
         )))
     }
@@ -608,6 +690,192 @@ impl Retriever {
         self.storage
             .read_index(&self.session_id, self.project_id.as_deref(), period)
             .await
+    }
+}
+
+// ========================================================================
+// v2.31 新增：跨 session 前缀匹配（独立函数，不依赖 Retriever 实例）
+// ========================================================================
+
+/// `find_hooks_by_prefix` 返回的匹配结果（v2.31 新增）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HookPrefixMatch {
+    /// 匹配到的完整 hook_id
+    pub hook_id: String,
+    /// 所属 session_id
+    ///
+    /// 注意：由于 [`IndexHook`] 结构本身不含 session_id 字段，本字段填充规则：
+    /// - 调用方传入 `session_id` 时，直接使用传入值
+    /// - 仅传入 `project_id` 时，尝试从 `memory_id` 路径解析（LocalStorage 路径形式
+    ///   `sessions/{session_id}/...`），无法解析则为空字符串（如 SQLite 后端的 UUID 形式）
+    pub session_id: String,
+    /// 归档周期
+    pub period: ArchivePeriod,
+    /// 摘要标题
+    pub summary_title: String,
+    /// 归档时间
+    pub archived_at: DateTime<Utc>,
+    /// Token 数
+    pub token_count: usize,
+}
+
+/// 按 hook_id 前缀跨 session 查找匹配的钩子摘要（v2.31 新增）
+///
+/// 与 [`Retriever::retrieve_memory`] 不同，本函数：
+/// - **跨所有 session 检索**（不绑定特定 session_id，通过 project 级聚合索引）
+/// - **仅返回 hook 摘要**（不读取完整记忆文件，轻量）
+/// - 支持 project_id 过滤
+///
+/// ## 前缀匹配规则
+/// - `hook_prefix` 最少 4 字符，否则返回空 Vec
+/// - 精确匹配优先（与 prefix 完全一致的 hook 排在结果首位）
+/// - 前缀匹配：`hook.id.to_string().starts_with(prefix)`
+/// - 跳过 [`crate::model::FileStatus::Deleted`] 的 hook
+///
+/// ## 参数说明
+/// - `storage`：存储后端引用
+/// - `hook_prefix`：hook_id 前缀（至少 4 字符）
+/// - `project_id`：项目 ID（跨 session 检索的依据，推荐提供）
+/// - `session_id`：可选，限定在单个 session 内搜索
+///
+/// ## 跨 session 检索机制
+///
+/// 由于 [`Storage`] trait 没有 `list_sessions` 方法，跨 session 检索依赖
+/// project 级聚合索引（[`Storage::read_project_index`]）：
+/// - 提供 `session_id` 时：仅在该 session 内搜索（走 [`Storage::read_index`]）
+/// - 仅提供 `project_id` 时：走 [`Storage::read_project_index`] 跨 session 搜索
+/// - 两者都未提供：返回空 Vec 并记录 warning（冷启动场景需要 `project_id`）
+///
+/// ## 返回结构
+/// 返回匹配的 hook 摘要列表（精确匹配优先，其次按归档时间升序），
+/// 包含 hook_id / session_id / period / summary_title / archived_at / token_count。
+/// 同一 hook_id 重复出现时去重（保留首次出现）。
+pub async fn find_hooks_by_prefix(
+    storage: &Arc<dyn Storage>,
+    hook_prefix: &str,
+    project_id: Option<&str>,
+    session_id: Option<&str>,
+) -> crate::Result<Vec<HookPrefixMatch>> {
+    use crate::model::FileStatus;
+
+    // 1. 前缀长度校验（最少 4 字符）
+    if hook_prefix.len() < 4 {
+        tracing::debug!(
+            hook_prefix = %hook_prefix,
+            "前缀长度 < 4，跳过前缀匹配"
+        );
+        return Ok(Vec::new());
+    }
+
+    // 2. 收集匹配结果（带精确匹配标记，便于后续排序）
+    //    元素：(is_exact, HookPrefixMatch)
+    let mut matches: Vec<(bool, HookPrefixMatch)> = Vec::new();
+
+    // 3. 分支 A：session_id 提供时 → 单 session 搜索（走 read_index）
+    if let Some(sid) = session_id {
+        for period in ArchivePeriod::all() {
+            let doc = storage.read_index(sid, project_id, period).await?;
+            if let Some(doc) = doc {
+                for hook in &doc.hooks {
+                    let hook_id_str = hook.id.to_string();
+                    // 精确匹配或前缀匹配
+                    let is_exact = hook_id_str == hook_prefix;
+                    let is_prefix = hook_id_str.starts_with(hook_prefix);
+                    if !is_exact && !is_prefix {
+                        continue;
+                    }
+                    // 跳过已删除的 hook
+                    if hook.file_status == FileStatus::Deleted {
+                        continue;
+                    }
+
+                    matches.push((
+                        is_exact,
+                        HookPrefixMatch {
+                            hook_id: hook_id_str,
+                            session_id: sid.to_string(),
+                            period,
+                            summary_title: hook.summary.title.clone(),
+                            archived_at: hook.archived_at,
+                            token_count: hook.token_count,
+                        },
+                    ));
+                }
+            }
+        }
+    } else if let Some(pid) = project_id {
+        // 4. 分支 B：仅 project_id 提供 → 跨 session 搜索（走 project 聚合索引）
+        for period in ArchivePeriod::all() {
+            let doc = storage.read_project_index(pid, period).await?;
+            if let Some(doc) = doc {
+                for hook in &doc.hooks {
+                    let hook_id_str = hook.id.to_string();
+                    let is_exact = hook_id_str == hook_prefix;
+                    let is_prefix = hook_id_str.starts_with(hook_prefix);
+                    if !is_exact && !is_prefix {
+                        continue;
+                    }
+                    if hook.file_status == FileStatus::Deleted {
+                        continue;
+                    }
+
+                    // IndexHook 不含 session_id 字段，尝试从 memory_id 解析
+                    // LocalStorage 的 memory_id 格式：sessions/{session_id}/daily/xxx.json
+                    // SQLite 的 memory_id 为 UUID，无法解析（返回 None → 空字符串）
+                    let sid = parse_session_id_from_memory_id(&hook.memory_id)
+                        .unwrap_or_default();
+
+                    matches.push((
+                        is_exact,
+                        HookPrefixMatch {
+                            hook_id: hook_id_str,
+                            session_id: sid,
+                            period,
+                            summary_title: hook.summary.title.clone(),
+                            archived_at: hook.archived_at,
+                            token_count: hook.token_count,
+                        },
+                    ));
+                }
+            }
+        }
+    } else {
+        // 5. 分支 C：两者都未提供 → 返回空并 warning
+        tracing::warn!(
+            hook_prefix = %hook_prefix,
+            "find_hooks_by_prefix 需要 session_id 或 project_id 至少一个，两者都为空时无法跨 session 检索"
+        );
+        return Ok(Vec::new());
+    }
+
+    // 6. 排序：精确匹配优先（is_exact=true 排前），其次按归档时间升序
+    matches.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.archived_at.cmp(&b.1.archived_at))
+    });
+
+    // 7. 去重（同一 hook_id 可能同时出现在 session 索引和 project 聚合索引中）
+    let mut seen = std::collections::HashSet::new();
+    let mut result: Vec<HookPrefixMatch> = Vec::with_capacity(matches.len());
+    for (_, m) in matches {
+        if seen.insert(m.hook_id.clone()) {
+            result.push(m);
+        }
+    }
+
+    Ok(result)
+}
+
+/// 从 memory_id 解析 session_id（内部辅助函数）
+///
+/// LocalStorage 的 memory_id 格式：`sessions/{session_id}/daily/xxx.json`
+/// SQLite 的 memory_id 为 UUID，无法解析（返回 `None`）。
+fn parse_session_id_from_memory_id(memory_id: &str) -> Option<String> {
+    let parts: Vec<&str> = memory_id.splitn(4, '/').collect();
+    if parts.len() >= 2 && parts[0] == "sessions" {
+        Some(parts[1].to_string())
+    } else {
+        None
     }
 }
 

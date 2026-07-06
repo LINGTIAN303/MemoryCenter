@@ -241,6 +241,7 @@ mod tests {
             archived_at: Utc::now(),
             period: ArchivePeriod::Daily,
             token_count: 100,
+            file_status: hippocampus_core::model::FileStatus::Normal,
         }
     }
 

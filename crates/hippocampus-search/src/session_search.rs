@@ -428,6 +428,63 @@ impl SessionSearchRouter {
         );
     }
 
+    /// 从内存索引中移除指定 hook（v2.31 新增）
+    ///
+    /// `batch_delete` 调用后立即生效，避免 `semantic_search` 返回幽灵记忆。
+    /// 进程重启后索引从 storage 重建，所以 storage 层的软删除标记是最终保障。
+    ///
+    /// ## 参数
+    ///
+    /// - `session_id`：会话 ID（用于定位内存中的检索路由器）
+    /// - `hook_id`：要移除的 hook ID
+    ///
+    /// ## 行为
+    ///
+    /// - **session 不存在**：静默跳过（进程重启后索引会从 storage 重建）
+    /// - **session 存在**：从该 session 的关键词索引和向量索引中移除该 hook
+    ///
+    /// ## 与 `remove_session` 的区别
+    ///
+    /// - `remove_session`：移除整个 session 的索引（用于整体清理）
+    /// - `unindex_hook`：仅移除单个 hook（用于 `batch_delete` 后的精确清理）
+    pub async fn unindex_hook(&self, session_id: &str, hook_id: &str) {
+        // 从缓存中获取已存在的 SessionIndices（不创建新的）
+        // 注意：不使用 get_or_create，避免为不存在的 session 创建空索引
+        let indices = match &self.sessions {
+            SessionCache::TinyLFU(cache) => cache.get(session_id).await,
+            SessionCache::StrictLRU(cache) => {
+                let guard = cache.lock().await;
+                // 使用 peek 不更新 LRU 顺序（清理操作不应影响淘汰策略）
+                guard.peek(session_id).cloned()
+            }
+        };
+
+        let Some(indices) = indices else {
+            // session 不在内存中，静默跳过
+            // 进程重启后索引会从 storage 重建，storage 层的软删除标记是最终保障
+            tracing::debug!(
+                session = %session_id,
+                hook_id = %hook_id,
+                "session 未在内存中索引，跳过 unindex_hook"
+            );
+            return;
+        };
+
+        // 1. 从关键词索引移除（必执行）
+        indices.keyword.remove(hook_id);
+
+        // 2. 从向量索引移除（仅当存在时）
+        if let Some(vi) = &indices.vector {
+            vi.remove(hook_id);
+        }
+
+        tracing::info!(
+            session = %session_id,
+            hook_id = %hook_id,
+            "已从 session 内存索引移除 hook"
+        );
+    }
+
     /// 语义检索（按 session 隔离）
     ///
     /// 只搜索该 session 的索引，不返回其他 session 的结果。
@@ -746,6 +803,7 @@ mod tests {
             archived_at: Utc::now(),
             period: ArchivePeriod::Daily,
             token_count: 100,
+            file_status: hippocampus_core::model::FileStatus::Normal,
         }
     }
 

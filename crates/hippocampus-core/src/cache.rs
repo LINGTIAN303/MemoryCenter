@@ -455,6 +455,7 @@ mod tests {
             archived_at: Utc::now(),
             period,
             token_count,
+            file_status: crate::model::FileStatus::Normal,
         }
     }
 

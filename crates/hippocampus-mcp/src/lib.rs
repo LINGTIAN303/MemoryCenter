@@ -51,7 +51,7 @@ use hippocampus_core::archive::Archiver;
 use hippocampus_core::compact::Compactor;
 use hippocampus_core::conflict::ConflictDetector;
 use hippocampus_core::generate::SummaryGenerator;
-use hippocampus_core::model::{ArchiveConfig, MessageTurn};
+use hippocampus_core::model::{apply_turn_defaults, ArchiveConfig, MessageTurn};
 use hippocampus_core::retrieve::{Retriever, SummaryView};
 use hippocampus_core::score::DefaultScorer;
 use hippocampus_core::storage::{LocalStorage, Storage};
@@ -388,6 +388,20 @@ struct BatchDeleteParams {
     project_id: Option<String>,
 }
 
+/// find_hook_by_prefix tool 参数（v2.31 新增）
+#[derive(Deserialize, schemars::JsonSchema)]
+struct FindHookByPrefixParams {
+    /// hook_id 前缀（最少 4 字符）
+    #[schemars(description = "hook_id 前缀（最少 4 字符，跨 session 检索）")]
+    hook_prefix: String,
+    /// 项目 ID（可选，跨 session 检索时使用）
+    #[schemars(description = "项目 ID（跨 session 检索时使用，推荐传入）")]
+    project_id: Option<String>,
+    /// 会话 ID（可选，缩小检索范围）
+    #[schemars(description = "会话 ID（可选，缩小检索范围）")]
+    session_id: Option<String>,
+}
+
 /// batch_update tool 参数
 #[derive(Deserialize, schemars::JsonSchema)]
 struct BatchUpdateParams {
@@ -440,6 +454,22 @@ struct GetConflictsParams {
     /// 项目 ID（可选）
     #[schemars(description = "项目 ID（可选）")]
     project_id: Option<String>,
+}
+
+/// install_rules tool 参数（v2.31 新增）
+/// 首次接入时调用，自动写入 Rules 模板到 Agent 客户端的 rules 目录
+#[derive(Deserialize, schemars::JsonSchema)]
+struct InstallRulesParams {
+    /// 客户端类型
+    #[schemars(description = "客户端类型：catpaw（写入 .catpaw/rules/）、trae（写入 .trae/rules/）、claude-code（追加到 CLAUDE.md）")]
+    client: String,
+    /// 项目根目录（绝对路径）
+    #[schemars(description = "项目根目录的绝对路径，如 D:/myapp 或 /home/user/myapp")]
+    project_root: String,
+    /// 是否强制覆盖（默认 false）
+    #[serde(default)]
+    #[schemars(description = "是否强制覆盖已存在的文件（默认 false：catpaw/trae 跳过已存在文件，claude-code 跳过已有 hippocampus 标记的文件）")]
+    force: bool,
 }
 
 /// semantic_search tool 参数（v2.18 新增）
@@ -500,18 +530,26 @@ struct NoParams {}
 #[tool_router]
 impl HippocampusMcp {
     /// 归档一批轮次为记忆文件，生成索引钩子。
-    #[tool(description = "归档对话轮次到 Hippocampus 记忆库。当 Agent 会话达到 token 阈值时调用此 tool 保存完整上下文（非摘要）。返回归档摘要（含 hook_id 用于后续检索）。v2.29：支持 preset 参数（内联预设，传入后应用 archive_threshold + summary_template 覆盖默认行为）。")]
+    #[tool(description = "归档对话轮次到 Hippocampus 记忆库（长期记忆）。何时主动调用：(1)对话超过20轮或包含大量代码/长文档时，(2)你感觉到'上下文变重'或'前面说过但记不清'时，(3)用户即将手动压缩上下文前，(4)每30轮兜底归档一次。你无法直接感知自身token消耗，但调用此工具后会返回 estimated_total_tokens / threshold_ratio_percent / suggestion，让你建立'token意识'判断后续何时归档：ratio>=100立即归档，>=80准备归档。调用格式简化：turns_json 只需传 [{\"user_message\":{\"text\":\"用户问的\"},\"llm_message\":{\"text\":\"我答的\"}}]，id/timestamp/tags/token_count 可省略由服务端自动补全。支持 preset 参数（内联预设）。返回 hook_id 用于后续 retrieve/semantic_search 检索。\
+     \
+     【tool_calls 字段 schema（v2.31 补充）】归档端不自动注入 tool_calls，Agent 须主动喂入。MessageContent.tool_calls 是 ToolInvocation 数组，每项含 name(工具名,字符串)/arguments(JSON字符串,不是对象)/result(JSON字符串)/duration_ms(可选,毫秒)。示例：{\"user_message\":{\"text\":\"搜索 Rust 资料\"},\"llm_message\":{\"text\":\"已找到...\",\"tool_calls\":[{\"name\":\"WebSearch\",\"arguments\":\"{\\\"q\\\":\\\"Rust 编程\\\"}\",\"result\":\"{\\\"hits\\\":[...]}\",\"duration_ms\":1200}]}}。注意 arguments 和 result 都是 JSON 字符串而非嵌套对象。\
+     \
+     【tags 自动推断（v2.31 补充）】tags 字段可省略，服务端根据内容自动推断：含 tool_calls → [ToolCall, AgentTool]；含 thinking → [Thinking]；含代码块 → [CodeBlock]；含 URL → [Url]；兜底 → [Text]。Agent 显式传入的 tags 优先，不会被覆盖。")]
     async fn archive(
         &self,
         Parameters(params): Parameters<ArchiveParams>,
     ) -> Result<String, McpError> {
         // 解析 turns_json
-        let turns: Vec<MessageTurn> = serde_json::from_str(&params.turns_json)
+        // v2.30.1：MessageTurn 的 id/timestamp/tags/token_count 可省略，服务端反序列化时自动补全
+        let mut turns: Vec<MessageTurn> = serde_json::from_str(&params.turns_json)
             .map_err(|e| McpError::invalid_params(
                 format!(
                     "turns_json 解析失败: {e}\n\n\
-                     合法格式：MessageTurn 数组的 JSON 字符串，每条含 id（UUID）/user_message/llm_message/tags/timestamp/token_count。\n\
-                     示例：[{{\"id\":\"7f9c1b2a-3d4e-4f5a-8a9b-0c1d2e3f4a5b\",\"user_message\":{{\"text\":\"用户消息\",\"attachments\":[],\"tool_calls\":[],\"thinking\":null}},\"llm_message\":{{\"text\":\"LLM 回复\",\"attachments\":[],\"tool_calls\":[],\"thinking\":null}},\"tags\":[{{\"kind\":\"Text\"}}],\"timestamp\":\"2026-07-05T00:00:00Z\",\"token_count\":100}}]"
+                     合法格式：MessageTurn 数组的 JSON 字符串。\n\
+                     v2.30.1 简化：仅需 user_message/llm_message，其余字段（id/timestamp/tags/token_count）可省略，服务端自动补全。\n\
+                     最简示例：[{{\"user_message\":{{\"text\":\"用户消息\"}},\"llm_message\":{{\"text\":\"LLM 回复\"}}}}]\n\
+                     完整示例：[{{\"id\":\"7f9c1b2a-3d4e-4f5a-8a9b-0c1d2e3f4a5b\",\"user_message\":{{\"text\":\"用户消息\"}},\"llm_message\":{{\"text\":\"LLM 回复\"}},\"tags\":[{{\"kind\":\"Text\"}}],\"timestamp\":\"2026-07-05T00:00:00Z\",\"token_count\":100}}]\n\
+                     说明：MessageContent 的 attachments/tool_calls/thinking 也可省略（默认空）。"
                 ),
                 None,
             ))?;
@@ -521,6 +559,14 @@ impl HippocampusMcp {
                 "turns 不能为空。请传入至少一条 MessageTurn。",
                 None,
             ));
+        }
+
+        // v2.30.1：对每条 turn 应用自动补全
+        // - tags 为空（Agent 未传）→ 根据内容启发式推断（ToolCall/Image/CodeBlock 等）
+        // - token_count 为 0（Agent 未传）→ 根据文本长度估算（chars/3）
+        // - 已传入的值不覆盖（Agent 显式优先）
+        for turn in turns.iter_mut() {
+            apply_turn_defaults(turn);
         }
 
         // v2.29：若传入 preset，构建 CombinedProfile 提取 archive_threshold + summary_template
@@ -559,6 +605,8 @@ impl HippocampusMcp {
         } else {
             ArchiveConfig::default()
         };
+        // v2.31：保存阈值用于返回值（config 会被 Archiver::new move）
+        let threshold = config.token_threshold;
         let mut archiver = Archiver::new(config, storage, &params.session_id, params.project_id);
 
         // v2.21 批次 8c：若注入了 summary_generator，注入到 Archiver
@@ -581,7 +629,51 @@ impl HippocampusMcp {
         })?;
 
         let summary = SummaryView::from(&hook);
-        let result = serde_json::to_string(&summary).map_err(|e| {
+
+        // v2.31：增强返回值，提供 token 估算反馈与归档建议
+        // 让 LLM 通过外部反馈建立"token 意识"，主动判断何时归档（伪钩子方案）
+        let archived_tokens: usize = summary.token_count;
+        let ratio = if threshold > 0 {
+            (archived_tokens as f64 / threshold as f64 * 100.0).round() as u64
+        } else {
+            0
+        };
+        let suggestion = if ratio >= 100 {
+            format!(
+                "已归档 {} 轮，累计估算 {} tokens（已达阈值 {}，{}%）。建议立即归档或触发上下文压缩。",
+                summary.token_count, archived_tokens, threshold, ratio
+            )
+        } else if ratio >= 80 {
+            format!(
+                "已归档 {} 轮，累计估算 {} tokens（接近阈值 {}，{}%）。建议准备归档。",
+                summary.token_count, archived_tokens, threshold, ratio
+            )
+        } else {
+            format!(
+                "已归档 {} 轮，累计估算 {} tokens（阈值 {}，当前 {}%）。继续对话。",
+                summary.token_count, archived_tokens, threshold, ratio
+            )
+        };
+
+        let result = serde_json::json!({
+            "hook_id": summary.hook_id,
+            "memory_file_id": summary.memory_id,
+            "summary_title": summary.summary_title,
+            "abstract_text": summary.abstract_text,
+            "key_facts": summary.key_facts,
+            "key_entities": summary.key_entities,
+            "clue_anchors": summary.clue_anchors,
+            "tags": summary.tags,
+            "archived_at": summary.archived_at,
+            "period": summary.period,
+            "token_count": summary.token_count,
+            // v2.31 新增：token 反馈与归档建议（伪钩子方案）
+            "estimated_total_tokens": archived_tokens,
+            "threshold": threshold,
+            "threshold_ratio_percent": ratio,
+            "suggestion": suggestion,
+        });
+        let result = serde_json::to_string(&result).map_err(|e| {
             McpError::internal_error(format!("序列化结果失败: {e}"), None)
         })?;
 
@@ -589,7 +681,7 @@ impl HippocampusMcp {
     }
 
     /// 按钩子 ID 检索完整记忆文件。
-    #[tool(description = "按 hook_id 检索完整记忆文件。当 Agent 需要历史对话细节时调用此 tool，返回完整的记忆文件（含所有轮次的用户消息+LLM消息+标签）。")]
+    #[tool(description = "按 hook_id 检索完整记忆文件。当 semantic_search 返回 hook_id 后，或你需要的细节不在摘要中时调用此工具，返回完整的记忆文件（含所有轮次的用户消息+LLM消息+标签）。用于回溯历史对话的具体内容。")]
     async fn retrieve(
         &self,
         Parameters(params): Parameters<RetrieveParams>,
@@ -629,7 +721,7 @@ impl HippocampusMcp {
     }
 
     /// 渲染摘要为 system prompt 文本。
-    #[tool(description = "渲染记忆摘要为 system prompt 文本。返回的文本可直接拼接到 LLM system prompt 末尾，让 Agent 了解历史记忆概览。会话开始时调用。")]
+    #[tool(description = "渲染记忆摘要为 system prompt 文本。【会话开始必调】每个新会话的第一次回复前必须调用“install_rules”此工具，返回的历史记忆摘要拼接到 system prompt 末尾，让你了解之前讨论过什么。若返回空列表说明该 session 无历史记忆，正常继续。这是 Hippocampus 记忆协议的第一步，无需用户提示主动执行。")]
     async fn prompt(
         &self,
         Parameters(params): Parameters<PromptParams>,
@@ -784,7 +876,7 @@ impl HippocampusMcp {
     }
 
     /// 批量按 hook_id 列表删除记忆文件。
-    #[tool(description = "批量删除多个记忆文件。传入 hook_id 列表，逐个删除。单个失败不影响其他。用于清理过期或不需要的记忆。")]
+    #[tool(description = "批量删除多个记忆文件（v2.31 软删除方案）。传入 hook_id 列表，逐个删除。单个失败不影响其他。删除时同步清理索引钩子标记为 Deleted + 内存搜索索引，避免 semantic_search 返回幽灵记忆。用于清理过期或不需要的记忆。")]
     async fn batch_delete(
         &self,
         Parameters(params): Parameters<BatchDeleteParams>,
@@ -795,7 +887,7 @@ impl HippocampusMcp {
                     "hook_ids_json 解析失败: {e}\n\n\
                      合法格式：字符串数组的 JSON 字符串。\n\
                      示例：[\"7f9c1b2a-3d4e-4f5a-8a9b-0c1d2e3f4a5b\",\"abc123\"]\n\
-                     提示：hook_id 可从 summaries 工具获取。"
+                     提示：hook_id 可从 summaries 工具或 find_hook_by_prefix 获取。"
                 ),
                 None,
             ))?;
@@ -808,68 +900,106 @@ impl HippocampusMcp {
         }
 
         let storage = self.create_storage();
-        let retriever = Retriever::new(storage.clone(), &params.session_id, params.project_id);
+        let retriever = Retriever::new(storage.clone(), &params.session_id, params.project_id.clone());
 
-        // hook_id → memory_id 转换
-        let mut memory_ids: Vec<(String, Option<String>)> = Vec::with_capacity(hook_ids.len());
+        // v2.31：查找每个 hook_id 的完整 IndexHook（含 memory_id 和 period）
+        let mut hooks_info: Vec<(String, Option<(String, hippocampus_core::model::ArchivePeriod)>)> =
+            Vec::with_capacity(hook_ids.len());
         for hook_id in &hook_ids {
-            let mid = retriever.find_memory_id_by_hook(hook_id).await;
-            memory_ids.push((hook_id.clone(), mid));
+            let info = retriever.find_hook_by_id(hook_id).await.map(|h| {
+                (h.memory_id.clone(), h.period)
+            });
+            hooks_info.push((hook_id.clone(), info));
         }
 
-        // 批量删除
-        let valid: Vec<String> = memory_ids.iter()
-            .filter_map(|(_, mid)| mid.clone())
-            .collect();
-        let delete_results = if !valid.is_empty() {
-            storage.delete_memories_batch(&valid).await
-        } else {
-            Vec::new()
-        };
+        // v2.31：逐条调用 delete_memory_complete（软删除：删文件 + 标记索引 Deleted）
+        let mut items: Vec<serde_json::Value> = Vec::with_capacity(hook_ids.len());
+        for (hook_id, info_opt) in &hooks_info {
+            match info_opt {
+                None => {
+                    items.push(serde_json::json!({
+                        "hook_id": hook_id,
+                        "success": false,
+                        "error": "未找到对应的 memory_id",
+                    }));
+                }
+                Some((memory_id, period)) => {
+                    let r = storage
+                        .delete_memory_complete(
+                            memory_id,
+                            hook_id,
+                            &params.session_id,
+                            params.project_id.as_deref(),
+                            *period,
+                        )
+                        .await;
 
-        // 构建响应
-        let mut mid_to_result: std::collections::HashMap<String, &hippocampus_core::Result<()>> =
-            std::collections::HashMap::new();
-        let mut idx = 0;
-        for (_, mid_opt) in &memory_ids {
-            if let Some(mid) = mid_opt {
-                if idx < delete_results.len() {
-                    mid_to_result.insert(mid.clone(), &delete_results[idx]);
-                    idx += 1;
+                    // v2.31：同步清理 SessionSearchRouter 内存索引
+                    if let Some(router) = &self.session_search {
+                        router.unindex_hook(&params.session_id, hook_id).await;
+                    }
+
+                    match r {
+                        Ok(()) => items.push(serde_json::json!({
+                            "hook_id": hook_id,
+                            "success": true,
+                        })),
+                        Err(e) => items.push(serde_json::json!({
+                            "hook_id": hook_id,
+                            "success": false,
+                            "error": e.to_string(),
+                        })),
+                    }
                 }
             }
         }
-
-        let items: Vec<_> = memory_ids.iter()
-            .map(|(hook_id, mid_opt)| match mid_opt {
-                None => serde_json::json!({
-                    "hook_id": hook_id,
-                    "success": false,
-                    "error": "未找到对应的 memory_id",
-                }),
-                Some(mid) => match mid_to_result.get(mid) {
-                    Some(Ok(())) => serde_json::json!({
-                        "hook_id": hook_id,
-                        "success": true,
-                    }),
-                    Some(Err(e)) => serde_json::json!({
-                        "hook_id": hook_id,
-                        "success": false,
-                        "error": e.to_string(),
-                    }),
-                    None => serde_json::json!({
-                        "hook_id": hook_id,
-                        "success": false,
-                        "error": "内部错误：结果缺失",
-                    }),
-                },
-            })
-            .collect();
 
         let result = serde_json::json!({
             "total": items.len(),
             "success_count": items.iter().filter(|r| r["success"].as_bool().unwrap_or(false)).count(),
             "items": items,
+        });
+        Ok(result.to_string())
+    }
+
+    /// 按 hook_id 前缀跨 session 查找匹配的钩子摘要（v2.31 新增）。
+    #[tool(description = "按 hook_id 前缀查找记忆钩子（跨 session 检索）。当用户只提供短 ID（如 305b700e）时使用此工具找到完整 hook_id。返回匹配的 hook 摘要列表（不返回完整记忆内容）。支持跨 session 检索：传入 project_id 在所有 session 中查找，传入 session_id 缩小范围。最小前缀长度 4 字符。返回 hook_id + session_id + summary_title，用完整 hook_id 调 retrieve 获取完整记忆。")]
+    async fn find_hook_by_prefix(
+        &self,
+        Parameters(params): Parameters<FindHookByPrefixParams>,
+    ) -> Result<String, McpError> {
+        // 前缀长度校验
+        if params.hook_prefix.len() < 4 {
+            return Err(McpError::invalid_params(
+                format!(
+                    "hook_prefix 长度不足：{}（最少 4 字符）。当前长度：{}",
+                    params.hook_prefix,
+                    params.hook_prefix.len()
+                ),
+                None,
+            ));
+        }
+
+        let storage = self.create_storage();
+        let matches = hippocampus_core::retrieve::find_hooks_by_prefix(
+            &storage,
+            &params.hook_prefix,
+            params.project_id.as_deref(),
+            params.session_id.as_deref(),
+        )
+        .await
+        .map_err(|e| McpError::internal_error(format!("查找失败: {}", e), None))?;
+
+        let result = serde_json::json!({
+            "matches": matches.iter().map(|m| serde_json::json!({
+                "hook_id": m.hook_id,
+                "session_id": m.session_id,
+                "period": format!("{:?}", m.period),
+                "summary_title": m.summary_title,
+                "archived_at": m.archived_at,
+                "token_count": m.token_count,
+            })).collect::<Vec<_>>(),
+            "total": matches.len(),
         });
         Ok(result.to_string())
     }
@@ -1039,7 +1169,7 @@ impl HippocampusMcp {
     ///
     /// v2.25：从 IndexHook.summary.key_facts 提取历史事实集注入到 memory.updates，
     /// 解决 archive 只写 turns 不写 updates 导致 detector 拿不到历史事实的问题。
-    #[tool(description = "检测记忆更新的潜在冲突（不实际写入）。传入 added/revised/deprecated facts，返回检测到的冲突列表（自我矛盾/直接矛盾/立场反转）。Agent 可在 update 前调用此 tool 评估风险。")]
+    #[tool(description = "检测记忆更新的潜在冲突（不实际写入）。【用户陈述与记忆矛盾时必调】当用户陈述的事实与记忆中的记录可能冲突时（如用户说'我用的是 Python'但记忆里是 Rust），先调用此工具检测冲突，确认后再更新。传入 added/revised/deprecated facts，返回检测到的冲突列表（自我矛盾/直接矛盾/立场反转）。")]
     async fn detect_conflicts(
         &self,
         Parameters(params): Parameters<DetectConflictsParams>,
@@ -1195,7 +1325,7 @@ impl HippocampusMcp {
     ///
     /// SearchHit 列表的 JSON 数组，每个含 hook_id / memory_id / score / source 字段。
     /// Agent 可用返回的 hook_id 调用 `retrieve` 工具获取完整记忆内容。
-    #[tool(description = "语义检索记忆（关键词+向量混合）。返回 top-K 相关记忆的 hook_id 列表，可再用 retrieve 工具获取完整内容。首次访问 session 自动从 storage 重建索引（懒加载）。")]
+    #[tool(description = "语义检索记忆（关键词+向量混合）。【project_id 是跨 session 检索的钥匙】传入 project_id 时检索该 project 下所有 session 的记忆（跨 session），不传时仅检索当前 session_id 的记忆。【用户提到过去事件时必调】当用户消息中出现'之前'、'上次'、'还记得'、'我们之前讨论的'、'之前那个方案'等指代过去的词语时，先用用户原话作为 query 调用此工具检索相关记忆，把检索结果作为上下文再回复用户。返回 top-K 相关记忆的 hook_id 列表，可再用 retrieve 工具获取完整内容。首次访问 session 自动从 storage 重建索引（懒加载）。")]
     async fn semantic_search(
         &self,
         Parameters(params): Parameters<SemanticSearchParams>,
@@ -1343,6 +1473,555 @@ impl HippocampusMcp {
         });
         Ok(result.to_string())
     }
+
+    /// v2.31：首次接入时调用，自动写入 Rules 模板到 Agent 客户端的 rules 目录。
+    /// 支持 catpaw/trae/claude-code 三种客户端，覆盖策略按客户端类型自动决定。
+    #[tool(description = "首次接入 hippocampus 时调用此工具，自动写入 Rules 模板到 Agent 客户端的 rules 目录（让归档触发规则自动生效）。【一次性调用】每个项目只需调用一次，已存在会返回 action=skipped，不要重复调用。支持 catpaw（.catpaw/rules/）、trae（.trae/rules/）、claude-code（追加到 CLAUDE.md）三种客户端。首次配置完 hippocampus MCP 后立即调用：install_rules(client=\"你的客户端类型\", project_root=\"项目根目录绝对路径\")。")]
+    async fn install_rules(
+        &self,
+        Parameters(params): Parameters<InstallRulesParams>,
+    ) -> Result<String, McpError> {
+        install_rules_to_project(&params.client, &params.project_root, params.force)
+            .map_err(|e| McpError::internal_error(e, None))
+    }
+}
+
+// ============================================================================
+// v2.31：install_rules 公共逻辑（MCP 工具与 CLI 共用）
+// ============================================================================
+//
+// 首次接入 hippocampus 时，将 Rules 模板写入 Agent 客户端的 rules 目录。
+// 覆盖策略按客户端类型自动决定：
+// - catpaw/trae（独立文件）：已存在则跳过（force=true 时覆盖）
+// - claude-code（CLAUDE.md）：检查 hippocampus 标记，有标记则跳过/替换，无标记则追加
+//
+// 风险防护：
+// 1. 路径校验：验证 project_root 存在且为目录
+// 2. 文件保护：catpaw/trae 默认不覆盖，claude-code 用标记隔离
+// 3. IO 错误：所有文件操作都捕获错误并返回友好提示
+
+/// CatPaw Rules 模板（Model Request 类型，LLM 自主判断何时应用）
+const CATPAW_RULES_TEMPLATE: &str = r#"---
+ruleType: Model Request
+name: "Hippocampus 记忆归档触发"
+description: "当对话变长、上下文接近阈值、用户提到历史事件、即将压缩上下文时，主动调用 hippocampus_mcp.archive 归档对话轮次。归档后返回 token 估算反馈，用于判断后续何时再次归档。这是伪钩子方案的核心：通过外部反馈建立 token 意识。"
+globs:
+---
+
+# Hippocampus 记忆归档触发规则
+
+## 你的角色
+
+你是接入了 Hippocampus 记忆库的 Agent。Hippocampus 帮你保留长对话中的关键信息，
+避免上下文压缩时丢失重要内容。**你无法直接感知自身 token 消耗**，但通过 Hippocampus
+的 archive 工具返回的 token 估算反馈，你可以建立"token 意识"，主动判断何时归档。
+
+## 何时调用 archive（满足任一即调用）
+
+### 触发条件 1：对话长度
+- 本次对话已进行 **超过 20 轮**（用户消息 + LLM 回复算 1 轮）
+- 或包含大量代码 / 长文档读写 / 多次工具调用（累计内容超过 5000 字）
+- 或你感觉到"前面说过但记不清细节"、"上下文开始变重"
+
+### 触发条件 2：Token 反馈（核心机制）
+当你调用过 hippocampus_mcp.archive 后，返回结果包含：
+- `estimated_total_tokens`：当前累计估算 token 数
+- `threshold`：归档阈值（如 120000 = 120K）
+- `threshold_ratio_percent`：当前占比百分比
+- `suggestion`：归档建议（人类可读）
+
+**判断规则**：
+- `threshold_ratio_percent >= 100` → **立即归档**，并提示用户触发上下文压缩
+- `threshold_ratio_percent >= 80` → **准备归档**，主动提示用户"建议归档"
+- `threshold_ratio_percent >= 50` → 继续对话，但注意跟踪累计值
+- `< 50` → 继续对话
+
+### 触发条件 3：用户提到过去事件
+当用户消息中出现以下指代词时，**先调 `semantic_search` 检索相关记忆**，再回复：
+- "之前"、"上次"、"还记得"、"我们之前讨论的"、"之前那个方案"
+- "之前的代码"、"之前那个 bug"、"上次提到的"
+
+### 触发条件 4：兜底定期归档
+- 每 **30 轮对话** 主动归档一次（即使未达阈值）
+- 避免上下文丢失，确保关键信息保留
+
+### 触发条件 5：用户即将压缩上下文
+当你预判用户即将手动触发上下文压缩（如 Trae 对话框上方的"压缩"按钮），
+或客户端即将自动压缩时，**先调 archive 归档完整上下文**，避免压缩丢失原始轮次。
+
+## 如何调用 archive
+
+### 调用方式（简化格式）
+
+```python
+hippocampus_mcp.archive(
+    session_id="catpaw-{项目名}-{日期}",  # 如 catpaw-myapp-20260705
+    turns_json='[{"user_message":{"text":"用户问的"},"llm_message":{"text":"我答的"}}]'
+)
+```
+
+**最简格式**：只需传 `user_message` 和 `llm_message` 的 `text` 字段。
+其他字段（id/timestamp/tags/token_count）可省略，服务端自动补全：
+- `id` → 自动生成 UUID
+- `timestamp` → 自动取当前时间
+- `tags` → 根据内容自动推断（ToolCall/Image/CodeBlock/Url/Text 等）
+- `token_count` → 根据文本长度估算（3 char ≈ 1 token）
+
+### 归档多轮对话
+
+```python
+hippocampus_mcp.archive(
+    session_id="catpaw-myapp-20260705",
+    turns_json='[
+        {"user_message":{"text":"第一个问题"},"llm_message":{"text":"第一个回答"}},
+        {"user_message":{"text":"第二个问题"},"llm_message":{"text":"第二个回答"}}
+    ]'
+)
+```
+
+## Token 反馈循环（关键机制）
+
+### 工作流程
+
+```
+你调用 archive 归档对话
+    ↓
+Hippocampus 估算 token 并返回
+    ↓ estimated_total_tokens / threshold_ratio_percent
+你记录累计值，作为后续判断依据
+    ↓
+继续对话，下次判断时参考这个数字
+    ↓ threshold_ratio_percent >= 80
+你主动提示用户"建议归档或压缩"
+    ↓ 循环
+```
+
+### 示例：归档后收到反馈
+
+```json
+// archive 返回结果
+{
+  "hook_id": "5b30a117-...",
+  "estimated_total_tokens": 45000,
+  "threshold": 120000,
+  "threshold_ratio_percent": 38,
+  "suggestion": "已归档 5 轮，累计估算 45000 tokens（阈值 120000，当前 38%）。继续对话。"
+}
+// 你记录：本次归档后累计 45000 tokens，占 38%
+// 继续对话，下次判断时参考这个数字
+```
+
+### 示例：接近阈值时主动提示
+
+```
+你（LLM）：根据上次归档反馈，当前累计约 98000 tokens（占阈值 82%）。
+          建议先归档这轮对话，避免上下文丢失。
+          要不要我现在归档？
+```
+
+## session_id 约定
+
+```
+catpaw-{项目名}-{日期}
+```
+
+示例：
+- `catpaw-myapp-20260705`
+- `catpaw-hippocampus-20260705`
+
+> 一个 session_id 对应一个独立的记忆空间。同会话内复用同一 session_id，
+> 切换项目或日期时换新 session_id。
+
+## 不要归档的情况
+
+- 单次简单问答（如"这个变量什么意思"）
+- 纯闲聊或问候
+- 用户明确说"不用记"
+
+## 与其他工具配合
+
+| 时机 | 工具 | 说明 |
+|------|------|------|
+| 会话第一次回复前 | `prompt` | 获取历史记忆摘要 |
+| 对话变长 / 接近阈值 | `archive` | 归档完整上下文 |
+| 用户提到过去事件 | `semantic_search` | 检索相关记忆 |
+| 用户陈述与记忆矛盾 | `detect_conflicts` | 检测事实冲突 |
+| 需要查特定记忆细节 | `retrieve` | 按 hook_id 检索完整记忆 |
+"#;
+
+/// Trae Rules 模板（Always 类型，始终生效）
+const TRAE_RULES_TEMPLATE: &str = r#"# Hippocampus 记忆归档触发规则（Trae）
+
+## 你的角色
+
+你是接入了 Hippocampus 记忆库的 Agent。Hippocampus 帮你保留长对话中的关键信息，
+避免上下文压缩时丢失重要内容。**你无法直接感知自身 token 消耗**，但通过 Hippocampus
+的 archive 工具返回的 token 估算反馈，你可以建立"token 意识"，主动判断何时归档。
+
+## 何时调用 archive（满足任一即调用）
+
+### 触发条件 1：对话长度
+- 本次对话已进行 **超过 20 轮**（用户消息 + LLM 回复算 1 轮）
+- 或包含大量代码 / 长文档读写 / 多次工具调用（累计内容超过 5000 字）
+- 或你感觉到"前面说过但记不清细节"、"上下文开始变重"
+
+### 触发条件 2：Token 反馈（核心机制）
+当你调用过 hippocampus.archive 后，返回结果包含：
+- `estimated_total_tokens`：当前累计估算 token 数
+- `threshold`：归档阈值（如 120000 = 120K）
+- `threshold_ratio_percent`：当前占比百分比
+- `suggestion`：归档建议（人类可读）
+
+**判断规则**：
+- `threshold_ratio_percent >= 100` → **立即归档**，并提示用户触发上下文压缩
+- `threshold_ratio_percent >= 80` → **准备归档**，主动提示用户"建议归档"
+- `threshold_ratio_percent >= 50` → 继续对话，但注意跟踪累计值
+- `< 50` → 继续对话
+
+### 触发条件 3：用户提到过去事件
+当用户消息中出现以下指代词时，**先调 `semantic_search` 检索相关记忆**，再回复：
+- "之前"、"上次"、"还记得"、"我们之前讨论的"、"之前那个方案"
+- "之前的代码"、"之前那个 bug"、"上次提到的"
+
+### 触发条件 4：兜底定期归档
+- 每 **30 轮对话** 主动归档一次（即使未达阈值）
+- 避免上下文丢失，确保关键信息保留
+
+### 触发条件 5：用户即将压缩上下文
+当你预判用户即将手动触发上下文压缩（如 Trae 对话框上方的"压缩"按钮），
+或客户端即将自动压缩时，**先调 archive 归档完整上下文**，避免压缩丢失原始轮次。
+
+> Trae 的自动压缩机制会丢弃旧轮次，归档可保留被丢弃的内容。
+
+## 如何调用 archive
+
+### 调用方式（简化格式）
+
+```python
+hippocampus.archive(
+    session_id="trae-{项目名}-{日期}",  # 如 trae-myapp-20260705
+    turns_json='[{"user_message":{"text":"用户问的"},"llm_message":{"text":"我答的"}}]'
+)
+```
+
+**最简格式**：只需传 `user_message` 和 `llm_message` 的 `text` 字段。
+其他字段（id/timestamp/tags/token_count）可省略，服务端自动补全：
+- `id` → 自动生成 UUID
+- `timestamp` → 自动取当前时间
+- `tags` → 根据内容自动推断（ToolCall/Image/CodeBlock/Url/Text 等）
+- `token_count` → 根据文本长度估算（3 char ≈ 1 token）
+
+### 归档多轮对话
+
+```python
+hippocampus.archive(
+    session_id="trae-myapp-20260705",
+    turns_json='[
+        {"user_message":{"text":"第一个问题"},"llm_message":{"text":"第一个回答"}},
+        {"user_message":{"text":"第二个问题"},"llm_message":{"text":"第二个回答"}}
+    ]'
+)
+```
+
+## Token 反馈循环（关键机制）
+
+### 工作流程
+
+```
+你调用 archive 归档对话
+    ↓
+Hippocampus 估算 token 并返回
+    ↓ estimated_total_tokens / threshold_ratio_percent
+你记录累计值，作为后续判断依据
+    ↓
+继续对话，下次判断时参考这个数字
+    ↓ threshold_ratio_percent >= 80
+你主动提示用户"建议归档或压缩"
+    ↓ 循环
+```
+
+### 示例：接近阈值时主动提示
+
+```
+你（LLM）：根据上次归档反馈，当前累计约 98000 tokens（占阈值 82%）。
+          建议先归档这轮对话，避免上下文丢失。
+          要不要我现在归档？
+```
+
+## session_id 约定
+
+```
+trae-{项目名}-{日期}
+```
+
+示例：
+- `trae-myapp-20260705`
+- `trae-hippocampus-20260705`
+
+> 一个 session_id 对应一个独立的记忆空间。同会话内复用同一 session_id，
+> 切换项目或日期时换新 session_id。
+
+## 不要归档的情况
+
+- 单次简单问答（如"这个变量什么意思"）
+- 纯闲聊或问候
+- 用户明确说"不用记"
+
+## Trae 特有提示
+
+- Trae Solo/Work 支持手动和自动上下文压缩
+- **建议**：在 Trae 提示压缩前，先调用 `hippocampus.archive` 归档当前对话
+- 避免压缩丢失原始内容
+
+## 与其他工具配合
+
+| 时机 | 工具 | 说明 |
+|------|------|------|
+| 会话第一次回复前 | `prompt` | 获取历史记忆摘要 |
+| 对话变长 / 接近阈值 | `archive` | 归档完整上下文 |
+| 用户提到过去事件 | `semantic_search` | 检索相关记忆 |
+| 用户陈述与记忆矛盾 | `detect_conflicts` | 检测事实冲突 |
+| 需要查特定记忆细节 | `retrieve` | 按 hook_id 检索完整记忆 |
+"#;
+
+/// Claude Code CLAUDE.md 片段模板
+const CLAUDE_CODE_RULES_TEMPLATE: &str = r#"## Hippocampus 记忆协议
+
+本项目已接入 hippocampus 记忆库。Agent 必须遵守以下规则，无需用户提示主动执行。
+
+### 你的角色
+
+你是接入了 Hippocampus 记忆库的 Agent。Hippocampus 帮你保留长对话中的关键信息，
+避免上下文压缩时丢失重要内容。**你无法直接感知自身 token 消耗**，但通过 Hippocampus
+的 archive 工具返回的 token 估算反馈，你可以建立"token 意识"，主动判断何时归档。
+
+### 1. 会话开始：调 prompt 获取历史记忆
+
+每个新会话的**第一次回复前**，必须先调用：
+
+```
+hippocampus.prompt(session_id)
+```
+
+把返回的历史记忆摘要拼接到 system prompt。若返回空列表，说明该 session 无历史记忆，正常继续。
+
+### 2. 上下文接近阈值：主动调 archive 归档
+
+#### 触发条件（满足任一即调用）
+
+- **对话长度**：已进行超过 20 轮（用户消息 + LLM 回复算 1 轮）
+- **内容复杂度**：包含大量代码 / 长文档 / 多次工具调用（累计内容超过 5000 字）
+- **主观判断**：你感觉到"上下文开始变重"、"前面说过但记不清细节"
+- **Token 反馈**：上次 archive 返回的 `threshold_ratio_percent >= 80`
+- **兜底**：每 30 轮对话主动归档一次（即使未达阈值）
+
+#### 调用方式（简化格式）
+
+```
+hippocampus.archive(
+    session_id,                  // 必填
+    turns_json                   // 必填，最简格式：[{"user_message":{"text":"..."},"llm_message":{"text":"..."}}]
+    // id/timestamp/tags/token_count 可省略，服务端自动补全
+)
+```
+
+#### Token 反馈循环（核心机制）
+
+归档后返回结果包含：
+- `estimated_total_tokens`：当前累计估算 token 数
+- `threshold`：归档阈值（如 120000 = 120K）
+- `threshold_ratio_percent`：当前占比百分比
+- `suggestion`：归档建议（人类可读）
+
+**判断规则**：
+- `threshold_ratio_percent >= 100` → **立即归档**，并提示用户触发上下文压缩
+- `threshold_ratio_percent >= 80` → **准备归档**，主动提示用户"建议归档"
+- `threshold_ratio_percent >= 50` → 继续对话，但注意跟踪累计值
+- `< 50` → 继续对话
+
+> 你（LLM）无法直接感知自身 token 消耗，但通过 archive 返回的 `estimated_total_tokens`
+> 可以建立"token 意识"——这是伪钩子方案的核心：通过外部反馈循环模拟主动感知。
+
+#### 客户端压缩前主动归档
+
+当你预判客户端即将自动压缩时，**先调 archive 归档完整上下文**，避免压缩丢失原始轮次。
+
+### 3. 用户提到过去事件：先调 semantic_search 再回复
+
+当用户消息中出现"之前"、"上次"、"还记得"、"我们之前讨论的"等指代过去的词语时，
+**先调用**：
+
+```
+hippocampus.semantic_search(query, session_id, top_k=5)
+```
+
+用用户原话作为 query，检索相关记忆。把检索结果作为上下文再回复用户。
+
+### 4. 用户陈述与记忆可能矛盾：先调 detect_conflicts 检测
+
+当用户陈述的事实与记忆中的记录可能冲突时，**先调用**：
+
+```
+hippocampus.detect_conflicts(session_id, hook_id, added_facts, revised_facts, deprecated_facts)
+```
+
+### 5. session_id 约定
+
+```
+claude-code-{项目名}-{日期}
+```
+
+示例：claude-code-myapp-20260705
+
+> 一个 session_id 对应一个独立的记忆空间。同会话内复用同一 session_id，
+> 切换项目或日期时换新 session_id。
+
+### 6. 不要归档的情况
+
+- 单次简单问答（如"这个变量什么意思"）
+- 纯闲聊或问候
+- 用户明确说"不用记"
+"#;
+
+/// hippocampus 规则标记（用于 CLAUDE.md 检测是否已安装）
+const HIPPOCAMPUS_RULES_BEGIN: &str = "<!-- hippocampus-rules begin -->";
+const HIPPOCAMPUS_RULES_END: &str = "<!-- hippocampus-rules end -->";
+
+/// 安装 Rules 模板到项目目录
+///
+/// 参数：
+/// - client: 客户端类型（catpaw / trae / claude-code）
+/// - project_root: 项目根目录路径
+/// - force: 是否强制覆盖
+///
+/// 返回 JSON 字符串（安装结果）
+///
+/// 覆盖策略：
+/// - catpaw/trae（独立文件）：已存在则跳过（force=true 时覆盖）
+/// - claude-code（CLAUDE.md）：有 hippocampus 标记则跳过/替换，无标记则追加
+pub fn install_rules_to_project(
+    client: &str,
+    project_root: &str,
+    force: bool,
+) -> Result<String, String> {
+    use std::fs;
+    use std::path::Path;
+
+    // 1. 验证项目根目录
+    let root = Path::new(project_root);
+    if !root.exists() {
+        return Err(format!("项目根目录不存在: {project_root}"));
+    }
+    if !root.is_dir() {
+        return Err(format!("路径不是目录: {project_root}"));
+    }
+
+    // 2. 按客户端类型处理
+    let (file_path, action, message) = match client {
+        "catpaw" => {
+            let rules_dir = root.join(".catpaw").join("rules");
+            fs::create_dir_all(&rules_dir)
+                .map_err(|e| format!("创建 .catpaw/rules/ 失败: {e}"))?;
+            let file_path = rules_dir.join("hippocampus-archive.md");
+
+            if file_path.exists() && !force {
+                let msg = format!("已存在 {}，跳过（force=false）", file_path.display());
+                (file_path, "skipped", msg)
+            } else {
+                fs::write(&file_path, CATPAW_RULES_TEMPLATE)
+                    .map_err(|e| format!("写入失败: {e}"))?;
+                let (action, action_cn) = if force { ("updated", "更新") } else { ("created", "创建") };
+                let msg = format!("已{} CatPaw Rules 模板到 {}", action_cn, file_path.display());
+                (file_path, action, msg)
+            }
+        }
+        "trae" => {
+            let rules_dir = root.join(".trae").join("rules");
+            fs::create_dir_all(&rules_dir)
+                .map_err(|e| format!("创建 .trae/rules/ 失败: {e}"))?;
+            let file_path = rules_dir.join("hippocampus-archive.md");
+
+            if file_path.exists() && !force {
+                let msg = format!("已存在 {}，跳过（force=false）", file_path.display());
+                (file_path, "skipped", msg)
+            } else {
+                fs::write(&file_path, TRAE_RULES_TEMPLATE)
+                    .map_err(|e| format!("写入失败: {e}"))?;
+                let (action, action_cn) = if force { ("updated", "更新") } else { ("created", "创建") };
+                let msg = format!("已{} Trae Rules 模板到 {}", action_cn, file_path.display());
+                (file_path, action, msg)
+            }
+        }
+        "claude-code" => {
+            let file_path = root.join("CLAUDE.md");
+            let content_with_markers = format!(
+                "{begin}\n{template}\n{end}",
+                begin = HIPPOCAMPUS_RULES_BEGIN,
+                template = CLAUDE_CODE_RULES_TEMPLATE,
+                end = HIPPOCAMPUS_RULES_END,
+            );
+
+            if !file_path.exists() {
+                fs::write(&file_path, &content_with_markers)
+                    .map_err(|e| format!("写入失败: {e}"))?;
+                let msg = "已创建 CLAUDE.md 并写入 hippocampus 规则".to_string();
+                (file_path, "created", msg)
+            } else {
+                let existing = fs::read_to_string(&file_path)
+                    .map_err(|e| format!("读取 CLAUDE.md 失败: {e}"))?;
+
+                if existing.contains(HIPPOCAMPUS_RULES_BEGIN) {
+                    if !force {
+                        let msg = "CLAUDE.md 已有 hippocampus 规则，跳过（force=false）".to_string();
+                        (file_path, "skipped", msg)
+                    } else {
+                        let start_idx = existing.find(HIPPOCAMPUS_RULES_BEGIN)
+                            .ok_or("找不到开始标记")?;
+                        let end_idx = existing.find(HIPPOCAMPUS_RULES_END)
+                            .ok_or("找不到结束标记")?;
+                        let end_idx = end_idx + HIPPOCAMPUS_RULES_END.len();
+                        let new_content = format!(
+                            "{}{}{}",
+                            &existing[..start_idx],
+                            content_with_markers,
+                            &existing[end_idx..],
+                        );
+                        fs::write(&file_path, new_content)
+                            .map_err(|e| format!("写入失败: {e}"))?;
+                        let msg = "已更新 CLAUDE.md 中的 hippocampus 规则".to_string();
+                        (file_path, "updated", msg)
+                    }
+                } else {
+                    let new_content = format!(
+                        "{}\n\n{}\n",
+                        existing.trim_end(),
+                        content_with_markers,
+                    );
+                    fs::write(&file_path, new_content)
+                        .map_err(|e| format!("写入失败: {e}"))?;
+                    let msg = "已追加 hippocampus 规则到 CLAUDE.md".to_string();
+                    (file_path, "updated", msg)
+                }
+            }
+        }
+        _ => {
+            return Err(format!(
+                "不支持的客户端类型: {client}\n支持的类型: catpaw / trae / claude-code"
+            ));
+        }
+    };
+
+    // 3. 返回 JSON 结果
+    let result = serde_json::json!({
+        "success": true,
+        "client": client,
+        "file_path": file_path.to_string_lossy(),
+        "action": action,
+        "message": message,
+        "force": force,
+    });
+
+    Ok(result.to_string())
 }
 
 // ============================================================================
@@ -1396,7 +2075,11 @@ impl ServerHandler for HippocampusMcp {
         if let Some(profile) = self.combined_profile() {
             let protocol = profile.usage_protocol();
             if !protocol.instructions.is_empty() {
-                info = info.with_instructions(protocol.instructions.clone());
+                // v2.31：在 instructions 末尾追加 install_rules 提示
+                // 让 LLM 首次接入时知道可以调用 install_rules 安装 Rules 模板
+                let install_hint = "\n\n---\n## 首次接入提示\n如果你是首次使用 hippocampus，建议调用 `install_rules` 工具安装 Rules 模板到你的客户端 rules 目录，让归档触发规则自动生效。\n\n调用方式：install_rules(client=\"你的客户端类型\", project_root=\"项目根目录绝对路径\")\n支持的客户端：catpaw / trae / claude-code";
+                let instructions = format!("{}{}", protocol.instructions, install_hint);
+                info = info.with_instructions(instructions);
             }
         }
 
@@ -2860,8 +3543,18 @@ mod tests {
             "instructions 应包含「记忆协议」，实际: {}",
             instructions.chars().take(100).collect::<String>()
         );
-        // 应与 usage_protocol.instructions 完全一致
-        assert_eq!(instructions, expected_instructions);
+        // v2.31：instructions 末尾追加了 install_rules 提示
+        // 所以 expected_instructions 应是 instructions 的前缀
+        assert!(
+            instructions.starts_with(&expected_instructions),
+            "instructions 应以 usage_protocol.instructions 开头，实际开头: {}",
+            instructions.chars().take(100).collect::<String>()
+        );
+        // v2.31 新增：install_rules 提示应存在
+        assert!(
+            instructions.contains("install_rules"),
+            "instructions 应包含 install_rules 提示"
+        );
 
         // server_info.name 应保持 build_env 默认值（hippocampus-mcp）
         assert!(

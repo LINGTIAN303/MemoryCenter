@@ -771,6 +771,11 @@ pub struct BatchDeleteItem {
 /// DELETE /api/v1/sessions/{sid}/memories/batch
 ///
 /// 批量按 hook_id 列表删除记忆文件。单个失败不影响其他条目。
+///
+/// v2.31：改用 `delete_memory_complete`（软删除方案）：
+/// - 删除记忆文件 + 将索引钩子标记为 `FileStatus::Deleted`
+/// - 同步调用 `unindex_hook` 清理 SessionSearchRouter 内存索引
+/// - 避免 semantic_search 返回幽灵记忆 / retrieve 崩溃
 pub async fn batch_delete(
     State(state): State<AppState>,
     Path(sid): Path<String>,
@@ -781,76 +786,66 @@ pub async fn batch_delete(
     }
 
     let storage = create_storage(&state);
-    let retriever = Retriever::new(storage.clone(), &sid, req.project_id);
+    let retriever = Retriever::new(storage.clone(), &sid, req.project_id.clone());
 
-    // 1. 将 hook_id 列表转换为 memory_id 列表（保持对应关系）
-    let mut memory_ids: Vec<(String, Option<String>)> = Vec::with_capacity(req.hook_ids.len());
+    // 1. 查找每个 hook_id 的完整 IndexHook（含 memory_id 和 period）
+    let mut hooks_info: Vec<(String, Option<(String, hippocampus_core::model::ArchivePeriod)> )> =
+        Vec::with_capacity(req.hook_ids.len());
     for hook_id in &req.hook_ids {
-        let mid = retriever.find_memory_id_by_hook(hook_id).await;
-        memory_ids.push((hook_id.clone(), mid));
+        let info = retriever.find_hook_by_id(hook_id).await.map(|h| {
+            (h.memory_id.clone(), h.period)
+        });
+        hooks_info.push((hook_id.clone(), info));
     }
 
-    // 2. 过滤出有效的 memory_id，调用批量删除
-    let valid: Vec<String> = memory_ids
-        .iter()
-        .filter_map(|(_, mid)| mid.clone())
-        .collect();
-
-    let delete_results = if !valid.is_empty() {
-        storage.delete_memories_batch(&valid).await
-    } else {
-        Vec::new()
-    };
-
-    // 3. 构建响应（按原始 hook_id 顺序）
-    let mut mid_to_result: std::collections::HashMap<String, &hippocampus_core::Result<()>> =
-        std::collections::HashMap::new();
-    let mut idx = 0;
-    for (_, mid_opt) in &memory_ids {
-        if let Some(mid) = mid_opt {
-            if idx < delete_results.len() {
-                mid_to_result.insert(mid.clone(), &delete_results[idx]);
-                idx += 1;
+    // 2. 逐条调用 delete_memory_complete（软删除：删文件 + 标记索引）
+    let mut results: Vec<BatchDeleteItem> = Vec::with_capacity(req.hook_ids.len());
+    for (hook_id, info_opt) in &hooks_info {
+        match info_opt {
+            None => {
+                results.push(BatchDeleteItem {
+                    hook_id: hook_id.clone(),
+                    success: false,
+                    error: Some("未找到对应的 memory_id".to_string()),
+                });
             }
-        }
-    }
+            Some((memory_id, period)) => {
+                let r = storage
+                    .delete_memory_complete(
+                        memory_id,
+                        hook_id,
+                        &sid,
+                        req.project_id.as_deref(),
+                        *period,
+                    )
+                    .await;
 
-    let results: Vec<BatchDeleteItem> = memory_ids
-        .iter()
-        .map(|(hook_id, mid_opt)| match mid_opt {
-            None => BatchDeleteItem {
-                hook_id: hook_id.clone(),
-                success: false,
-                error: Some("未找到对应的 memory_id".to_string()),
-            },
-            Some(mid) => {
-                let r = mid_to_result.get(mid);
+                // v2.31：同步清理 SessionSearchRouter 内存索引（即使 storage 删除失败也尝试清理）
+                if let Some(router) = &state.session_search {
+                    router.unindex_hook(&sid, hook_id).await;
+                }
+
                 match r {
-                    Some(Ok(())) => BatchDeleteItem {
+                    Ok(()) => results.push(BatchDeleteItem {
                         hook_id: hook_id.clone(),
                         success: true,
                         error: None,
-                    },
-                    Some(Err(e)) => BatchDeleteItem {
+                    }),
+                    Err(e) => results.push(BatchDeleteItem {
                         hook_id: hook_id.clone(),
                         success: false,
                         error: Some(e.to_string()),
-                    },
-                    None => BatchDeleteItem {
-                        hook_id: hook_id.clone(),
-                        success: false,
-                        error: Some("内部错误：结果缺失".to_string()),
-                    },
+                    }),
                 }
             }
-        })
-        .collect();
+        }
+    }
 
     tracing::info!(
         session = %sid,
         total = results.len(),
         success = results.iter().filter(|r| r.success).count(),
-        "批量删除完成"
+        "批量删除完成（v2.31 软删除：文件删除 + 索引标记 Deleted + 内存索引清理）"
     );
 
     Ok(Json(results))
