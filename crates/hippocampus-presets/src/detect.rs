@@ -74,11 +74,16 @@ impl std::fmt::Display for DetectionSource {
 
 /// Layer 1：从环境变量 `HIPPOCAMPUS_PRESET_AGENT` 显式读取
 ///
-/// 支持的值：AgentFamily::display_name()（如 "Claude Code" / "Trae"）
-/// 大小写敏感（与 AgentFamily::from_str 一致）
+/// 支持的值：AgentFamily::display_name()（如 "Claude Code" / "Trae"），
+/// 大小写不敏感 + 连字符/空格/下划线归一化（v2.30.1 增强）。
+///
+/// 合法输入示例：
+/// - `"Claude Code"` / `"claude-code"` / `"CLAUDE CODE"` / `"ClaudeCode"` / `"claude_code"`
+/// - `"Trae"` / `"trae"` / `"TRAE"`
+/// - `"CatPaw"` / `"cat-paw"` / `"catpaw"` / `"CAT PAW"`
 fn detect_from_explicit_env() -> Option<DetectedAgent> {
     let value = std::env::var("HIPPOCAMPUS_PRESET_AGENT").ok()?;
-    let family = AgentFamily::from_str(&value)?;
+    let family = AgentFamily::from_str_normalized(&value)?;
     Some(DetectedAgent {
         family,
         source: DetectionSource::ExplicitEnv,

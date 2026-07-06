@@ -112,6 +112,30 @@ impl AgentFamily {
         }
     }
 
+    /// 从字符串解析（大小写不敏感 + 连字符/空格/下划线归一化）
+    ///
+    /// 与 [`from_str`](Self::from_str) 互为兄弟方法：
+    /// - `from_str`：精确匹配（大小写敏感，用于内部代码 / 序列化互逆）
+    /// - `from_str_normalized`：容错匹配（用于用户输入 / 环境变量）
+    ///
+    /// ## 归一化规则
+    ///
+    /// lowercase + 去掉空格、连字符、下划线
+    ///
+    /// ## 支持的输入示例
+    ///
+    /// - `"Claude Code"` / `"claude-code"` / `"CLAUDE CODE"` / `"ClaudeCode"` / `"claude_code"` → ClaudeCode
+    /// - `"Trae"` / `"trae"` / `"TRAE"` → Trae
+    /// - `"CatPaw"` / `"cat-paw"` / `"catpaw"` / `"CAT PAW"` → CatPaw
+    ///
+    /// Custom 不参与解析（调用方自行构造 `Custom(String)`）
+    pub fn from_str_normalized(s: &str) -> Option<Self> {
+        let normalized = normalize_agent_name(s.trim());
+        Self::all_builtin().into_iter().find(|f| {
+            normalize_agent_name(f.display_name()) == normalized
+        })
+    }
+
     /// 默认 session ID 前缀（用于按 Agent 隔离记忆）
     ///
     /// 4 主流有专用前缀，其他返回 family 小写名
@@ -166,6 +190,21 @@ impl AgentFamily {
             _ => AgentFingerprint::generic(),
         }
     }
+}
+
+/// 归一化 Agent 名称（v2.30.1 新增）
+///
+/// lowercase + 去掉空格、连字符、下划线，用于 [`AgentFamily::from_str_normalized`]。
+///
+/// 示例：
+/// - `"Claude Code"` → `"claudecode"`
+/// - `"claude-code"` → `"claudecode"`
+/// - `"CatPaw"` → `"catpaw"`
+fn normalize_agent_name(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '-' | '_'))
+        .collect()
 }
 
 /// Agent 客户端识别指纹（v2.30 新增）
@@ -308,6 +347,85 @@ mod tests {
     fn test_from_str_unknown_returns_none() {
         assert!(AgentFamily::from_str("UnknownAgent").is_none());
         assert!(AgentFamily::from_str("").is_none());
+    }
+
+    // ========================================================================
+    // v2.30.1 新增：from_str_normalized 归一化匹配测试
+    // ========================================================================
+
+    #[test]
+    fn test_from_str_normalized_claude_code_variants() {
+        // Claude Code 的多种写法都应识别为 ClaudeCode
+        let variants = [
+            "Claude Code",     // 原样 display_name
+            "claude-code",     // 小写连字符
+            "CLAUDE CODE",     // 全大写空格
+            "ClaudeCode",      // 驼峰无分隔
+            "claude_code",     // 小写下划线
+            "claude code",     // 全小写空格
+            "  Claude-Code  ", // 前后空格 + 连字符（v2.30.1 trim 支持）
+        ];
+        for v in &variants {
+            assert_eq!(
+                AgentFamily::from_str_normalized(v),
+                Some(AgentFamily::ClaudeCode),
+                "from_str_normalized({:?}) 应识别为 ClaudeCode",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_str_normalized_trae_variants() {
+        assert_eq!(AgentFamily::from_str_normalized("Trae"), Some(AgentFamily::Trae));
+        assert_eq!(AgentFamily::from_str_normalized("trae"), Some(AgentFamily::Trae));
+        assert_eq!(AgentFamily::from_str_normalized("TRAE"), Some(AgentFamily::Trae));
+        assert_eq!(AgentFamily::from_str_normalized("Trae-CLI"), None); // 多余字符不匹配
+    }
+
+    #[test]
+    fn test_from_str_normalized_catpaw_variants() {
+        // CatPaw 是非主流 family，但也应支持归一化匹配
+        assert_eq!(AgentFamily::from_str_normalized("CatPaw"), Some(AgentFamily::CatPaw));
+        assert_eq!(AgentFamily::from_str_normalized("cat-paw"), Some(AgentFamily::CatPaw));
+        assert_eq!(AgentFamily::from_str_normalized("catpaw"), Some(AgentFamily::CatPaw));
+        assert_eq!(AgentFamily::from_str_normalized("CAT PAW"), Some(AgentFamily::CatPaw));
+        assert_eq!(AgentFamily::from_str_normalized("cat_paw"), Some(AgentFamily::CatPaw));
+    }
+
+    #[test]
+    fn test_from_str_normalized_all_builtin_roundtrip() {
+        // 所有内置 family 的 display_name 归一化后都应能往返匹配
+        for family in AgentFamily::all_builtin() {
+            let name = family.display_name();
+            assert_eq!(
+                AgentFamily::from_str_normalized(name),
+                Some(family.clone()),
+                "{} 归一化往返失败",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_str_normalized_unknown_returns_none() {
+        assert!(AgentFamily::from_str_normalized("UnknownAgent").is_none());
+        assert!(AgentFamily::from_str_normalized("").is_none());
+        assert!(AgentFamily::from_str_normalized("claude-code-cli").is_none()); // 多余字符
+    }
+
+    #[test]
+    fn test_from_str_and_normalized_consistency() {
+        // from_str 接受的输入，from_str_normalized 也应接受
+        for family in AgentFamily::all_builtin() {
+            let name = family.display_name();
+            assert_eq!(
+                AgentFamily::from_str(name),
+                AgentFamily::from_str_normalized(name),
+                "{} 两个方法结果不一致",
+                name
+            );
+        }
     }
 
     #[test]
