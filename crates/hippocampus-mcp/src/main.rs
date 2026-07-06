@@ -72,12 +72,17 @@ use hippocampus_scenarios::ScenarioProfile;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 
-/// 从环境变量构造冲突检测器（v2.11，v2.13 简化）
+/// 从环境变量构造冲突检测器（v2.11，v2.13 简化，v2.32 返回降级状态）
 ///
 /// - 配置了 `HIPPOCAMPUS_DETECTOR_API_URL` + `API_KEY`：
-///   返回 `HybridDetector`（串联 Heuristic + LLM，合并两份报告）
-/// - 未配置：返回 `HeuristicDetector`（启发式纯算法，无 LLM 依赖）
-fn build_conflict_detector() -> Arc<dyn ConflictDetector> {
+///   返回 `(HybridDetector, "hybrid")`（串联 Heuristic + LLM，合并两份报告）
+/// - 未配置：返回 `(HeuristicDetector, "heuristic")`（启发式纯算法，无 LLM 依赖）
+///
+/// ## 返回
+///
+/// - `Arc<dyn ConflictDetector>`：检测器实例
+/// - `&'static str`：降级状态字符串（`"hybrid"` / `"heuristic"`），供 `RuntimeStatus` 记录
+fn build_conflict_detector() -> (Arc<dyn ConflictDetector>, &'static str) {
     // v2.13：使用 LlmDetectorConfig::from_env() 统一环境变量读取
     let config = match LlmDetectorConfig::from_env() {
         Some(config) => config,
@@ -85,7 +90,7 @@ fn build_conflict_detector() -> Arc<dyn ConflictDetector> {
             tracing::info!(
                 "冲突检测器：未配置 LLM API，使用 HeuristicDetector（启发式纯算法，三维度检测）"
             );
-            return Arc::new(HeuristicDetector::new());
+            return (Arc::new(HeuristicDetector::new()), "heuristic");
         }
     };
 
@@ -99,19 +104,31 @@ fn build_conflict_detector() -> Arc<dyn ConflictDetector> {
     // v2.11：串联 Heuristic + LLM，合并两份报告
     let heuristic: Arc<dyn ConflictDetector> = Arc::new(HeuristicDetector::new());
     let llm: Arc<dyn ConflictDetector> = Arc::new(HttpLlmDetector::new(config));
-    Arc::new(HybridDetector::new(heuristic, llm))
+    (Arc::new(HybridDetector::new(heuristic, llm)), "hybrid")
 }
 
-/// 从环境变量构造 SessionSearchRouter（v2.18 新增）
+/// 从环境变量构造 SessionSearchRouter（v2.18 新增，v2.32 返回降级状态）
 ///
 /// 与 server 端 `build_session_search` 的关键差异：
 /// **MCP 端必须注入 storage 引用**（用 `with_storage`），因为 MCP 进程是
 /// 短生命周期子进程，每次启动后内存索引为空，必须从 storage 懒重建。
 ///
 /// - 配置了 `HIPPOCAMPUS_EMBEDDER_API_URL` + `API_KEY`：
-///   返回注入了 HttpEmbedder 的 SessionSearchRouter（混合检索）
-/// - 未配置：返回仅关键词模式的 SessionSearchRouter（降级，但仍带 storage 懒重建）
-fn build_session_search(storage_root: &Path) -> Option<Arc<hippocampus_search::SessionSearchRouter>> {
+///   返回 `(Some(router), "hybrid", Some(dim))`（混合检索）
+/// - 未配置：返回 `(Some(router), "keyword_only", None)`（降级，但仍带 storage 懒重建）
+///
+/// ## 返回
+///
+/// - `Option<Arc<SessionSearchRouter>>`：路由器实例（当前总返回 Some）
+/// - `&'static str`：降级状态字符串（`"hybrid"` / `"keyword_only"`）
+/// - `Option<usize>`：Embedder 向量维度（仅 hybrid 模式有值）
+fn build_session_search(
+    storage_root: &Path,
+) -> (
+    Option<Arc<hippocampus_search::SessionSearchRouter>>,
+    &'static str,
+    Option<usize>,
+) {
     use hippocampus_core::semantic::Embedder;
     use hippocampus_llm::{EmbedderConfig, HttpEmbedder};
     use hippocampus_search::SessionSearchRouter;
@@ -128,7 +145,7 @@ fn build_session_search(storage_root: &Path) -> Option<Arc<hippocampus_search::S
                 "语义检索：未配置 Embedder API，降级为仅关键词检索（KeywordOnlyRetriever，session 级隔离 + storage 懒重建）"
             );
             let router = SessionSearchRouter::new(None, 0).with_storage(storage);
-            return Some(Arc::new(router));
+            return (Some(Arc::new(router)), "keyword_only", None);
         }
     };
 
@@ -142,10 +159,10 @@ fn build_session_search(storage_root: &Path) -> Option<Arc<hippocampus_search::S
 
     let embedder: Arc<dyn Embedder> = Arc::new(HttpEmbedder::new(embedder_config));
     let router = SessionSearchRouter::new(Some(embedder), dim).with_storage(storage);
-    Some(Arc::new(router))
+    (Some(Arc::new(router)), "hybrid", Some(dim))
 }
 
-/// 从环境变量构造 LLM 摘要生成器（v2.21 批次 8c）
+/// 从环境变量构造 LLM 摘要生成器（v2.21 批次 8c，v2.32 返回降级状态）
 ///
 /// 与 server 端 `build_summary_generator` 行为一致：
 ///
@@ -157,9 +174,14 @@ fn build_session_search(storage_root: &Path) -> Option<Arc<hippocampus_search::S
 /// | `HIPPOCAMPUS_GENERATOR_TIMEOUT` | 超时秒数 | `60` |
 /// | `HIPPOCAMPUS_GENERATOR_MAX_TOKENS` | LLM 最大输出 token | `500` |
 ///
-/// - 未配置 `API_URL`：返回 None（使用启发式 `Summary::from_title`）
-/// - 配置完整：返回 `HttpSummaryGenerator`（归档时生成结构化摘要）
-fn build_summary_generator() -> Option<Arc<dyn hippocampus_core::generate::SummaryGenerator>> {
+/// ## 返回
+///
+/// - `Option<Arc<dyn SummaryGenerator>>`：生成器实例（None 表示使用启发式）
+/// - `&'static str`：降级状态字符串（`"llm"` / `"heuristic"`）
+fn build_summary_generator() -> (
+    Option<Arc<dyn hippocampus_core::generate::SummaryGenerator>>,
+    &'static str,
+) {
     use hippocampus_core::generate::LlmGeneratorConfig;
     use hippocampus_llm::HttpSummaryGenerator;
 
@@ -169,7 +191,7 @@ fn build_summary_generator() -> Option<Arc<dyn hippocampus_core::generate::Summa
             tracing::info!(
                 "摘要生成器：未配置 LLM API（HIPPOCAMPUS_GENERATOR_API_URL），使用启发式 Summary::from_title"
             );
-            return None;
+            return (None, "heuristic");
         }
     };
 
@@ -180,7 +202,38 @@ fn build_summary_generator() -> Option<Arc<dyn hippocampus_core::generate::Summa
         "摘要生成器：LLM API 已配置，启用 HttpSummaryGenerator（归档时生成结构化摘要）"
     );
 
-    Some(Arc::new(HttpSummaryGenerator::new(config)))
+    (Some(Arc::new(HttpSummaryGenerator::new(config))), "llm")
+}
+
+/// 从环境变量构造场景识别器（v2.33 新增）
+///
+/// 复用 `HIPPOCAMPUS_DETECTOR_*` 环境变量（与冲突检测器、摘要生成器共享 LLM 配置）：
+///
+/// - 配置了 `HIPPOCAMPUS_DETECTOR_API_URL` + `API_KEY`：
+///   返回关键词 + LLM 兜底的 HybridScenarioDetector
+/// - 未配置：返回仅关键词模式的 HybridScenarioDetector
+fn build_scenario_detector() -> Arc<hippocampus_presets::HybridScenarioDetector> {
+    use hippocampus_llm::LlmDetectorConfig;
+    use hippocampus_presets::scenario_detect::HttpScenarioDetector;
+
+    let llm_config = match LlmDetectorConfig::from_env() {
+        Some(config) => {
+            tracing::info!(
+                api_url = %config.api_url,
+                model = %config.model,
+                "场景识别器：LLM API 已配置，启用关键词 + LLM 兜底"
+            );
+            Some(Arc::new(HttpScenarioDetector::new(config)))
+        }
+        None => {
+            tracing::info!(
+                "场景识别器：未配置 LLM API，仅用关键词规则识别（7 场景 × 15 关键词）"
+            );
+            None
+        }
+    };
+
+    Arc::new(hippocampus_presets::HybridScenarioDetector::new(llm_config))
 }
 
 /// 启动时识别 Agent 客户端 + 构建 CombinedProfile（v2.30 新增）
@@ -335,21 +388,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::env::var("HIPPOCAMPUS_ROOT").unwrap_or_else(|_| "./data".to_string()),
     );
 
-    // v2.11：构造冲突检测器并注入
-    let conflict_detector = build_conflict_detector();
+    // v2.11：构造冲突检测器并注入（v2.32：同时获取降级状态）
+    let (conflict_detector, detector_status) = build_conflict_detector();
 
-    // v2.18：构造 SessionSearchRouter（注入 storage 支持懒重建）
-    let session_search = build_session_search(&storage_root);
+    // v2.18：构造 SessionSearchRouter（注入 storage 支持懒重建，v2.32 同时获取降级状态）
+    let (session_search, search_status, embedder_dim) = build_session_search(&storage_root);
 
-    // v2.21 批次 8c：构造 LLM 摘要生成器（环境变量驱动：未配置时返回 None，使用启发式）
-    let summary_generator = build_summary_generator();
+    // v2.21 批次 8c：构造 LLM 摘要生成器（v2.32：同时获取降级状态）
+    let (summary_generator, generator_status) = build_summary_generator();
 
     // v2.30：启动时识别 Agent 客户端 + 构建 CombinedProfile（注入行为契约）
     let combined_profile = build_combined_profile();
 
+    // v2.32：汇总降级状态快照（供 get_config 工具查询）
+    let runtime_status = hippocampus_mcp::RuntimeStatus {
+        conflict_detector: detector_status,
+        semantic_search: search_status,
+        summary_generator: generator_status,
+        embedder_dim,
+    };
+
     tracing::info!(
         root = %storage_root.display(),
         has_combined_profile = combined_profile.is_some(),
+        conflict_detector = runtime_status.conflict_detector,
+        semantic_search = runtime_status.semantic_search,
+        summary_generator = runtime_status.summary_generator,
         "启动 Hippocampus MCP server (stdio 传输)"
     );
 
@@ -360,7 +424,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .with_session_search(session_search)
     .with_summary_generator(summary_generator)
+    .with_scenario_detector(Some(build_scenario_detector()))
     .with_combined_profile(combined_profile)
+    .with_runtime_status(runtime_status)
     .serve(stdio())
     .await?;
 

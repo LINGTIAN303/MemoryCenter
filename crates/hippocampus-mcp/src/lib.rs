@@ -59,6 +59,8 @@ use hippocampus_core::storage::{LocalStorage, Storage};
 use hippocampus_search::SessionSearchRouter;
 // v2.30：启动时识别 Agent 客户端 + 注入 CombinedProfile（行为契约）
 use hippocampus_presets::CombinedProfile;
+// v2.33：场景识别器（关键词 + LLM 兜底）
+use hippocampus_presets::HybridScenarioDetector;
 
 /// MCP server 主结构体
 #[derive(Clone)]
@@ -85,6 +87,11 @@ pub struct HippocampusMcp {
     /// - `None`：使用启发式 `Summary::from_title`（首条消息前 80 字符，向后兼容）
     /// - LLM 调用失败：降级为启发式，归档主流程不中断
     summary_generator: Option<Arc<dyn SummaryGenerator>>,
+    /// 可注入的场景识别器（v2.33 新增）
+    ///
+    /// - `Some`：`archive` 工具首次归档时调用，识别场景写入 session_meta
+    /// - `None`：仅用 Agent 默认场景（向后兼容，与 v2.32 行为一致）
+    scenario_detector: Option<Arc<HybridScenarioDetector>>,
     /// 启动时识别 + 注入的 CombinedProfile（v2.30 新增）
     ///
     /// 由 `main()` 调用 `detect_agent_client()` + `PresetBuilder::build()` 生成，
@@ -94,6 +101,11 @@ pub struct HippocampusMcp {
     ///   后续 tool 可读取 `usage_protocol.instructions` 注入 server_info.description
     /// - `None`：未识别（Custom/降级），tool 行为与 v2.29 一致（向后兼容）
     combined_profile: Option<CombinedProfile>,
+    /// 运行时降级状态快照（v2.32 新增）
+    ///
+    /// 由 `main()` 启动时一次性记录，描述 conflict_detector / semantic_search /
+    /// summary_generator 的降级模式。`get_config` 工具读取此字段返回给 LLM。
+    runtime_status: RuntimeStatus,
 }
 
 impl HippocampusMcp {
@@ -106,7 +118,9 @@ impl HippocampusMcp {
             conflict_detector: None,
             session_search: None,
             summary_generator: None,
+            scenario_detector: None,
             combined_profile: None,
+            runtime_status: RuntimeStatus::default(),
         }
     }
 
@@ -128,7 +142,9 @@ impl HippocampusMcp {
             conflict_detector,
             session_search: None,
             summary_generator: None,
+            scenario_detector: None,
             combined_profile: None,
+            runtime_status: RuntimeStatus::default(),
         }
     }
 
@@ -184,6 +200,26 @@ impl HippocampusMcp {
         self
     }
 
+    /// 链式注入场景识别器（v2.33 新增 builder 模式）
+    ///
+    /// 启用后 `archive` 工具首次归档时调用识别器，识别场景写入 session_meta。
+    /// 未注入时使用 Agent 默认场景（向后兼容）。
+    ///
+    /// ## 使用示例
+    ///
+    /// ```rust,ignore
+    /// let detector = Arc::new(HybridScenarioDetector::new(Some(llm)));
+    /// let mcp = HippocampusMcp::with_conflict_detector(root, detector_conflict)
+    ///     .with_scenario_detector(Some(detector));
+    /// ```
+    pub fn with_scenario_detector(
+        mut self,
+        scenario_detector: Option<Arc<HybridScenarioDetector>>,
+    ) -> Self {
+        self.scenario_detector = scenario_detector;
+        self
+    }
+
     /// 链式注入启动时识别的 CombinedProfile（v2.30 builder 模式）
     ///
     /// 由 `main()` 在启动时调用 `detect_agent_client()` + `PresetBuilder::build()`
@@ -224,6 +260,35 @@ impl HippocampusMcp {
         self
     }
 
+    /// 链式注入运行时降级状态快照（v2.32 builder 模式）
+    ///
+    /// 由 `main.rs` 启动时调用，把 `build_*` 函数产出的状态字符串汇总为
+    /// `RuntimeStatus` 注入。`get_config` 工具读取此字段返回给 LLM。
+    ///
+    /// ## 使用示例
+    ///
+    /// ```rust,ignore
+    /// let mcp = HippocampusMcp::with_conflict_detector(root, detector)
+    ///     .with_session_search(search)
+    ///     .with_summary_generator(generator)
+    ///     .with_combined_profile(profile)
+    ///     .with_runtime_status(RuntimeStatus {
+    ///         conflict_detector: "hybrid",
+    ///         semantic_search: "hybrid",
+    ///         summary_generator: "llm",
+    ///         embedder_dim: Some(3072),
+    ///     });
+    /// ```
+    ///
+    /// ## 参数
+    ///
+    /// - `runtime_status`：降级状态快照，未调用时使用 `RuntimeStatus::default()`
+    ///   （全降级模式：heuristic + keyword_only + heuristic）
+    pub fn with_runtime_status(mut self, runtime_status: RuntimeStatus) -> Self {
+        self.runtime_status = runtime_status;
+        self
+    }
+
     /// 获取启动时识别 + 注入的 CombinedProfile（v2.30）
     ///
     /// 返回 `Option<&CombinedProfile>`：
@@ -246,6 +311,54 @@ impl HippocampusMcp {
         match &self.conflict_detector {
             Some(d) => Arc::clone(d),
             None => Arc::new(hippocampus_core::heuristic::HeuristicDetector::new()),
+        }
+    }
+
+    /// 获取运行时降级状态快照（v2.32 新增）
+    ///
+    /// 返回启动时记录的组件降级状态，供 `get_config` 工具查询。
+    pub fn runtime_status(&self) -> &RuntimeStatus {
+        &self.runtime_status
+    }
+}
+
+/// 运行时降级状态快照（v2.32 新增）
+///
+/// 在 MCP server 启动时由 `main.rs` 的 `build_*` 函数一次性记录，
+/// 描述各组件的降级模式。`get_config` 工具读取此快照返回给 LLM，
+/// 让 LLM 知道：
+/// - `semantic_search` 是否降级为 keyword_only（避免盲目调用后才发现失败）
+/// - `conflict_detector` 是否含 LLM 检测（影响冲突检测精度预期）
+/// - `summary_generator` 是否使用 LLM（影响归档摘要质量预期）
+///
+/// ## 字段语义
+///
+/// | 字段 | 可选值 | 含义 |
+/// |------|--------|------|
+/// | `conflict_detector` | `heuristic` / `hybrid` / `disabled` | 启发式纯算法 / 串联 Heuristic+LLM / 未注入 |
+/// | `semantic_search` | `hybrid` / `keyword_only` / `disabled` | 关键词+向量融合 / 仅 BM25 / 未注入 |
+/// | `summary_generator` | `llm` / `heuristic` | LLM 生成结构化摘要 / 启发式首条消息截取 |
+/// | `embedder_dim` | `Option<usize>` | 向量维度（仅 hybrid 模式有值） |
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RuntimeStatus {
+    /// 冲突检测器模式
+    pub conflict_detector: &'static str,
+    /// 语义检索模式
+    pub semantic_search: &'static str,
+    /// 摘要生成器模式
+    pub summary_generator: &'static str,
+    /// Embedder 向量维度（仅 `semantic_search="hybrid"` 时有值）
+    pub embedder_dim: Option<usize>,
+}
+
+impl Default for RuntimeStatus {
+    fn default() -> Self {
+        // 默认全降级（未注入任何 LLM/embedder 组件）
+        Self {
+            conflict_detector: "heuristic",
+            semantic_search: "keyword_only",
+            summary_generator: "heuristic",
+            embedder_dim: None,
         }
     }
 }
@@ -546,6 +659,21 @@ struct PresetBuildParams {
 /// 空参数（用于无参数 tool，如 preset_list_*）
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 struct NoParams {}
+
+/// get_config tool 参数（v2.32 新增）
+///
+/// 查询当前 MCP 服务的运行时配置快照。支持 4 种 scope：
+/// - `runtime`：归档阈值、session_prefix、storage_root（脱敏）
+/// - `preset`：Agent family、scenario、评分权重、检索策略、启用技能
+/// - `degraded`：冲突检测器/语义检索/摘要生成器的降级模式
+/// - `all`：以上全部（默认）
+#[derive(Deserialize, schemars::JsonSchema)]
+struct GetConfigParams {
+    /// 查询范围（可选，默认 "all"）
+    #[schemars(description = "查询范围：runtime=归档阈值/session前缀/存储目录；preset=Agent/scenario/评分权重/检索策略/启用技能；degraded=各组件降级模式（heuristic/hybrid/keyword_only/llm）；all=全部（默认）。建议先调 all 了解全貌，后续按需查具体 scope 减少 token 占用。")]
+    #[serde(default)]
+    scope: Option<String>,
+}
 
 /// update_project_memory tool 参数（v2.31 动手点 4）
 ///
@@ -1635,6 +1763,162 @@ impl HippocampusMcp {
             .map_err(|e| McpError::internal_error(e, None))
     }
 
+    /// 查询当前 MCP 服务的运行时配置快照（v2.32 新增）
+    ///
+    /// 让 LLM / 客户端在运行时查询当前生效配置，避免"瞎猜阈值"或"盲目调用降级工具"。
+    /// 核心价值：暴露降级状态，让 LLM 知道 semantic_search 是否为 keyword_only 模式、
+    /// summary_generator 是否使用 LLM 等，从而调整调用策略。
+    #[tool(description = "查询当前 MCP 服务的运行时配置快照（只读）。【何时调用】(1)会话开始时调 all 了解全貌；(2)调 semantic_search 前查 degraded 确认是否 keyword_only 降级；(3)判断归档节奏时查 runtime 看阈值。\
+     \
+     【scope=runtime】返回 archive_threshold（归档阈值 token 数）/ force_truncate_limit（强制截断上限=1.5×阈值）/ session_prefix（session_id 派生前缀）/ storage_root（脱敏，仅最后一级目录名）。\
+     \
+     【scope=preset】返回 agent_family（如 Trae/Cursor/ClaudeCode/Codex/Custom）/ scenario（如 coding/daily/writing）/ score_weights（评分权重）/ retrieval_strategy（检索策略）/ summary_focus（摘要重点）/ enabled_skills（已启用技能列表）。未识别 Agent 时 agent_family=Custom，preset 字段为 null。\
+     \
+     【scope=degraded】返回 conflict_detector（heuristic=启发式纯算法 / hybrid=串联Heuristic+LLM）/ semantic_search（hybrid=关键词+向量融合 / keyword_only=仅BM25）/ summary_generator（llm=LLM生成结构化摘要 / heuristic=首条消息截取）/ embedder_dim（向量维度，仅 hybrid 有值）。\
+     \
+     【scope=all】返回以上全部（默认）。")]
+    async fn get_config(
+        &self,
+        Parameters(params): Parameters<GetConfigParams>,
+    ) -> Result<String, McpError> {
+        let scope = params.scope.as_deref().unwrap_or("all").to_lowercase();
+        let include_runtime = matches!(scope.as_str(), "runtime" | "all");
+        let include_preset = matches!(scope.as_str(), "preset" | "all");
+        let include_degraded = matches!(scope.as_str(), "degraded" | "all");
+
+        // 校验 scope 合法性
+        if !matches!(scope.as_str(), "runtime" | "preset" | "degraded" | "all") {
+            return Err(McpError::invalid_params(
+                format!(
+                    "scope 参数非法：'{scope}'\n\
+                     合法值：runtime / preset / degraded / all（默认）\n\n\
+                     - runtime：归档阈值、session_prefix、storage_root（脱敏）\n\
+                     - preset：Agent family、scenario、评分权重、检索策略、启用技能\n\
+                     - degraded：各组件降级模式\n\
+                     - all：以上全部"
+                ),
+                None,
+            ));
+        }
+
+        let mut result = serde_json::json!({
+            "scope": scope,
+        });
+
+        // runtime：运行时参数
+        if include_runtime {
+            // 归档阈值：优先从 CombinedProfile 读取，未识别时用默认值
+            let (archive_threshold, force_truncate_limit) = if let Some(profile) = self.combined_profile() {
+                let threshold = profile.archive_threshold();
+                (threshold, threshold * 3 / 2)
+            } else {
+                // 未识别 Agent：使用 ArchiveConfig::default() 的值
+                let default_config = ArchiveConfig::default();
+                (default_config.token_threshold, default_config.force_truncate_limit)
+            };
+
+            // session_prefix：从 CombinedProfile 读取
+            let session_prefix = self.combined_profile()
+                .and_then(|p| p.session_prefix().map(|s| s.to_string()));
+
+            // storage_root 脱敏：只返回最后一级目录名
+            let storage_root_name = self.storage_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+
+            result["runtime"] = serde_json::json!({
+                "archive_threshold": archive_threshold,
+                "force_truncate_limit": force_truncate_limit,
+                "session_prefix": session_prefix,
+                "storage_root_dir": storage_root_name,
+            });
+        }
+
+        // preset：预设配置（来自 CombinedProfile）
+        if include_preset {
+            let preset_json = if let Some(profile) = self.combined_profile() {
+                // agent_family：从 profile.agent 推导
+                let agent_family = profile.agent
+                    .as_ref()
+                    .map(|a| format!("{:?}", a.family))
+                    .unwrap_or_else(|| "Custom".to_string());
+
+                // scenario + score_weights + retrieval_strategy + summary_focus
+                // 直接序列化 ScenarioProfile 的相关字段（避免字段名硬编码出错）
+                let (scenario, score_weights, retrieval_strategy, summary_focus) =
+                    if let Some(s) = profile.scenario.as_ref() {
+                        (
+                            Some(format!("{:?}", s.scenario)),
+                            serde_json::to_value(&s.score_weights).ok(),
+                            serde_json::to_value(&s.retrieval_strategy).ok(),
+                            serde_json::to_value(&s.summary_focus).ok(),
+                        )
+                    } else {
+                        (None, None, None, None)
+                    };
+
+                // enabled_skills
+                let enabled_skills: Vec<_> = profile.skills
+                    .iter()
+                    .filter(|s| s.enabled)
+                    .map(|s| s.skill.display_name().to_string())
+                    .collect();
+
+                serde_json::json!({
+                    "agent_family": agent_family,
+                    "scenario": scenario,
+                    "score_weights": score_weights,
+                    "retrieval_strategy": retrieval_strategy,
+                    "summary_focus": summary_focus,
+                    "enabled_skills": enabled_skills,
+                    "has_combined_profile": true,
+                })
+            } else {
+                serde_json::json!({
+                    "agent_family": "Custom",
+                    "has_combined_profile": false,
+                    "note": "未识别 Agent 客户端，preset 未注入（向后兼容 v2.29）",
+                })
+            };
+            result["preset"] = preset_json;
+        }
+
+        // degraded：降级状态
+        if include_degraded {
+            let status = &self.runtime_status;
+            result["degraded"] = serde_json::json!({
+                "conflict_detector": status.conflict_detector,
+                "semantic_search": status.semantic_search,
+                "summary_generator": status.summary_generator,
+                "embedder_dim": status.embedder_dim,
+                // 附加可读说明
+                "notes": {
+                    "conflict_detector": match status.conflict_detector {
+                        "heuristic" => "启发式纯算法（无 LLM 依赖，精度较低）",
+                        "hybrid" => "串联 Heuristic + LLM（精度较高，消耗 token）",
+                        "disabled" => "未注入检测器",
+                        _ => "未知",
+                    },
+                    "semantic_search": match status.semantic_search {
+                        "keyword_only" => "仅 BM25 关键词检索（无向量，语义匹配能力弱）",
+                        "hybrid" => "关键词 + 向量融合（RRF 融合，语义匹配能力强）",
+                        "disabled" => "未注入 SessionSearchRouter",
+                        _ => "未知",
+                    },
+                    "summary_generator": match status.summary_generator {
+                        "heuristic" => "启发式首条消息截取（摘要质量较低）",
+                        "llm" => "LLM 生成结构化摘要（title + abstract + key_facts + key_entities）",
+                        _ => "未知",
+                    },
+                },
+            });
+        }
+
+        Ok(result.to_string())
+    }
+
     // ========================================================================
     // v2.31 动手点 4：project_memory.md 反向写入
     // ========================================================================
@@ -2518,7 +2802,9 @@ impl ServerHandler for HippocampusMcp {
                 // v2.31：在 instructions 末尾追加 install_rules 提示
                 // 让 LLM 首次接入时知道可以调用 install_rules 安装 Rules 模板
                 let install_hint = "\n\n---\n## 首次接入提示\n如果你是首次使用 hippocampus，建议调用 `install_rules` 工具安装 Rules 模板到你的客户端 rules 目录，让归档触发规则自动生效。\n\n调用方式：install_rules(client=\"你的客户端类型\", project_root=\"项目根目录绝对路径\")\n支持的客户端：catpaw / trae / claude-code";
-                let instructions = format!("{}{}", protocol.instructions, install_hint);
+                // v2.32：追加 get_config 提示，让 LLM 启动即知道可查询运行时配置
+                let get_config_hint = "\n\n---\n## 运行时配置查询\n会话开始时建议先调用 `get_config(scope=\"all\")` 了解当前生效配置，包括：\n- 归档阈值（archive_threshold）和 session_id 前缀\n- Agent 类型、scenario、评分权重、检索策略\n- **各组件降级状态**（重要）：semantic_search 是否为 keyword_only 降级、summary_generator 是否使用 LLM 等\n\n调 semantic_search 前建议先查 scope=degraded 确认检索模式，避免盲目调用降级工具。";
+                let instructions = format!("{}{}{}", protocol.instructions, install_hint, get_config_hint);
                 info = info.with_instructions(instructions);
             }
         }
@@ -3630,6 +3916,145 @@ mod tests {
         // 至少有一个是家族默认
         let models = v["models"].as_array().unwrap();
         assert!(models.iter().any(|m| m["is_default"] == true));
+    }
+
+    // ========================================================================
+    // v2.32：get_config 工具测试
+    // ========================================================================
+
+    /// 创建带完整 CombinedProfile + RuntimeStatus 的 MCP 实例（get_config 测试用）
+    fn make_mcp_with_full_profile(tmpdir: &TempDir) -> HippocampusMcp {
+        use hippocampus_agents::{AgentFamily, AgentProfile};
+        use hippocampus_presets::PresetBuilder;
+        use hippocampus_scenarios::{Scenario, ScenarioProfile};
+
+        let agent = AgentProfile::from_family(AgentFamily::Trae);
+        let scenario = ScenarioProfile::from_scenario(Scenario::Coding);
+        let combined = PresetBuilder::new()
+            .with_agent(agent)
+            .with_scenario(scenario)
+            .build()
+            .expect("PresetBuilder 构建失败");
+
+        let status = RuntimeStatus {
+            conflict_detector: "hybrid",
+            semantic_search: "hybrid",
+            summary_generator: "llm",
+            embedder_dim: Some(3072),
+        };
+
+        HippocampusMcp::with_conflict_detector(tmpdir.path().to_path_buf(), None)
+            .with_combined_profile(Some(combined))
+            .with_runtime_status(status)
+    }
+
+    #[tokio::test]
+    async fn test_get_config_scope_all() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp_with_full_profile(&tmpdir);
+        let params = Parameters(GetConfigParams { scope: None }); // 默认 all
+        let result = mcp.get_config(params).await.unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+
+        // scope 默认 all
+        assert_eq!(v["scope"], "all");
+        // 三个 section 都应存在
+        assert!(v.get("runtime").is_some(), "runtime section 应存在");
+        assert!(v.get("preset").is_some(), "preset section 应存在");
+        assert!(v.get("degraded").is_some(), "degraded section 应存在");
+
+        // runtime：应包含归档阈值（Coding 场景 = 500_000）
+        assert_eq!(v["runtime"]["archive_threshold"], 500_000);
+        assert_eq!(v["runtime"]["force_truncate_limit"], 750_000); // 500_000 * 3 / 2
+        assert_eq!(v["runtime"]["session_prefix"], "trae");
+        // storage_root_dir 应为临时目录最后一级（非完整路径）
+        let storage_dir = v["runtime"]["storage_root_dir"].as_str().unwrap();
+        assert!(!storage_dir.contains('\\') && !storage_dir.contains('/'),
+            "storage_root_dir 应脱敏（仅最后一级目录名），实际: {storage_dir}");
+
+        // preset：应识别为 Trae + Coding
+        assert_eq!(v["preset"]["agent_family"], "Trae");
+        assert_eq!(v["preset"]["scenario"], "Coding");
+        assert_eq!(v["preset"]["has_combined_profile"], true);
+        assert!(v["preset"]["score_weights"].is_object());
+        assert!(v["preset"]["retrieval_strategy"].is_object());
+        assert!(v["preset"]["summary_focus"].is_string());
+
+        // degraded：应反映注入的降级状态
+        assert_eq!(v["degraded"]["conflict_detector"], "hybrid");
+        assert_eq!(v["degraded"]["semantic_search"], "hybrid");
+        assert_eq!(v["degraded"]["summary_generator"], "llm");
+        assert_eq!(v["degraded"]["embedder_dim"], 3072);
+        // notes 应包含可读说明
+        assert!(v["degraded"]["notes"]["semantic_search"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_get_config_scope_runtime_only() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp_with_full_profile(&tmpdir);
+        let params = Parameters(GetConfigParams { scope: Some("runtime".into()) });
+        let result = mcp.get_config(params).await.unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(v["scope"], "runtime");
+        assert!(v.get("runtime").is_some());
+        // 其他 section 不应存在
+        assert!(v.get("preset").is_none(), "scope=runtime 时不应返回 preset");
+        assert!(v.get("degraded").is_none(), "scope=runtime 时不应返回 degraded");
+    }
+
+    #[tokio::test]
+    async fn test_get_config_scope_degraded_only() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp_with_full_profile(&tmpdir);
+        let params = Parameters(GetConfigParams { scope: Some("degraded".into()) });
+        let result = mcp.get_config(params).await.unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(v["scope"], "degraded");
+        assert!(v.get("degraded").is_some());
+        assert!(v.get("runtime").is_none());
+        assert!(v.get("preset").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_config_no_profile_defaults() {
+        // 未注入 CombinedProfile：应返回默认值 + Custom
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmpdir); // 无 profile，无 runtime_status（使用默认）
+        let params = Parameters(GetConfigParams { scope: Some("all".into()) });
+        let result = mcp.get_config(params).await.unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+
+        // runtime：未识别时用默认值（400_000）
+        assert_eq!(v["runtime"]["archive_threshold"], 400_000);
+        assert_eq!(v["runtime"]["force_truncate_limit"], 600_000);
+        assert!(v["runtime"]["session_prefix"].is_null());
+
+        // preset：未识别
+        assert_eq!(v["preset"]["agent_family"], "Custom");
+        assert_eq!(v["preset"]["has_combined_profile"], false);
+
+        // degraded：默认全降级
+        assert_eq!(v["degraded"]["conflict_detector"], "heuristic");
+        assert_eq!(v["degraded"]["semantic_search"], "keyword_only");
+        assert_eq!(v["degraded"]["summary_generator"], "heuristic");
+        assert!(v["degraded"]["embedder_dim"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_get_config_invalid_scope_returns_error() {
+        let tmpdir = TempDir::new().unwrap();
+        let mcp = make_mcp(&tmpdir);
+        let params = Parameters(GetConfigParams { scope: Some("invalid".into()) });
+        let result = mcp.get_config(params).await;
+        assert!(result.is_err(), "非法 scope 应返回错误");
+        let err = result.unwrap_err();
+        // MCP 错误应为 invalid_params
+        assert!(format!("{err:?}").to_lowercase().contains("invalidparams")
+            || format!("{err}").contains("scope 参数非法"),
+            "错误信息应提示 scope 非法");
     }
 
     #[tokio::test]
