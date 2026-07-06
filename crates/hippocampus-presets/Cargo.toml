@@ -16,7 +16,11 @@ hippocampus-windows = { path = "../hippocampus-windows", version = "0.1.0" }
 hippocampus-agents = { path = "../hippocampus-agents", version = "0.1.0" }
 hippocampus-skills = { path = "../hippocampus-skills", version = "0.1.0" }
 hippocampus-llm = { path = "../hippocampus-llm", version = "0.1.0" }
+# v2.33：HttpScenarioDetector 需要 reqwest::Client 调用 LLM API
+reqwest = { version = "0.12", features = ["json"] }
 
 [dev-dependencies]
 chrono = { workspace = true }
 uuid = { workspace = true }
+# v2.33：HttpScenarioDetector 测试需要 #[tokio::test] 宏
+tokio = { version = "1.0", features = ["rt", "macros"] }

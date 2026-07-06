@@ -29,8 +29,12 @@
 //! - **失败降级**：识别失败永不阻塞 archive，降级到 Agent 默认场景
 //! - **跨进程持久**：识别结果写入 `sessions/{sid}/meta.json`
 
+use crate::builder::scenario_from_str;
 use hippocampus_core::model::MessageTurn;
+use hippocampus_llm::LlmDetectorConfig;
 use hippocampus_scenarios::Scenario;
+// Arc 暂未在本文件直接使用，Task 8 的 HybridScenarioDetector 会以 Arc<HttpScenarioDetector> 形态注入
+#[allow(unused_imports)]
 use std::sync::Arc;
 
 // ============================================================================
@@ -115,17 +119,11 @@ impl DetectionResult {
 /// - `>= 0.6` 算高置信，直接采用
 /// - `< 0.6` 触发 LLM 兜底
 /// - 全部零命中 → 返回 None
-pub struct KeywordScenarioDetector {
-    // 预留：后续 HybridScenarioDetector 会注入 LLM detector
-    #[allow(dead_code)]
-    placeholder: Arc<()>,
-}
+pub struct KeywordScenarioDetector;
 
 impl KeywordScenarioDetector {
     pub fn new() -> Self {
-        Self {
-            placeholder: Arc::new(()),
-        }
+        Self
     }
 
     /// 从对话轮次提取文本（拼接 user_message.text + llm_message.text）
@@ -191,6 +189,202 @@ impl KeywordScenarioDetector {
 impl Default for KeywordScenarioDetector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ============================================================================
+// HttpScenarioDetector
+// ============================================================================
+
+/// HTTP LLM 场景识别器
+///
+/// 复用 `LlmDetectorConfig`（同 `HIPPOCAMPUS_DETECTOR_*` 环境变量前缀），
+/// 调用 OpenAI 兼容 API 推断对话场景。
+///
+/// ## Prompt 策略
+///
+/// 要求 LLM 严格返回 JSON：`{"scenario": "coding", "reason": "..."}`
+///
+/// ## 降级策略
+///
+/// - 未配置 API URL（config.api_url 为空）：返回 None
+/// - 网络错误 / 超时 / API 错误：返回 None
+/// - JSON 解析失败：返回 None
+/// - 场景标签不在 7 个内置场景中：视为 `Custom(s)`
+pub struct HttpScenarioDetector {
+    config: LlmDetectorConfig,
+    client: reqwest::Client,
+}
+
+impl HttpScenarioDetector {
+    /// 创建新的 LLM 场景识别器
+    pub fn new(config: LlmDetectorConfig) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { config, client }
+    }
+
+    /// 从对话轮次提取文本（前 N 轮，默认 10 轮）
+    fn build_conversation_summary(turns: &[MessageTurn], max_turns: usize) -> String {
+        let take = turns.len().min(max_turns);
+        let mut summary = String::new();
+        for (i, turn) in turns.iter().take(take).enumerate() {
+            if let Some(t) = &turn.user_message.text {
+                summary.push_str(&format!("轮次 {} 用户: {}\n", i + 1, truncate(t, 200)));
+            }
+            if let Some(t) = &turn.llm_message.text {
+                summary.push_str(&format!("轮次 {} 助手: {}\n", i + 1, truncate(t, 200)));
+            }
+        }
+        summary
+    }
+
+    /// 构造 LLM prompt
+    fn build_prompt(conversation_summary: &str) -> String {
+        format!(
+            r#"你是一个场景识别器。请分析以下对话内容，判断属于哪个场景。
+
+## 可选场景标签
+
+- coding: 编码场景（编程/调试/架构设计/code review）
+- writing: 写作场景（文章/文档/创意写作）
+- research: 科研场景（论文/实验/数据分析）
+- daily: 日常场景（闲聊/咨询/生活）
+- finance: 金融场景（交易/投资/风险分析）
+- design: 设计场景（UI/UX/视觉/产品设计）
+- officework: 工作场景（会议/文档/项目协作）
+
+## 对话摘要（前 10 轮）
+
+{conversation_summary}
+
+## 输出要求
+
+请只返回 JSON，不要包含任何解释或 markdown 标记。格式如下：
+
+{{"scenario": "coding", "reason": "对话涉及 Rust 代码实现"}}
+
+若无法判断，返回：{{"scenario": "daily", "reason": "无明显场景特征"}}"#,
+            conversation_summary = conversation_summary
+        )
+    }
+
+    /// 解析 LLM 返回的 JSON，提取场景标签
+    fn parse_scenario(raw: &str) -> Option<Scenario> {
+        // 尝试直接解析
+        let value: serde_json::Value = match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(_) => {
+                // 尝试从 markdown 代码块中提取
+                let trimmed = Self::extract_json_from_markdown(raw);
+                match serde_json::from_str(&trimmed) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, raw = %raw, "LLM 场景识别响应 JSON 解析失败");
+                        return None;
+                    }
+                }
+            }
+        };
+
+        let scenario_str = value
+            .get("scenario")
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+
+        if scenario_str.is_empty() {
+            tracing::warn!(raw = %raw, "LLM 响应缺少 scenario 字段");
+            return None;
+        }
+
+        Some(scenario_from_str(scenario_str))
+    }
+
+    /// 从 markdown 代码块中提取 JSON
+    fn extract_json_from_markdown(raw: &str) -> String {
+        let trimmed = raw.trim();
+        if let Some(start) = trimmed.find("```") {
+            let after = &trimmed[start + 3..];
+            let after = after.strip_prefix("json").unwrap_or(after);
+            if let Some(end) = after.find("```") {
+                return after[..end].trim().to_string();
+            }
+        }
+        trimmed.to_string()
+    }
+
+    /// 识别场景
+    ///
+    /// 返回 `Some(Scenario)` 或 `None`（失败时调用方应降级到 Agent 默认场景）。
+    pub async fn detect(&self, turns: &[MessageTurn]) -> Option<Scenario> {
+        if self.config.api_url.is_empty() {
+            tracing::debug!("HttpScenarioDetector 未配置 api_url，跳过");
+            return None;
+        }
+
+        let summary = Self::build_conversation_summary(turns, 10);
+        let prompt = Self::build_prompt(&summary);
+
+        let request_body = serde_json::json!({
+            "model": self.config.model,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": self.config.max_tokens,
+            "temperature": 0.0,
+            "thinking": {"type": "disabled"},
+        });
+
+        let resp = match self
+            .client
+            .post(&self.config.api_url)
+            .bearer_auth(&self.config.api_key)
+            .json(&request_body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "LLM 场景识别 API 请求失败");
+                return None;
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(status = %status, body = %body, "LLM 场景识别 API 返回错误状态");
+            return None;
+        }
+
+        let resp_json: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "LLM 场景识别响应解析失败");
+                return None;
+            }
+        };
+
+        let content = resp_json
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+
+        Self::parse_scenario(content)
+    }
+}
+
+/// 截断文本到指定字符数（避免 prompt 过长）
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        s.chars().take(max_chars).collect::<String>() + "..."
     }
 }
 
@@ -349,5 +543,91 @@ mod tests {
         let _ = (scenario, conf);
         // 关键是置信度 < 1.0（说明触发了 LLM 兜底条件）
         assert!(conf < 1.0, "混合场景置信度应 < 1.0: {}", conf);
+    }
+
+    // ========================================================================
+    // HttpScenarioDetector 测试（不含真实网络调用，仅测 prompt 构造 + 解析）
+    // ========================================================================
+
+    #[test]
+    fn test_http_build_prompt_contains_scenario_labels() {
+        let summary = "轮次 1 用户: 写一个 Rust 函数\n轮次 1 助手: 好的\n";
+        let prompt = HttpScenarioDetector::build_prompt(summary);
+        assert!(prompt.contains("coding"));
+        assert!(prompt.contains("writing"));
+        assert!(prompt.contains("research"));
+        assert!(prompt.contains("daily"));
+        assert!(prompt.contains("finance"));
+        assert!(prompt.contains("design"));
+        assert!(prompt.contains("officework"));
+        assert!(prompt.contains("轮次 1 用户: 写一个 Rust 函数"));
+    }
+
+    #[test]
+    fn test_http_parse_scenario_valid_json() {
+        let raw = r#"{"scenario": "coding", "reason": "Rust 代码"}"#;
+        let scenario = HttpScenarioDetector::parse_scenario(raw);
+        assert_eq!(scenario, Some(Scenario::Coding));
+    }
+
+    #[test]
+    fn test_http_parse_scenario_markdown_wrapped() {
+        let raw = "```json\n{\"scenario\": \"writing\", \"reason\": \"文章\"}\n```";
+        let scenario = HttpScenarioDetector::parse_scenario(raw);
+        assert_eq!(scenario, Some(Scenario::Writing));
+    }
+
+    #[test]
+    fn test_http_parse_scenario_unknown_label_falls_back_to_custom() {
+        let raw = r#"{"scenario": "medical", "reason": "医学对话"}"#;
+        let scenario = HttpScenarioDetector::parse_scenario(raw);
+        assert_eq!(scenario, Some(Scenario::Custom("medical".to_string())));
+    }
+
+    #[test]
+    fn test_http_parse_scenario_missing_scenario_field() {
+        let raw = r#"{"reason": "无 scenario 字段"}"#;
+        let scenario = HttpScenarioDetector::parse_scenario(raw);
+        assert_eq!(scenario, None);
+    }
+
+    #[test]
+    fn test_http_parse_scenario_invalid_json() {
+        let raw = "这不是 JSON";
+        let scenario = HttpScenarioDetector::parse_scenario(raw);
+        assert_eq!(scenario, None);
+    }
+
+    #[test]
+    fn test_http_build_conversation_summary_truncates_long_text() {
+        let long_text = "a".repeat(500);
+        let turns = vec![make_turn(&long_text, &long_text)];
+        let summary = HttpScenarioDetector::build_conversation_summary(&turns, 10);
+        // 每段截断到 200 字符 + "..."
+        assert!(summary.contains("..."));
+        // 总长度应远小于原始 1000 字符
+        assert!(summary.chars().count() < 600);
+    }
+
+    #[tokio::test]
+    async fn test_http_detect_without_api_url_returns_none() {
+        let config = LlmDetectorConfig::default(); // api_url 为空
+        let detector = HttpScenarioDetector::new(config);
+        let turns = vec![make_turn("test", "test")];
+        assert_eq!(detector.detect(&turns).await, None);
+    }
+
+    #[test]
+    fn test_http_extract_json_from_markdown_plain() {
+        let raw = r#"{"scenario": "coding"}"#;
+        let extracted = HttpScenarioDetector::extract_json_from_markdown(raw);
+        assert_eq!(extracted, r#"{"scenario": "coding"}"#);
+    }
+
+    #[test]
+    fn test_http_extract_json_from_markdown_block() {
+        let raw = "```json\n{\"scenario\": \"coding\"}\n```";
+        let extracted = HttpScenarioDetector::extract_json_from_markdown(raw);
+        assert_eq!(extracted, r#"{"scenario": "coding"}"#);
     }
 }
