@@ -29,12 +29,12 @@
 //! - **失败降级**：识别失败永不阻塞 archive，降级到 Agent 默认场景
 //! - **跨进程持久**：识别结果写入 `sessions/{sid}/meta.json`
 
-use crate::builder::scenario_from_str;
+use crate::builder::{scenario_from_str, scenario_to_str};
+use hippocampus_agents::AgentFamily;
 use hippocampus_core::model::MessageTurn;
+use hippocampus_core::storage::{SessionMeta, Storage};
 use hippocampus_llm::LlmDetectorConfig;
 use hippocampus_scenarios::Scenario;
-// Arc 暂未在本文件直接使用，Task 8 的 HybridScenarioDetector 会以 Arc<HttpScenarioDetector> 形态注入
-#[allow(unused_imports)]
 use std::sync::Arc;
 
 // ============================================================================
@@ -389,6 +389,166 @@ fn truncate(s: &str, max_chars: usize) -> String {
 }
 
 // ============================================================================
+// HybridScenarioDetector
+// ============================================================================
+
+/// 混合场景识别器（关键词 + LLM 兜底）
+///
+/// ## 串联策略
+///
+/// 1. 关键词规则优先
+/// 2. 关键词置信度 `>= 0.6` → 直接采用，跳过 LLM
+/// 3. 关键词置信度 `< 0.6` 或零命中 → 调 LLM
+/// 4. LLM 失败 → 返回 `DetectionResult::failed()`
+pub struct HybridScenarioDetector {
+    keyword: KeywordScenarioDetector,
+    llm: Option<Arc<HttpScenarioDetector>>,
+}
+
+impl HybridScenarioDetector {
+    /// 创建混合识别器
+    ///
+    /// - `llm = None`：仅关键词模式（未配置 LLM API）
+    /// - `llm = Some`：关键词 + LLM 兜底
+    pub fn new(llm: Option<Arc<HttpScenarioDetector>>) -> Self {
+        Self {
+            keyword: KeywordScenarioDetector::new(),
+            llm,
+        }
+    }
+
+    /// 识别场景
+    pub async fn detect(&self, turns: &[MessageTurn]) -> DetectionResult {
+        // 1. 关键词规则优先
+        if let Some((scenario, conf)) = self.keyword.detect(turns) {
+            if conf >= 0.6 {
+                tracing::debug!(
+                    ?scenario,
+                    confidence = conf,
+                    "关键词高置信，跳过 LLM"
+                );
+                return DetectionResult {
+                    scenario: Some(scenario),
+                    confidence: conf,
+                    method: "keyword",
+                };
+            }
+            tracing::debug!(
+                ?scenario,
+                confidence = conf,
+                "关键词低置信，触发 LLM 兜底"
+            );
+        } else {
+            tracing::debug!("关键词零命中，触发 LLM 兜底");
+        }
+
+        // 2. LLM 兜底
+        if let Some(llm) = &self.llm {
+            if let Some(scenario) = llm.detect(turns).await {
+                return DetectionResult {
+                    scenario: Some(scenario),
+                    confidence: 0.8,
+                    method: "llm",
+                };
+            }
+        }
+
+        // 3. 全部失败
+        DetectionResult::failed()
+    }
+}
+
+// ============================================================================
+// resolve_effective_scenario 编排函数
+// ============================================================================
+
+/// 解析生效的场景（v2.33 核心 API）
+///
+/// 4 级优先级链：
+///
+/// 1. **用户显式**（`user_explicit` 参数）最高
+/// 2. **session 元数据**（已识别则跳过识别）
+/// 3. **首次 archive**：调 `detector.detect(turns)` 识别 + 写入元数据
+/// 4. **降级**：Agent 默认场景（[`crate::resolve_scenario_name`]）
+///
+/// ## 参数
+///
+/// - `storage`：存储 trait（读写 session_meta）
+/// - `session_id`：会话 ID
+/// - `user_explicit`：用户显式指定的场景（来自 preset.scenario）
+/// - `agent_family`：Agent family（用于降级时推导默认场景）
+/// - `detector`：场景识别器
+/// - `turns`：对话内容（首次识别时用）
+///
+/// ## 失败容忍
+///
+/// - `read_session_meta` 失败：当作 None，触发重新识别
+/// - `write_session_meta` 失败：日志 warn，不阻塞返回
+/// - detector 识别失败：降级到 Agent 默认场景
+pub async fn resolve_effective_scenario(
+    storage: &dyn Storage,
+    session_id: &str,
+    user_explicit: Option<&str>,
+    agent_family: &AgentFamily,
+    detector: &HybridScenarioDetector,
+    turns: &[MessageTurn],
+) -> Scenario {
+    // 1. 用户显式最高
+    if let Some(s) = user_explicit {
+        tracing::debug!(scenario = %s, "场景识别：用户显式指定");
+        return scenario_from_str(s);
+    }
+
+    // 2. session 元数据（已识别）
+    match storage.read_session_meta(session_id).await {
+        Ok(Some(meta)) => {
+            tracing::debug!(
+                scenario = %meta.scenario,
+                confidence = meta.confidence,
+                method = %meta.method,
+                "场景识别：命中 session 元数据"
+            );
+            return scenario_from_str(&meta.scenario);
+        }
+        Ok(None) => { /* 首次识别，继续 */ }
+        Err(e) => {
+            tracing::warn!(error = %e, "读取 session_meta 失败，触发重新识别");
+        }
+    }
+
+    // 3. 首次识别
+    let result = detector.detect(turns).await;
+    if let Some(scenario) = result.scenario {
+        let meta = SessionMeta {
+            scenario: scenario_to_str(&scenario),
+            confidence: result.confidence,
+            method: result.method.to_string(),
+            detected_at: chrono::Utc::now(),
+        };
+        // 写入元数据（失败不阻塞）
+        if let Err(e) = storage.write_session_meta(session_id, &meta).await {
+            tracing::warn!(error = %e, "写入 session_meta 失败（不阻塞 archive）");
+        }
+        tracing::info!(
+            ?scenario,
+            confidence = result.confidence,
+            method = %result.method,
+            "场景识别完成"
+        );
+        return scenario;
+    }
+
+    // 4. 降级：Agent 默认场景
+    let default_str = crate::resolve_scenario_name(agent_family);
+    let default = scenario_from_str(&default_str);
+    tracing::info!(
+        default = ?default,
+        "场景识别失败，降级到 Agent 默认场景"
+    );
+    default
+}
+
+// ============================================================================
 // 单元测试
 // ============================================================================
 
@@ -629,5 +789,143 @@ mod tests {
         let raw = "```json\n{\"scenario\": \"coding\"}\n```";
         let extracted = HttpScenarioDetector::extract_json_from_markdown(raw);
         assert_eq!(extracted, r#"{"scenario": "coding"}"#);
+    }
+
+    // ========================================================================
+    // HybridScenarioDetector 测试
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_hybrid_keyword_high_confidence_skips_llm() {
+        // 关键词命中明显，置信度 >= 0.6，应跳过 LLM
+        let turns = vec![
+            make_turn("fn compile refactor 调试", "好的，重构架构"),
+        ];
+        let detector = HybridScenarioDetector::new(None); // 无 LLM
+        let result = detector.detect(&turns).await;
+        assert!(result.scenario.is_some());
+        assert_eq!(result.scenario.unwrap(), Scenario::Coding);
+        assert!(result.confidence >= 0.6);
+        assert_eq!(result.method, "keyword");
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_keyword_zero_hits_without_llm_returns_failed() {
+        // 零命中 + 无 LLM → failed
+        let turns = vec![make_turn("啊啊啊", "嗯嗯嗯")];
+        let detector = HybridScenarioDetector::new(None);
+        let result = detector.detect(&turns).await;
+        assert!(result.is_failed());
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_keyword_zero_hits_with_llm_unconfigured_returns_failed() {
+        // 零命中 + LLM 未配置 api_url → LLM 返回 None → failed
+        let turns = vec![make_turn("啊啊啊", "嗯嗯嗯")];
+        let config = LlmDetectorConfig::default(); // api_url 为空
+        let llm = Arc::new(HttpScenarioDetector::new(config));
+        let detector = HybridScenarioDetector::new(Some(llm));
+        let result = detector.detect(&turns).await;
+        assert!(result.is_failed());
+    }
+
+    // ========================================================================
+    // resolve_effective_scenario 测试
+    // ========================================================================
+
+    use hippocampus_core::storage::LocalStorage;
+    use tempfile::TempDir;
+
+    fn make_storage() -> (TempDir, LocalStorage) {
+        let tmp = TempDir::new().unwrap();
+        let storage = LocalStorage::new(tmp.path().to_path_buf());
+        (tmp, storage)
+    }
+
+    #[tokio::test]
+    async fn test_resolve_user_explicit_overrides_everything() {
+        // 用户显式 > session_meta > 识别 > 默认
+        let (_tmp, storage) = make_storage();
+        let detector = HybridScenarioDetector::new(None);
+        let family = AgentFamily::ClaudeCode;
+
+        let result = resolve_effective_scenario(
+            &storage,
+            "sess-1",
+            Some("writing"),
+            &family,
+            &detector,
+            &[make_turn("fn compile", "好的")],
+        ).await;
+        assert_eq!(result, Scenario::Writing);
+        // 用户显式不应写入 session_meta
+        assert!(storage.read_session_meta("sess-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_session_meta_hit_skips_detection() {
+        // 已有 session_meta → 直接用，不调 detector
+        let (_tmp, storage) = make_storage();
+        let meta = SessionMeta {
+            scenario: "research".to_string(),
+            confidence: 0.85,
+            method: "keyword".to_string(),
+            detected_at: chrono::Utc::now(),
+        };
+        storage.write_session_meta("sess-2", &meta).await.unwrap();
+
+        let detector = HybridScenarioDetector::new(None);
+        let family = AgentFamily::ClaudeCode;
+
+        let result = resolve_effective_scenario(
+            &storage,
+            "sess-2",
+            None,
+            &family,
+            &detector,
+            &[make_turn("fn compile", "好的")], // 即使对话是 coding，也用 meta 的 research
+        ).await;
+        assert_eq!(result, Scenario::Research);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_first_archive_writes_meta() {
+        // 首次 archive：识别 + 写 meta
+        let (_tmp, storage) = make_storage();
+        let detector = HybridScenarioDetector::new(None);
+        let family = AgentFamily::ClaudeCode;
+
+        let result = resolve_effective_scenario(
+            &storage,
+            "sess-3",
+            None,
+            &family,
+            &detector,
+            &[make_turn("fn compile refactor 调试", "架构")],
+        ).await;
+        assert_eq!(result, Scenario::Coding);
+
+        // 验证 meta 已写入
+        let meta = storage.read_session_meta("sess-3").await.unwrap().unwrap();
+        assert_eq!(meta.scenario, "coding");
+        assert_eq!(meta.method, "keyword");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_detection_failure_falls_back_to_agent_default() {
+        // 识别失败（零命中 + 无 LLM）→ Agent 默认场景
+        let (_tmp, storage) = make_storage();
+        let detector = HybridScenarioDetector::new(None);
+        let family = AgentFamily::ClaudeCode; // 默认 Coding
+
+        let result = resolve_effective_scenario(
+            &storage,
+            "sess-4",
+            None,
+            &family,
+            &detector,
+            &[make_turn("啊啊啊", "嗯嗯嗯")],
+        ).await;
+        assert_eq!(result, Scenario::Coding, "ClaudeCode 默认应降级到 Coding");
     }
 }

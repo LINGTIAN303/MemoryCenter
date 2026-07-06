@@ -18,9 +18,13 @@ hippocampus-skills = { path = "../hippocampus-skills", version = "0.1.0" }
 hippocampus-llm = { path = "../hippocampus-llm", version = "0.1.0" }
 # v2.33：HttpScenarioDetector 需要 reqwest::Client 调用 LLM API
 reqwest = { version = "0.12", features = ["json"] }
+# v2.33：resolve_effective_scenario 用 chrono::Utc::now() 写入 detected_at
+chrono = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
 uuid = { workspace = true }
 # v2.33：HttpScenarioDetector 测试需要 #[tokio::test] 宏
 tokio = { version = "1.0", features = ["rt", "macros"] }
+# v2.33：resolve_effective_scenario 测试需要 TempDir 创建临时存储
+tempfile = { workspace = true }
