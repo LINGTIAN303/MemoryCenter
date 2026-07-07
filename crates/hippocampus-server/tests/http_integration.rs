@@ -1588,10 +1588,9 @@ async fn test_http_pre_compress_plain_text() {
 }
 
 #[tokio::test]
-async fn test_http_pre_compress_empty_context_returns_200() {
-    // 空 full_context：handler 未做显式空检查，按 spec 第七章 "raw_context 永远先存" 逻辑，
-    // 空字符串会写入空 raw_context 文件并返回 200 + parse_success=false（graceful 降级）。
-    // 注：任务原始描述期望返回 400，但实际 handler 行为是 200，此处按实际实现调整。
+async fn test_http_pre_compress_empty_context_returns_400() {
+    // v2.34 风险点 1：空 full_context 应返回 400（与 archive 空 turns 检查一致），
+    // 不再走 "raw_context 永远先存" 的 graceful 降级路径。
     let server = TestServer::start().await;
     let client = reqwest::Client::new();
 
@@ -1607,28 +1606,101 @@ async fn test_http_pre_compress_empty_context_returns_200() {
         .await
         .expect("请求失败");
 
-    // 实际行为：返回 200（空字符串通过 serde 校验，handler 无显式空检查）
-    assert_eq!(resp.status(), 200);
-    let result: Value = resp.json().await.expect("解析响应失败");
+    assert_eq!(resp.status(), 400);
+    let err: Value = resp.json().await.expect("解析错误响应失败");
+    assert_eq!(err["error"]["code"].as_str().unwrap(), "BAD_REQUEST");
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("full_context 不能为空"));
+}
 
-    // 空 context 解析失败（context_parser 对空字符串返回 None）
+// ============================================================================
+// v2.34 风险点 2：pre_compress hook_id 一致性测试
+// ============================================================================
+
+/// 验证 pre_compress 返回的 hook_id 与 IndexHook.id 一致：
+/// 1. POST pre-compress，返回 hook_id + raw_context_path
+/// 2. GET memories/{hook_id}，应能检索到（说明 IndexHook.id == hook_id）
+///
+/// 这是 v2.34 修复的核心保证：预生成 hook_id（用于 raw_context 文件命名）
+/// 必须与 Archiver 内部生成的 IndexHook.id 对齐，否则 retrieve 时 404。
+#[tokio::test]
+async fn test_http_pre_compress_hook_id_consistency() {
+    let server = TestServer::start().await;
+    let client = reqwest::Client::new();
+
+    // context_parser 期望 user_message / llm_message 为 String（非对象）
+    let full_context = r#"[{"user_message":"HTTP 一致性验证","llm_message":"ok"}]"#;
+    let body = json!({
+        "full_context": full_context,
+        "project_id": null
+    });
+
+    // 1. POST pre-compress
+    let resp = client
+        .post(server.url("/api/v1/sessions/sess-pc-consistency/pre-compress"))
+        .json(&body)
+        .send()
+        .await
+        .expect("请求失败");
+    assert_eq!(resp.status(), 200);
+
+    let result: Value = resp.json().await.expect("解析响应失败");
     assert_eq!(
         result["parse_success"].as_bool().unwrap(),
-        false,
-        "空 context 应解析失败"
+        true,
+        "JSON 输入应解析成功"
+    );
+
+    let hook_id = result["hook_id"].as_str().expect("hook_id 应为字符串");
+    let raw_context_path = result["raw_context_path"]
+        .as_str()
+        .expect("raw_context_path 应为字符串");
+
+    // 2. 验证 hook_id 是合法 UUID（36 字符，含 4 个连字符）
+    assert_eq!(
+        hook_id.len(),
+        36,
+        "hook_id 应为 36 字符 UUID，实际: {}",
+        hook_id
     );
     assert_eq!(
-        result["parsed_turns_count"].as_u64().unwrap(),
-        0,
-        "解析失败时 turns 数应为 0"
+        hook_id.matches('-').count(),
+        4,
+        "hook_id 应含 4 个连字符"
     );
-    // raw_context 仍被保存（即使是空文件）
+
+    // 3. 验证 raw_context_path 包含 hook_id（文件命名一致性）
     assert!(
-        !result["hook_id"].as_str().unwrap().is_empty(),
-        "hook_id 不应为空"
+        raw_context_path.contains(hook_id),
+        "raw_context_path 应包含 hook_id，实际: {} (hook_id={})",
+        raw_context_path,
+        hook_id
     );
-    assert!(
-        !result["raw_context_path"].as_str().unwrap().is_empty(),
-        "raw_context_path 不应为空"
+
+    // 4. GET memories/{hook_id}：能检索到说明 IndexHook.id == hook_id（风险点 2 修复）
+    let url = format!("/api/v1/sessions/sess-pc-consistency/memories/{}", hook_id);
+    let resp = client
+        .get(server.url(&url))
+        .send()
+        .await
+        .expect("请求失败");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "应能通过 hook_id 检索到记忆（IndexHook.id 与 hook_id 一致）"
+    );
+    let memory: Value = resp.json().await.expect("解析响应失败");
+    assert_eq!(
+        memory["session_id"].as_str().unwrap(),
+        "sess-pc-consistency",
+        "检索到的记忆 session_id 应匹配"
+    );
+    assert_eq!(
+        memory["turns"].as_array().unwrap().len(),
+        1,
+        "应检索到 1 轮对话"
     );
 }

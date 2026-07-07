@@ -2204,6 +2204,14 @@ impl HippocampusMcp {
         &self,
         Parameters(params): Parameters<PreCompressParams>,
     ) -> Result<String, McpError> {
+        // v2.34 风险点 1：空 full_context 检查（与 archive 空 turns 检查一致，返回 invalid_params）
+        if params.full_context.trim().is_empty() {
+            return Err(McpError::invalid_params(
+                "full_context 不能为空。请传入完整的会话上下文。",
+                None,
+            ));
+        }
+
         // 1. 生成 hook_id（提前生成，用于 raw_context 文件命名 + 后续 IndexHook 关联）
         let hook_id = uuid::Uuid::new_v4().to_string();
 
@@ -2243,6 +2251,8 @@ impl HippocampusMcp {
                         parsed.turns,
                         &params.preset,
                         &params.task_state_snapshot,
+                        &hook_id,
+                        &raw_context_path,
                     )
                     .await
                 {
@@ -2322,6 +2332,8 @@ impl HippocampusMcp {
         turns: Vec<MessageTurn>,
         preset: &Option<PresetParams>,
         task_state_snapshot: &Option<TaskStateSnapshotParams>,
+        hook_id: &str,
+        raw_context_path: &str,
     ) -> Result<usize, String> {
         // v2.33：场景识别（仅首次 archive 时识别，后续读 session_meta 跳过）
         // 优先级：用户显式 preset.scenario > session_meta > 识别 > Agent 默认
@@ -2412,6 +2424,13 @@ impl HippocampusMcp {
         if let Some(tpl) = summary_template {
             archiver = archiver.with_summary_template_override(tpl);
         }
+
+        // v2.34：注入覆盖（hook_id 一致性 + archive_reason + raw_context_path）
+        // 用于 pre_compress_hook：预生成 hook_id 与 IndexHook.id 对齐
+        archiver = archiver
+            .with_override_hook_id(hook_id)
+            .with_archive_reason("pre_compress")
+            .with_raw_context_path(raw_context_path);
 
         for turn in turns {
             archiver.push_turn(turn);

@@ -70,6 +70,25 @@ pub struct Archiver {
     /// [`SummaryGenerator::generate_summary_with_template`] 传入。
     /// `None` 时调用 [`generate_summary`](SummaryGenerator::generate_summary)（向后兼容）。
     summary_template_override: Option<String>,
+
+    /// v2.34：外部覆盖 hook_id（用于 pre_compress_hook 一致性）
+    ///
+    /// pre_compress_hook 预生成 hook_id 用于 raw_context 文件命名，
+    /// 注入此字段后 archive() 会用该 hook_id 覆盖 IndexHook.id（默认内部生成的 uuid）。
+    /// 未注入时使用内部生成的 uuid（向后兼容）。
+    override_hook_id: Option<String>,
+
+    /// v2.34：归档来源覆盖（archive / pre_compress / manual）
+    ///
+    /// 注入后 archive() 会将此值填入 IndexHook.archive_reason。
+    /// 未注入时 IndexHook.archive_reason 保持 None（向后兼容）。
+    archive_reason_override: Option<String>,
+
+    /// v2.34：raw_context 文件路径覆盖
+    ///
+    /// 注入后 archive() 会将此值填入 IndexHook.raw_context_path。
+    /// 未注入时 IndexHook.raw_context_path 保持 None（向后兼容）。
+    raw_context_path_override: Option<String>,
 }
 
 impl Archiver {
@@ -94,6 +113,9 @@ impl Archiver {
             project_id,
             summary_generator: None,
             summary_template_override: None,
+            override_hook_id: None,
+            archive_reason_override: None,
+            raw_context_path_override: None,
         }
     }
 
@@ -123,6 +145,32 @@ impl Archiver {
     /// 模板需含 `{conversation}` 占位符。未注入 summary_generator 时本字段无效果。
     pub fn with_summary_template_override(mut self, template: impl Into<String>) -> Self {
         self.summary_template_override = Some(template.into());
+        self
+    }
+
+    /// v2.34：注入外部 hook_id 覆盖（用于 pre_compress_hook 一致性）
+    ///
+    /// pre_compress_hook 预生成 hook_id 用于 raw_context 文件命名，
+    /// 注入后 archive() 会用该 hook_id 覆盖 IndexHook.id。
+    /// 未注入时使用内部生成的 uuid（向后兼容）。
+    pub fn with_override_hook_id(mut self, hook_id: impl Into<String>) -> Self {
+        self.override_hook_id = Some(hook_id.into());
+        self
+    }
+
+    /// v2.34：注入归档来源覆盖（archive / pre_compress / manual）
+    ///
+    /// 注入后 archive() 会将此值填入 IndexHook.archive_reason。
+    pub fn with_archive_reason(mut self, reason: impl Into<String>) -> Self {
+        self.archive_reason_override = Some(reason.into());
+        self
+    }
+
+    /// v2.34：注入 raw_context 文件路径覆盖
+    ///
+    /// 注入后 archive() 会将此值填入 IndexHook.raw_context_path。
+    pub fn with_raw_context_path(mut self, path: impl Into<String>) -> Self {
+        self.raw_context_path_override = Some(path.into());
         self
     }
 
@@ -243,6 +291,25 @@ impl Archiver {
                     );
                 }
             }
+        }
+
+        // v2.34：应用外部覆盖（hook_id / archive_reason / raw_context_path）
+        // 用于 pre_compress_hook 一致性：预生成 hook_id 与 IndexHook.id 对齐
+        if let Some(override_id) = &self.override_hook_id {
+            if let Ok(parsed) = uuid::Uuid::parse_str(override_id) {
+                hook.id = parsed;
+            } else {
+                tracing::warn!(
+                    override_id = %override_id,
+                    "override_hook_id 不是合法 UUID，保留内部生成的 hook.id"
+                );
+            }
+        }
+        if let Some(reason) = &self.archive_reason_override {
+            hook.archive_reason = Some(reason.clone());
+        }
+        if let Some(path) = &self.raw_context_path_override {
+            hook.raw_context_path = Some(path.clone());
         }
 
         // 6. 追加钩子到 daily 索引文档（session 级）
@@ -671,5 +738,112 @@ mod tests {
         // 验证调用了 generate_summary（template 记录为 None）
         assert_eq!(gen.last_template(), None);
         assert_eq!(hook.summary.title, "default-call");
+    }
+
+    // ========================================================================
+    // v2.34：Archiver 覆盖 API 测试（pre_compress_hook 一致性）
+    // ========================================================================
+
+    /// 注入 override_hook_id 后，archive() 返回的 IndexHook.id 应等于注入值
+    #[tokio::test]
+    async fn test_archive_with_override_hook_id() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+        let config = ArchiveConfig {
+            token_threshold: 100,
+            force_truncate_limit: 150,
+            wait_for_turn_completion: true,
+        };
+        let custom_id = "12345678-1234-1234-1234-123456789012";
+        let mut archiver = Archiver::new(config, storage, "sess-override-001", None)
+            .with_override_hook_id(custom_id);
+
+        archiver.push_turn(make_turn(110));
+        let (_memory, hook) = archiver.archive().await.unwrap();
+
+        assert_eq!(hook.id.to_string(), custom_id);
+    }
+
+    /// 注入 archive_reason 后，IndexHook.archive_reason 应等于注入值
+    #[tokio::test]
+    async fn test_archive_with_archive_reason() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+        let config = ArchiveConfig {
+            token_threshold: 100,
+            force_truncate_limit: 150,
+            wait_for_turn_completion: true,
+        };
+        let mut archiver = Archiver::new(config, storage, "sess-override-002", None)
+            .with_archive_reason("pre_compress");
+
+        archiver.push_turn(make_turn(110));
+        let (_memory, hook) = archiver.archive().await.unwrap();
+
+        assert_eq!(hook.archive_reason.as_deref(), Some("pre_compress"));
+    }
+
+    /// 注入 raw_context_path 后，IndexHook.raw_context_path 应等于注入值
+    #[tokio::test]
+    async fn test_archive_with_raw_context_path() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+        let config = ArchiveConfig {
+            token_threshold: 100,
+            force_truncate_limit: 150,
+            wait_for_turn_completion: true,
+        };
+        let custom_path = "sessions/sess-003/raw_contexts/abc.txt";
+        let mut archiver = Archiver::new(config, storage, "sess-override-003", None)
+            .with_raw_context_path(custom_path);
+
+        archiver.push_turn(make_turn(110));
+        let (_memory, hook) = archiver.archive().await.unwrap();
+
+        assert_eq!(hook.raw_context_path.as_deref(), Some(custom_path));
+    }
+
+    /// 未注入覆盖时，IndexHook 字段保持默认（向后兼容）
+    #[tokio::test]
+    async fn test_archive_without_overrides_backward_compatible() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+        let config = ArchiveConfig {
+            token_threshold: 100,
+            force_truncate_limit: 150,
+            wait_for_turn_completion: true,
+        };
+        let mut archiver = Archiver::new(config, storage, "sess-override-004", None);
+        // 不注入任何覆盖
+
+        archiver.push_turn(make_turn(110));
+        let (_memory, hook) = archiver.archive().await.unwrap();
+
+        // archive_reason 和 raw_context_path 应为 None（向后兼容）
+        assert_eq!(hook.archive_reason, None);
+        assert_eq!(hook.raw_context_path, None);
+        // hook.id 应为内部生成的 uuid（非特定值）
+        assert!(hook.id.to_string().len() == 36);
+    }
+
+    /// 非法 UUID 的 override_hook_id 应降级为内部生成的 uuid（不 panic）
+    #[tokio::test]
+    async fn test_archive_with_invalid_override_hook_id_falls_back() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()));
+        let config = ArchiveConfig {
+            token_threshold: 100,
+            force_truncate_limit: 150,
+            wait_for_turn_completion: true,
+        };
+        let mut archiver = Archiver::new(config, storage, "sess-override-005", None)
+            .with_override_hook_id("not-a-uuid");
+
+        archiver.push_turn(make_turn(110));
+        let (_memory, hook) = archiver.archive().await.unwrap();
+
+        // 非法 UUID 应降级，hook.id 应为内部生成的合法 uuid
+        assert_eq!(hook.id.to_string().len(), 36);
+        assert_ne!(hook.id.to_string(), "not-a-uuid");
     }
 }

@@ -145,3 +145,110 @@ async fn test_pre_compress_hook_raw_context_file_exists() {
         "raw_context 文件内容应与 full_context 完全一致"
     );
 }
+
+// ============================================================================
+// v2.34 风险点 2 & 3：hook_id 一致性 + archive_reason + raw_context_path 测试
+// ============================================================================
+
+/// 验证 pre_compress_hook 返回的 hook_id 与 IndexHook.id 一致，
+/// 且 IndexHook.archive_reason == "pre_compress"、raw_context_path 与返回值一致。
+///
+/// 这是 v2.34 修复的核心保证：预生成 hook_id（用于 raw_context 文件命名）
+/// 必须与 Archiver 内部生成的 IndexHook.id 对齐，否则 retrieve 时无法按 hook_id 检索。
+#[tokio::test]
+async fn test_pre_compress_hook_id_consistency() {
+    use hippocampus_core::model::ArchivePeriod;
+    use hippocampus_core::storage::{LocalStorage, Storage};
+    use std::sync::Arc;
+
+    let tmp = TempDir::new().unwrap();
+    let storage_root = tmp.path().to_path_buf();
+    let mcp = make_mcp(&tmp);
+
+    // JSON 数组格式：1 轮对话（context_parser 期望 user_message/llm_message 为字符串）
+    let full_context = r#"[{"user_message":"一致性验证","llm_message":"ok"}]"#;
+    let params = make_params("integration-consistency-sess", full_context);
+    let result = call_hook(&mcp, params).await;
+
+    // 1. 验证 parse_success=true（解析成功才会走 Archiver 归档路径）
+    assert_eq!(
+        result["parse_success"], true,
+        "JSON 输入应解析成功（否则不会走 Archiver，无法验证 hook_id 一致性）"
+    );
+
+    // 2. 验证 hook_id 是合法 UUID（36 字符，含 4 个连字符）
+    let hook_id = result["hook_id"].as_str().expect("hook_id 应为字符串");
+    assert_eq!(
+        hook_id.len(),
+        36,
+        "hook_id 应为 36 字符 UUID，实际: {}",
+        hook_id
+    );
+    assert_eq!(
+        hook_id.matches('-').count(),
+        4,
+        "hook_id 应含 4 个连字符"
+    );
+
+    // 3. 验证 raw_context_path 包含 hook_id（文件命名一致性）
+    let raw_context_path = result["raw_context_path"]
+        .as_str()
+        .expect("raw_context_path 应为字符串");
+    assert!(
+        raw_context_path.contains(hook_id),
+        "raw_context_path 应包含 hook_id，实际: {} (hook_id={})",
+        raw_context_path,
+        hook_id
+    );
+
+    // 4. 验证 raw_context 文件实际存在且内容正确
+    let raw_abs = storage_root.join(raw_context_path);
+    assert!(
+        raw_abs.exists(),
+        "raw_context 文件应存在: {:?}",
+        raw_abs
+    );
+    let content = std::fs::read_to_string(&raw_abs).expect("读取 raw_context 文件失败");
+    assert_eq!(
+        content, full_context,
+        "raw_context 文件内容应与 full_context 完全一致"
+    );
+
+    // 5. 通过 LocalStorage 读取索引文档，验证 IndexHook 一致性
+    let storage: Arc<LocalStorage> = Arc::new(LocalStorage::new(storage_root));
+    let index = storage
+        .read_index("integration-consistency-sess", None, ArchivePeriod::Daily)
+        .await
+        .expect("读取索引文档失败")
+        .expect("索引文档应存在（pre_compress_hook 解析成功后应写入 Archiver）");
+
+    // 索引文档中应有 1 个 hook
+    assert_eq!(
+        index.hooks.len(),
+        1,
+        "索引文档应有 1 个 hook（pre_compress_hook 归档一次）"
+    );
+
+    let hook = &index.hooks[0];
+
+    // 6. 风险点 2：IndexHook.id == 预生成 hook_id（核心一致性保证）
+    assert_eq!(
+        hook.id.to_string(),
+        hook_id,
+        "IndexHook.id 应等于预生成 hook_id（v2.34 风险点 2 修复）"
+    );
+
+    // 7. 风险点 3：IndexHook.archive_reason == "pre_compress"
+    assert_eq!(
+        hook.archive_reason.as_deref(),
+        Some("pre_compress"),
+        "IndexHook.archive_reason 应为 'pre_compress'（v2.34 风险点 3 修复）"
+    );
+
+    // 8. 风险点 3：IndexHook.raw_context_path == 返回值
+    assert_eq!(
+        hook.raw_context_path.as_deref(),
+        Some(raw_context_path),
+        "IndexHook.raw_context_path 应等于返回的 raw_context_path（v2.34 风险点 3 修复）"
+    );
+}
