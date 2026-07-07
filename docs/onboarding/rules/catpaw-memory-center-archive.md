@@ -1,4 +1,4 @@
-# MemoryCenter 记忆归档触发规则（Trae）
+# MemoryCenter 记忆归档触发规则（CatPaw）
 
 ## 触发条件（满足任一即调用 archive）
 
@@ -26,7 +26,7 @@
 ## 调用示例
 
 MemoryCenter.archive(
-    session_id="trae-{项目名}-{日期}",
+    session_id="catpaw-{项目名}-{日期}",
     turns_json='[{"user_message":{"text":"用户问的"},"llm_message":{"text":"我答的"}}]'
 )
 
@@ -34,21 +34,21 @@ MemoryCenter.archive(
 # id/timestamp/tags/token_count 可省略，服务端自动补全
 
 ## session_id 约定
-trae-{项目名}-{日期}，如 trae-myapp-20260705
+catpaw-{项目名}-{日期}，如 catpaw-myapp-20260705
 
-## Trae 特有提示
-在 Trae 提示压缩前，先调用 MemoryCenter.archive 归档当前对话，避免压缩丢失原始内容。
+## CatPaw 特有提示
+在 CatPaw 提示压缩前，先调用 MemoryCenter.archive 归档当前对话，避免压缩丢失原始内容。
 
 ---
 
 ## 压缩后行为协议
 
 > 本协议解决"LLM 被压缩后无法感知自身状态"的伪钩子方案核心环节。
-> 通过识别 Trae 客户端注入的固定标记消息，触发强制校准流程。
+> 通过识别 CatPaw 客户端注入的固定标记消息，触发强制校准流程。
 
 ### 1. 触发条件：识别 Marker Message
 
-当你在系统消息中看到以下**固定文本**时，表明上下文刚被 Trae 客户端压缩：
+当你在系统消息中看到以下**固定文本**时，表明上下文刚被 CatPaw 客户端压缩：
 
 ```
 This session continues a previous conversation that lost its context.
@@ -57,9 +57,11 @@ using the summary as your guide to avoid repeating any completed steps.
 ```
 
 **关键判断**：
-- 该文本是 Trae 编码层固定返回，100% 可靠
+- 该文本是 CatPaw 编码层固定返回，100% 可靠
 - 看到"lost its context"即视为压缩触发信号
 - 不要将其当作普通的会话开场白
+
+> **注意**：上述 marker text 为 Trae 客户端的压缩标记。CatPaw 的压缩机制可能不同，核心流程一致但需根据实际标记调整。
 
 ### 2. 压缩后强制流程（必须按序执行，不可跳过）
 
@@ -69,10 +71,10 @@ using the summary as your guide to avoid repeating any completed steps.
 
 #### 步骤 2：拉取 MemoryCenter 一手记忆
 - 调用 `MemoryCenter.prompt(session_id)` 获取历史记忆摘要
-- MemoryCenter 记忆是**一手源数据**，优先级高于 Trae 生成的 Summary
+- MemoryCenter 记忆是**一手源数据**，优先级高于 CatPaw 生成的 Summary
 
 #### 步骤 3：交叉校准 Current Work（对应 Summary 第8章节）
-比对 Trae Summary 的"Current Work"章节与 MemoryCenter 记忆：
+比对 CatPaw Summary 的"Current Work"章节与 MemoryCenter 记忆：
 
 | 情况 | 处理方式 |
 |------|---------|
@@ -95,7 +97,7 @@ using the summary as your guide to avoid repeating any completed steps.
 ## Next Step 决策协议
 
 > 本协议解决"LLM 压缩后重复提问或跳步"问题。
-> 通过 Pending todos（Trae 注入的状态）校准 Next Step（Trae 生成的建议）。
+> 通过 Pending todos（CatPaw 注入的状态）校准 Next Step（CatPaw 生成的建议）。
 
 ### 决策树（按优先级从高到低）
 
@@ -105,7 +107,7 @@ using the summary as your guide to avoid repeating any completed steps.
 
 理由：
 - `in_progress` 表示任务正在执行中被压缩打断
-- Trae 生成的 Next Step 不知道"你已经在做了"，可能给出错误建议
+- CatPaw 生成的 Next Step 不知道"你已经在做了"，可能给出错误建议
 - 此时 Next Step 仅作参考，不作为行动依据
 
 执行：
@@ -150,7 +152,7 @@ using the summary as your guide to avoid repeating any completed steps.
 
 > 本协议解决"MemoryCenter 记忆无法主动流入第7层 Memory Context"问题。
 > 通过 `update_project_memory` 工具 + Write 工具的两步闭环，让 MemoryCenter 记忆
-> 主动写入 Trae 客户端的 project_memory.md，影响下次会话的第7层注入。
+> 主动写入 CatPaw 客户端的 project_memory.md，影响下次会话的第7层注入。
 
 ### 1. 触发条件（满足任一即调用）
 
@@ -175,10 +177,10 @@ MemoryCenter.update_project_memory(
 
 返回 `full_content`（更新后的完整 project_memory.md 内容）。
 
-#### 步骤 2：用 Write 工具写入 Trae 的 project_memory.md
+#### 步骤 2：用 Write 工具写入 CatPaw 的 project_memory.md
 
-将 `full_content` 写入 Trae 客户端的 memory 文件夹：
-- Trae: `c:\Users\<user>\.trae-cn\memory\projects\<project>\project_memory.md`
+将 `full_content` 写入 CatPaw 客户端的 memory 文件夹：
+- CatPaw: `~/.catpaw/memory/projects/<project>/project_memory.md`
 - Cursor: 对应的 memory 目录
 
 完成"反向写入"闭环——MemoryCenter 记忆主动流入第7层 Memory Context。
@@ -212,7 +214,7 @@ MemoryCenter.update_project_memory(
 ### 5. 注意事项
 
 - **不要覆盖用户手动写入的内容**：只在标记范围内操作
-- **返回的 full_content 必须完整写入 Trae 文件**：不能只写部分
+- **返回的 full_content 必须完整写入 CatPaw 文件**：不能只写部分
 - **会话结束前更新 task_state**：供下次会话的第7层注入参考
 - **与 TaskStateSnapshot 配合**：archive 时传 task_state_snapshot（动手点 2），
   update_project_memory 更新 project_memory.md（动手点 4），双重保障
