@@ -2,6 +2,34 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。变更格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## v2.35 - WASM 组件支持（2026-07-07）
+
+### 新增
+- 新建 `hippocampus-core-logic` crate：纯逻辑 + Storage trait，可编译为 WASM
+- 新建 `hippocampus-wasm` crate：wasm-bindgen 绑定 + MemoryStorage + JsStorage + HippocampusCore
+- `hippocampus-core` 改为 facade：重导出 core-logic + 保留原生 IO 实现
+- MemoryStorage：纯内存 Storage 实现（demo/测试/fallback）
+- JsStorage：注入式 Storage 实现（JS 调用方实现存储后端）
+- HippocampusCore JS API：archive / list_memories / read_memory / read_index
+- feature flag：`native`（jieba-rs+dashmap）/ `wasm`（简易分词）
+- bm25_wasm.rs：简易字符分词版 BM25（ASCII 按词，中文按单字）
+
+### 架构
+- 三层架构：WASM 绑定层 → core-logic → core facade
+- 向后兼容：现有 `use hippocampus_core::*` 代码无需修改
+- WASM target：wasm32-unknown-unknown
+
+### 测试
+- WASM crate 共 14 个测试通过（api 6 + memory_storage 4 + js_storage 4）
+- 全量 cargo test 通过（单线程模式，避免 env var race）
+- WASM 编译验证通过（hippocampus-core-logic + hippocampus-wasm 均编译为 wasm32）
+- wasm-pack build 生成 pkg/（含 .wasm / .js / .d.ts）
+
+### 已知问题
+- pkg/.gitignore 自动生成（wasm-pack 标准），未排除
+- 本地 wasm-opt 版本与 Rust 工具链 bulk-memory 特性不兼容，已在 Cargo.toml 通过 `wasm-opt = false` 禁用优化（不影响功能）
+- `hippocampus-presets::detect::tests::test_detect_from_explicit_env_valid` 在并行测试下偶发失败（env var race，与 WASM 改动无关，单线程模式下通过）
+
 ## [v2.34] - 2026-07-07
 
 ### 新增

@@ -12,4 +12,4 @@ pub mod bindings;
 // Task 8-10 启用
 pub use memory_storage::MemoryStorage;
 pub use js_storage::JsStorage;
-// pub use bindings::HippocampusCore;
+pub use bindings::HippocampusCore;

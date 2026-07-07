@@ -8,6 +8,14 @@ license.workspace = true
 repository.workspace = true
 description = "Hippocampus WASM 绑定 - 浏览器/Edge/多语言嵌入"
 
+# 禁用 wasm-opt 优化（避免本地 wasm-opt 版本与 Rust 工具链 bulk-memory 特性不兼容）
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = false
+[package.metadata.wasm-pack.profile.profiling]
+wasm-opt = false
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
