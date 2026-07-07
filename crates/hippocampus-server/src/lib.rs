@@ -126,6 +126,11 @@ pub fn create_router(state: AppState) -> axum::Router {
             "/api/v1/sessions/{sid}/archive",
             post(handlers::archive),
         )
+        // v2.34：压缩前一次性完整归档（与 archive 互补，输入 full_context 字符串）
+        .route(
+            "/api/v1/sessions/{sid}/pre-compress",
+            post(handlers::pre_compress),
+        )
         .route(
             "/api/v1/sessions/{sid}/memories/{hook_id}",
             get(handlers::retrieve).patch(handlers::update_memory),

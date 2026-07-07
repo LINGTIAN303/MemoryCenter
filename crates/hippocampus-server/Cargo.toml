@@ -32,6 +32,9 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
+# v2.34 pre_compress：生成 hook_id（uuid::Uuid::new_v4）+ 归档时间（chrono::Utc::now）
+uuid = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.0"
