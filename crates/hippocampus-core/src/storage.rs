@@ -1182,6 +1182,109 @@ impl Storage for LocalStorage {
         }
     }
 
+    // ========================================================================
+    // raw_context 原始上下文（v2.34 新增，pre_compress_hook 使用）
+    // ========================================================================
+
+    /// 写入 raw_context 文件（v2.34 新增，pre_compress_hook 调用）
+    ///
+    /// 写入 `sessions/{session_id}/raw_contexts/{hook_id}.txt`。
+    /// 不加 session 写锁（与 session_state.json / meta.json 同理，无并发冲突风险）。
+    /// 返回相对路径（POSIX 分隔符）。
+    async fn write_raw_context(
+        &self,
+        session_id: &str,
+        hook_id: &str,
+        content: &str,
+    ) -> crate::Result<String> {
+        let relative = self
+            .session_scope_dir(session_id)
+            .join("raw_contexts")
+            .join(format!("{}.txt", hook_id));
+        let abs = self.abs_path(&relative);
+        self.ensure_parent_dir(&abs).await?;
+
+        // 复用原子写入（temp + rename，防止崩溃导致文件损坏）
+        self.atomic_write(&abs, content.as_bytes()).await?;
+
+        tracing::debug!(
+            session_id = %session_id,
+            hook_id = %hook_id,
+            content_bytes = content.len(),
+            "raw_context 已写入"
+        );
+
+        Ok(Self::to_posix_string(&relative))
+    }
+
+    /// 读取 raw_context 文件内容（v2.34 新增）
+    ///
+    /// 从 `sessions/{session_id}/raw_contexts/{hook_id}.txt` 读取。
+    /// 文件不存在时返回 `Err`（与 `read_session_meta` 返回 `Option` 不同，
+    /// 因为压缩后重建时 raw_context 缺失是异常情况，应让调用方感知）。
+    async fn read_raw_context(
+        &self,
+        session_id: &str,
+        hook_id: &str,
+    ) -> crate::Result<String> {
+        let relative = self
+            .session_scope_dir(session_id)
+            .join("raw_contexts")
+            .join(format!("{}.txt", hook_id));
+        let abs = self.abs_path(&relative);
+
+        match tokio::fs::read_to_string(&abs).await {
+            Ok(content) => Ok(content),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(crate::Error::Storage(format!(
+                    "raw_context 文件不存在 {:?}",
+                    path_display(&relative)
+                )))
+            }
+            Err(e) => Err(crate::Error::Storage(format!(
+                "读取 raw_context 失败 {:?}: {}",
+                path_display(&relative),
+                e
+            ))),
+        }
+    }
+
+    /// 删除 raw_context 文件（v2.34 新增，随记忆删除级联）
+    ///
+    /// 删除 `sessions/{session_id}/raw_contexts/{hook_id}.txt`。
+    /// 文件不存在视为已删除，返回 `Ok(())`（幂等，与 `delete_index` 行为一致）。
+    async fn delete_raw_context(
+        &self,
+        session_id: &str,
+        hook_id: &str,
+    ) -> crate::Result<()> {
+        let relative = self
+            .session_scope_dir(session_id)
+            .join("raw_contexts")
+            .join(format!("{}.txt", hook_id));
+        let abs = self.abs_path(&relative);
+
+        match tokio::fs::remove_file(&abs).await {
+            Ok(()) => {
+                tracing::debug!(
+                    session_id = %session_id,
+                    hook_id = %hook_id,
+                    "raw_context 已删除"
+                );
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 文件不存在视为已删除（幂等，与 delete_index 一致）
+                Ok(())
+            }
+            Err(e) => Err(crate::Error::Storage(format!(
+                "删除 raw_context 失败 {:?}: {}",
+                path_display(&relative),
+                e
+            ))),
+        }
+    }
+
     /// 列出所有 session_id（v2.31 新增）
     ///
     /// 扫描 `sessions/` 目录下所有子目录名。
@@ -2307,5 +2410,158 @@ mod tests {
 
         let r3 = storage.update_memories_batch(&[]).await;
         assert!(r3.is_empty());
+    }
+
+    // ========================================================================
+    // v2.34 raw_context 3 方法测试（pre_compress_hook 持久化原始上下文）
+    // ========================================================================
+
+    mod v2_34_raw_context_tests {
+        use super::*;
+        use tempfile::TempDir;
+
+        /// 写入 raw_context 后返回的相对路径应包含 raw_contexts 和 hook_id
+        #[tokio::test]
+        async fn test_write_raw_context_creates_file() {
+            let tmp = TempDir::new().unwrap();
+            let storage = LocalStorage::new(tmp.path());
+
+            let session_id = "test-sess-v2-34";
+            let hook_id = "hook-001";
+            let content = r#"{"turns":[{"user":"hello"}]}"#;
+
+            let path = storage
+                .write_raw_context(session_id, hook_id, content)
+                .await
+                .expect("write_raw_context 应成功");
+
+            // 返回路径应包含 raw_contexts 目录和 hook_id
+            assert!(
+                path.contains("raw_contexts"),
+                "返回路径应包含 raw_contexts 目录, 实际: {}",
+                path
+            );
+            assert!(
+                path.contains(hook_id),
+                "返回路径应包含 hook_id, 实际: {}",
+                path
+            );
+            // 路径应为 POSIX 分隔符（不含反斜杠）
+            assert!(
+                !path.contains('\\'),
+                "返回路径应为 POSIX 分隔符, 实际: {}",
+                path
+            );
+            // 文件应实际存在于磁盘
+            let abs = std::path::Path::new(tmp.path()).join(&path);
+            assert!(
+                abs.exists(),
+                "raw_context 文件应存在于磁盘: {:?}",
+                abs
+            );
+        }
+
+        /// 写入后读取，内容应一致
+        #[tokio::test]
+        async fn test_read_raw_context_returns_content() {
+            let tmp = TempDir::new().unwrap();
+            let storage = LocalStorage::new(tmp.path());
+
+            let session_id = "test-sess-read";
+            let hook_id = "hook-read-001";
+            let content = r#"{"turns":[{"user":"你好","llm":"你好，我是助手"}]}"#;
+
+            storage
+                .write_raw_context(session_id, hook_id, content)
+                .await
+                .expect("write_raw_context 应成功");
+
+            let read_back = storage
+                .read_raw_context(session_id, hook_id)
+                .await
+                .expect("read_raw_context 应成功");
+
+            assert_eq!(
+                read_back, content,
+                "读取内容应与写入内容一致"
+            );
+        }
+
+        /// 删除后读取应失败（NotFound）
+        #[tokio::test]
+        async fn test_delete_raw_context_removes_file() {
+            let tmp = TempDir::new().unwrap();
+            let storage = LocalStorage::new(tmp.path());
+
+            let session_id = "test-sess-delete";
+            let hook_id = "hook-delete-001";
+            let content = r#"{"turns":[]}"#;
+
+            // 先写入
+            storage
+                .write_raw_context(session_id, hook_id, content)
+                .await
+                .expect("write_raw_context 应成功");
+
+            // 删除
+            storage
+                .delete_raw_context(session_id, hook_id)
+                .await
+                .expect("delete_raw_context 应成功");
+
+            // 再次读取应失败
+            let result = storage.read_raw_context(session_id, hook_id).await;
+            assert!(
+                result.is_err(),
+                "删除后读取应失败, 实际: {:?}",
+                result
+            );
+
+            // 再次删除应成功（幂等，NotFound 视为成功）
+            storage
+                .delete_raw_context(session_id, hook_id)
+                .await
+                .expect("重复删除应幂等成功");
+        }
+
+        /// 同一 hook_id 重复写入应覆盖原内容
+        #[tokio::test]
+        async fn test_write_raw_context_overwrites_existing() {
+            let tmp = TempDir::new().unwrap();
+            let storage = LocalStorage::new(tmp.path());
+
+            let session_id = "test-sess-overwrite";
+            let hook_id = "hook-overwrite-001";
+            let content_v1 = r#"{"version":1,"turns":[]}"#;
+            let content_v2 = r#"{"version":2,"turns":[{"user":"新内容"}]}"#;
+
+            // 第一次写入
+            storage
+                .write_raw_context(session_id, hook_id, content_v1)
+                .await
+                .expect("第一次 write_raw_context 应成功");
+
+            // 第二次写入（覆盖）
+            storage
+                .write_raw_context(session_id, hook_id, content_v2)
+                .await
+                .expect("第二次 write_raw_context 应成功");
+
+            // 读取应为 v2 内容
+            let read_back = storage
+                .read_raw_context(session_id, hook_id)
+                .await
+                .expect("read_raw_context 应成功");
+
+            assert_eq!(
+                read_back, content_v2,
+                "覆盖后读取应为 v2 内容, 实际: {}",
+                read_back
+            );
+            assert_ne!(
+                read_back, content_v1,
+                "覆盖后读取不应为 v1 内容"
+            );
+        }
     }
 }
