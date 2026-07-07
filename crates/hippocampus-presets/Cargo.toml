@@ -28,3 +28,5 @@ uuid = { workspace = true }
 tokio = { version = "1.0", features = ["rt", "macros"] }
 # v2.33：resolve_effective_scenario 测试需要 TempDir 创建临时存储
 tempfile = { workspace = true }
+# v2.35：env var 测试串行化（避免并行 set_var/remove_var 互相干扰）
+serial_test = "3"

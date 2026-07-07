@@ -314,6 +314,7 @@ pub fn resolve_scenario_name(family: &AgentFamily) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_detection_source_display() {
@@ -325,6 +326,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_detect_from_explicit_env_valid() {
         // 临时设置环境变量
         std::env::set_var("HIPPOCAMPUS_PRESET_AGENT", "Trae");
@@ -337,6 +339,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_detect_from_explicit_env_invalid_value() {
         std::env::set_var("HIPPOCAMPUS_PRESET_AGENT", "UnknownAgent");
         let result = detect_from_explicit_env();
@@ -347,6 +350,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_detect_from_explicit_env_unset() {
         std::env::remove_var("HIPPOCAMPUS_PRESET_AGENT");
         let result = detect_from_explicit_env();
@@ -401,6 +405,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_detect_from_env_var_prefix_no_match() {
         // 清理可能的干扰变量
         std::env::remove_var("CLAUDE_CODE_VERSION");
@@ -418,6 +423,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_detect_agent_client_explicit_env_priority() {
         // 注意：此测试验证 Layer 1 优先级，但 Rust 测试并行执行时
         // 全局环境变量可能被其他测试干扰，因此改为验证单层：
@@ -441,6 +447,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_detect_agent_client_fallback() {
         // 清理所有可能的识别信号
         std::env::remove_var("HIPPOCAMPUS_PRESET_AGENT");
@@ -477,6 +484,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_scenario_name_from_env() {
         std::env::set_var("HIPPOCAMPUS_PRESET_SCENARIO", "writing");
         let scenario = resolve_scenario_name(&AgentFamily::Trae);
@@ -486,6 +494,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_scenario_name_default_for_trae() {
         std::env::remove_var("HIPPOCAMPUS_PRESET_SCENARIO");
         let scenario = resolve_scenario_name(&AgentFamily::Trae);
@@ -493,6 +502,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_scenario_name_default_for_custom() {
         std::env::remove_var("HIPPOCAMPUS_PRESET_SCENARIO");
         let scenario = resolve_scenario_name(&AgentFamily::Custom("x".into()));
@@ -500,6 +510,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_detected_agent_family_is_default_when_fallback() {
         // 显式触发 Fallback 路径
         std::env::remove_var("HIPPOCAMPUS_PRESET_AGENT");
