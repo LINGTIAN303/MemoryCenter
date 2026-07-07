@@ -2,6 +2,61 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。变更格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## v2.36 - MCP Streamable HTTP 传输（2026-07-07）
+
+### 新增
+- **MCP Streamable HTTP 传输**：通过 `/mcp` 端点提供远程访问 + 多客户端共享能力
+  - 基于 rmcp 1.8 `transport-streamable-http-server` feature
+  - 与 REST API 共享同一个 Axum 服务（合并到 HTTP Server，无需独立进程）
+  - 支持 POST（请求）/ GET（SSE 流）/ DELETE（关闭 session）
+- **`hippocampus-mcp::bootstrap` 模块**：抽离 5 个启动期 `build_*` 函数供 stdio + HTTP 双入口复用
+  - `build_conflict_detector` / `build_session_search` / `build_summary_generator`
+  - `build_scenario_detector` / `build_combined_profile`
+- **`hippocampus-server::mcp` 模块**：MCP Streamable HTTP 路由挂载
+  - `McpConfig::from_env()`：环境变量驱动配置
+  - `mount_mcp_route()`：根据 stateful_mode 选择 SessionManager 并挂载到 Router
+  - `make_service_factory()`：闭包内构造 HippocampusMcp 实例（每 session 一个）
+
+### 改动
+- `Cargo.toml`（workspace）：rmcp 1.8 启用 `transport-io` + `transport-streamable-http-server` features
+- `crates/hippocampus-mcp/src/lib.rs`：新增 `pub mod bootstrap;`
+- `crates/hippocampus-mcp/src/main.rs`：移除内联 build_*，改用 `bootstrap::build_*`（stdio 行为不变）
+- `crates/hippocampus-server/Cargo.toml`：新增 rmcp + hippocampus-mcp + axum 依赖
+- `crates/hippocampus-server/src/lib.rs`：新增 `pub mod mcp;`
+- `crates/hippocampus-server/src/main.rs`：
+  - 移除 4 个本地 build_* 函数定义（~150 行）
+  - 改用 `bootstrap::build_*` 构造 AppState 组件
+  - 新增 MCP 启用/禁用逻辑（`HIPPOCAMPUS_MCP_ENABLED` 环境变量驱动，默认 false）
+  - 启用时调用 `mount_mcp_route(app, &mcp_config)` 追加 `/mcp` 路由
+- `crates/hippocampus-server/src/mcp.rs`：新建文件（配置 + service_factory + 路由挂载）
+
+### 配置项（新增环境变量）
+
+| 环境变量 | 说明 | 默认值 |
+|---------|------|--------|
+| `HIPPOCAMPUS_MCP_ENABLED` | 是否启用 MCP Streamable HTTP 端点 | `false`（需显式启用） |
+| `HIPPOCAMPUS_MCP_STATEFUL` | 是否启用 session 模式（true: LocalSessionManager / false: NeverSessionManager） | `true` |
+| `HIPPOCAMPUS_MCP_ALLOWED_HOSTS` | 允许的 Host 列表（逗号分隔，DNS rebinding 防护） | `localhost,127.0.0.1,::1` |
+| `HIPPOCAMPUS_MCP_ALLOWED_ORIGINS` | 允许的 Origin 列表（逗号分隔，CORS 防护） | 空（不校验 Origin） |
+
+### 设计决策
+- **合并到 HTTP Server**：与 REST API 共享同一 Axum 进程，避免独立部署
+- **`/mcp` 不经过 REST API 鉴权**：MCP 客户端使用 MCP 协议自身认证；DNS rebinding + CORS 由 `StreamableHttpServerConfig` 内部处理
+- **环境变量驱动 session 模式**：默认 `true`（LocalSessionManager，支持 SSE 流 + session 管理），可设为 `false`（无状态 JSON 响应）
+- **Agent 识别限制**：rmcp `service_factory` 签名不支持传入 ClientInfo，HTTP 模式下 per-session 识别依赖 `HIPPOCAMPUS_PRESET_AGENT` 环境变量（Layer 1），Layer 2 失效。生产环境推荐在 systemd unit 设置该变量
+- **stdio bin 保留**：`hippocampus-mcp` bin 仍为 stdio 模式入口，本地开发零配置
+
+### 测试
+- hippocampus-server: 41 passed（含 mcp.rs doc test ignored）
+- hippocampus-mcp: 51 passed（lib）+ 5 doc tests ignored
+- 总计 92 passed，0 failed
+- cargo build 全量编译通过
+
+### 向后兼容
+- 未设置 `HIPPOCAMPUS_MCP_ENABLED=true` 时，HTTP Server 行为与 v2.35 完全一致
+- stdio MCP bin 行为不变（仅 build_* 函数来源变更，逻辑等价）
+- 现有 `.mcp.json` 配置（stdio 模式）继续可用
+
 ## v2.35 - WASM 组件支持（2026-07-07）
 
 ### 新增

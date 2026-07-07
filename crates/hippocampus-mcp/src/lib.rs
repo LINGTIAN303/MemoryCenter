@@ -35,6 +35,10 @@
 //! }
 //! ```
 
+// v2.36：启动期组件构造函数（build_*）抽离到独立模块，
+// 供 hippocampus-mcp bin（stdio）和 hippocampus-server bin（HTTP）复用
+pub mod bootstrap;
+
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};

@@ -24,6 +24,11 @@ hippocampus-scenarios = { path = "../hippocampus-scenarios", version = "0.1.0" }
 hippocampus-models = { path = "../hippocampus-models", version = "0.1.0" }
 hippocampus-windows = { path = "../hippocampus-windows", version = "0.1.0" }
 hippocampus-skills = { path = "../hippocampus-skills", version = "0.1.0" }
+# v2.36: MCP Streamable HTTP 传输（合并到 HTTP Server）
+# - rmcp: 复用 workspace 声明（1.8 + transport-streamable-http-server feature）
+# - hippocampus-mcp: 复用 bootstrap 模块的 build_* 函数 + HippocampusMcp 服务实现
+rmcp = { workspace = true }
+hippocampus-mcp = { path = "../hippocampus-mcp" }
 axum.workspace = true
 tokio = { version = "1.0", features = ["full"] }
 tower-http.workspace = true

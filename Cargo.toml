@@ -27,7 +27,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"  # napi 3.x 要求 1.88（rmcp 1.7 要求 1.85，已满足）
+rust-version = "1.88"  # napi 3.x 要求 1.88（rmcp 1.8 要求 1.85，已满足）
 authors = ["lingtian303"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/LINGTIAN303/Hippocampus"
@@ -72,8 +72,14 @@ pyo3 = { version = "0.29", features = ["extension-module"] }
 # Node.js 绑定（v2.14 napi-rs 3.x，异步 Promise）
 napi = { version = "3", features = ["async", "tokio_rt"] }
 napi-derive = "3"
-# MCP 协议（v2.3 rmcp）
-rmcp = { version = "1.7", features = ["schemars", "transport-io"] }
+# MCP 协议（v2.3 rmcp；v2.36 升级到 1.8 + 新增 Streamable HTTP 传输）
+# - transport-io: stdio 传输（本地开发 + SSH 远程）
+# - transport-streamable-http-server: Streamable HTTP 传输（生产常驻 + 多客户端共享）
+rmcp = { version = "1.8", features = [
+    "schemars",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
 # 基准测试（v2.4 批次 4）
 criterion = { version = "0.5", features = ["async_tokio"] }
 # 临时目录（测试/基准测试用）

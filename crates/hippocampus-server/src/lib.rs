@@ -21,6 +21,7 @@
 
 mod error;
 mod handlers;
+pub mod mcp; // v2.36: MCP Streamable HTTP 传输（/mcp 端点）
 pub mod middleware;
 mod presets;
 
