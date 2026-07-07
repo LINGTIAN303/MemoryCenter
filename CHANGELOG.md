@@ -2,6 +2,49 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。变更格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v2.34] - 2026-07-07
+
+### 新增
+- **pre_compress_hook 工具**：压缩前一次性完整归档，与 archive 平级的独立 MCP 工具
+  - 双轨处理：raw_context 原样保存 + 解析 turns 复用 Archiver
+  - 伪钩子场景增强：通过 AGENTS.md 规则引导 LLM 在压缩前兆时调用
+- **IndexHook 扩展**：新增 `archive_reason` + `raw_context_path` 字段（`#[serde(default)]` 向后兼容）
+- **Storage trait 扩展**：新增 `write_raw_context` / `read_raw_context` / `delete_raw_context` 3 方法
+- **context_parser 模块**：JSON 数组 + User:/Assistant: 分隔符双解析器，失败返回 None 不阻塞
+- **HTTP 端点**：`POST /api/v1/sessions/:sid/pre-compress`
+- **文档更新**：AGENTS.md 新增第 3 节 + Rules 新增第 5 节「压缩前兆触发」
+
+### 改动
+- `crates/hippocampus-core/src/model.rs`：IndexHook 新增 2 字段 + 修复 5 处构造点
+- `crates/hippocampus-core/src/storage.rs`：Storage trait + LocalStorage 实现（文件 `sessions/{sid}/raw_contexts/{hook_id}.txt`）
+- `crates/hippocampus-core/src/sqlite.rs`：SqliteStorage 实现 + `raw_contexts` 表 + 幂等迁移
+- `crates/hippocampus-core/src/cache.rs`：CachedStorage 透传
+- `crates/hippocampus-core/src/context_parser.rs`：新建模块（263 行）
+- `crates/hippocampus-core/src/lib.rs`：导出 context_parser 模块
+- `crates/hippocampus-mcp/src/lib.rs`：PreCompressParams/Result + pre_compress_hook 方法 + 辅助方法
+- `crates/hippocampus-mcp/Cargo.toml`：uuid 提升为生产依赖
+- `crates/hippocampus-mcp/tests/pre_compress_integration.rs`：新建，4 个集成测试
+- `crates/hippocampus-server/src/handlers.rs`：PreCompressRequest + pre_compress_handler
+- `crates/hippocampus-server/src/lib.rs`：路由注册
+- `crates/hippocampus-server/Cargo.toml`：新增 uuid + chrono 生产依赖
+- `crates/hippocampus-server/tests/http_integration.rs`：新增 3 个 HTTP 集成测试
+- `AGENTS.md` + `.trae/rules/hippocampus-archive.md`：调用规则更新
+
+### 测试
+- core: 新增 19 个测试（2 向后兼容 + 4 LocalStorage + 5 SqliteStorage + 8 context_parser）
+- mcp: 新增 4 个集成测试
+- server: 新增 3 个 HTTP 集成测试
+- 全量测试通过（具体数量以实际运行为准）
+
+### 已知问题
+- pre_compress 端点对空 full_context 返回 200（与 archive 端点对空 turns 返回 400 不一致）
+  - 原因：遵循 spec 第七章「raw_context 永远先存，失败才阻塞」逻辑，未做显式空检查
+  - 影响：空字符串会写入空 raw_context 文件并返回 200 + parse_success=false
+  - 后续修复方向：如需统一行为，可在 handlers.rs 增加显式空检查
+
+### Commit 链
+- 859e160 / 28e7aa4 / 74f41c3 / 62ad05c / 057caa8 / 07b6eb4 / 87d7f2a / 75858d6 / e9a2f2b / 56a0227 / f4d8a2b
+
 ## [Unreleased]
 
 ### 计划中
