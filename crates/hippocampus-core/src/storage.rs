@@ -476,6 +476,71 @@ pub trait Storage: Send + Sync {
     ) -> crate::Result<Option<SessionMeta>> {
         Ok(None)
     }
+
+    // ========================================================================
+    // raw_context 原始上下文（v2.34 新增，pre_compress_hook 使用）
+    // ========================================================================
+
+    /// 写入 raw_context 文件（仅 pre_compress_hook 调用）
+    ///
+    /// 在 Trae 客户端压缩上下文前，由 pre_compress_hook 将完整原始上下文
+    /// （未摘要的轮次 JSON）持久化到存储后端，避免压缩丢失原始内容。
+    ///
+    /// ## 路径约定
+    ///
+    /// `sessions/{session_id}/raw_contexts/{hook_id}.txt`
+    ///
+    /// 返回相对路径（POSIX 分隔符）。
+    ///
+    /// ## 默认实现
+    ///
+    /// 默认返回 `Err`（旧后端不支持 raw_context 持久化）。
+    async fn write_raw_context(
+        &self,
+        _session_id: &str,
+        _hook_id: &str,
+        _content: &str,
+    ) -> crate::Result<String> {
+        Err(crate::Error::Storage(
+            "write_raw_context 未实现: 后端不支持 raw_context 持久化".into(),
+        ))
+    }
+
+    /// 读取 raw_context 文件内容（按 hook_id 检索）
+    ///
+    /// 用于压缩后重建上下文：LLM 通过 hook_id 拉取对应的原始上下文，
+    /// 与 hippocampus 一手记忆交叉校准 Trae Summary。
+    ///
+    /// ## 默认实现
+    ///
+    /// 默认返回 `Err`（旧后端不支持 raw_context 持久化）。
+    async fn read_raw_context(
+        &self,
+        _session_id: &str,
+        _hook_id: &str,
+    ) -> crate::Result<String> {
+        Err(crate::Error::Storage(
+            "read_raw_context 未实现: 后端不支持 raw_context 持久化".into(),
+        ))
+    }
+
+    /// 删除 raw_context 文件（随记忆删除级联）
+    ///
+    /// 当 `delete_memory_complete` 删除记忆时，应级联删除对应的 raw_context 文件。
+    /// NotFound 视为成功（幂等，与 `delete_index` 行为一致）。
+    ///
+    /// ## 默认实现
+    ///
+    /// 默认返回 `Err`（旧后端不支持 raw_context 持久化）。
+    async fn delete_raw_context(
+        &self,
+        _session_id: &str,
+        _hook_id: &str,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Storage(
+            "delete_raw_context 未实现: 后端不支持 raw_context 持久化".into(),
+        ))
+    }
 }
 
 /// 本地文件树存储后端
