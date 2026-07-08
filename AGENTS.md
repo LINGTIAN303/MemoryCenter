@@ -117,7 +117,7 @@ mcp_memory-center.detect_conflicts(session_id, hook_id, added_facts, revised_fac
 This session continues a previous conversation that lost its context.
 ```
 
-表明 Trae 客户端刚压缩了上下文，必须立即执行**压缩后行为协议**（详见 `.trae/rules/memory-center-archive.md` 的「压缩后行为协议」章节）：
+表明 Trae 客户端刚压缩了上下文，必须立即执行**压缩后行为协议**（详见 `docs/onboarding/rules/trae-memory-center-archive.md` 的「压缩后行为协议」章节）：
 
 1. 归档压缩前未持久化的轮次（如有）
 2. 调用 `prompt` 拉取 memory-center 一手记忆
@@ -299,6 +299,5 @@ memory-center 在以下情况会降级，但仍保持核心功能可用：
 ## 参考文档
 
 - [Trae 接入指南](docs/onboarding/trae.md)
-- [v2.30 Agent 接入路线图](docs/v2.30-roadmap-agent-onboarding.md)
 - [架构文档](docs/ARCHITECTURE.md)
 - [部署文档](docs/DEPLOY.md)

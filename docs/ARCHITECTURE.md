@@ -497,7 +497,7 @@ MemoryCenter 维护一份 `project_memory.md` 副本（`projects/{project_id}/pr
 
 | 模式 | 适用传输方式 | 行为 |
 |------|--------------|------|
-| 本地直接写入 | stdio | 直接在客户端本地路径创建规则文件（如 `.trae/rules/hippocampus-archive.md`） |
+| 本地直接写入 | stdio | 直接在客户端本地路径创建规则文件（如 `.trae/rules/memory-center-archive.md`，由 install_rules 工具自动生成） |
 | 远程模板模式 | Streamable HTTP | 返回模板内容，LLM 用 Write 工具创建文件 |
 
 远程模式解决了 Web 端 Agent 无法直接访问客户端本地文件系统的问题。

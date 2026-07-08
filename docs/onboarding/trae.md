@@ -243,7 +243,6 @@ trae-{项目名}-{日期}
 
 ## 7. 下一步
 
-- 阅读 [v2.30 路线图](../v2.30-roadmap-agent-onboarding.md) 了解 Agent 接入的完整设计思路（历史路线图，v2.3 已实现 11 个 Agent 预设自动识别）
 - 阅读 [架构文档](../ARCHITECTURE.md) 了解 memory-center 内部设计
 - 调整 `MEMORY_CENTER_PRESET_SCENARIO` 适配你的工作场景（coding/writing/research/daily/finance/design/officework 7 个内置 Scenario）
 - 如部署在远程服务器，参考 [部署文档](../DEPLOY.md) 配置 MCP Streamable HTTP 模式
