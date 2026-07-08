@@ -3,7 +3,7 @@ import json
 import uuid
 import requests
 
-HIPPO_BASE = "http://127.0.0.1:8765/api/v1"
+MC_BASE = "http://127.0.0.1:8765/api/v1"
 SID = "probe-session-001"
 
 
@@ -31,7 +31,7 @@ def make_turn(user_text: str, llm_text: str, tags: list[str], timestamp: str, to
 
 def archive(session_id: str, turns: list[dict]) -> dict:
     r = requests.post(
-        f"{HIPPO_BASE}/sessions/{session_id}/archive",
+        f"{MC_BASE}/sessions/{session_id}/archive",
         json={"turns": turns, "project_id": None},
         timeout=30,
     )
@@ -40,13 +40,13 @@ def archive(session_id: str, turns: list[dict]) -> dict:
 
 
 def summaries(session_id: str) -> dict:
-    r = requests.get(f"{HIPPO_BASE}/sessions/{session_id}/summaries", timeout=10)
+    r = requests.get(f"{MC_BASE}/sessions/{session_id}/summaries", timeout=10)
     r.raise_for_status()
     return r.json()
 
 
 def prompt(session_id: str) -> dict:
-    r = requests.get(f"{HIPPO_BASE}/sessions/{session_id}/prompt", timeout=10)
+    r = requests.get(f"{MC_BASE}/sessions/{session_id}/prompt", timeout=10)
     r.raise_for_status()
     return r.json()
 

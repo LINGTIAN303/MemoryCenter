@@ -1,9 +1,9 @@
-"""评测公共模块：环境加载、LLM 客户端、Hippo HTTP 封装、消息构造、时间戳解析、JSONL 续传。
+"""评测公共模块：环境加载、LLM 客户端、MemoryCenter HTTP 封装、消息构造、时间戳解析、JSONL 续传。
 
 设计要点：
 - .env 在模块导入时自动加载，后续脚本只需 `from common import *` 即可用全部工具
 - LLM 调用统一封装 call_llm()，内置简单重试（3 次指数退避）
-- Hippo 流程：archive（归档会话）→ /prompt（拉取记忆摘要），支持幂等（已归档则跳过）
+- MemoryCenter 流程：archive（归档会话）→ /prompt（拉取记忆摘要），支持幂等（已归档则跳过）
 - 断点续传：load_completed_keys() 读取已完成的 question_id/sample_id，跳过已完成项
 """
 from __future__ import annotations
@@ -35,7 +35,7 @@ if _ENV_PATH.exists():
 # ---------------------------------------------------------------------------
 # 2. 常量
 # ---------------------------------------------------------------------------
-HIPPO_BASE = os.environ.get("HIPPO_BASE_URL", "http://127.0.0.1:8765/api/v1")
+MC_BASE = os.environ.get("MEMORY_CENTER_BASE_URL", "http://127.0.0.1:8765/api/v1")
 
 # 结果目录
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
@@ -43,7 +43,7 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # 默认评测参数
 DEFAULT_MODELS = ["sensenova", "step"]
-DEFAULT_CONDITIONS = ["baseline", "hippo"]
+DEFAULT_CONDITIONS = ["baseline", "memory_center"]
 
 # 模型简称映射（用于 session_id 命名）
 MODEL_SHORT = {
@@ -160,14 +160,14 @@ def call_llm(
 # ---------------------------------------------------------------------------
 # 4. MemoryCenter HTTP API 封装
 # ---------------------------------------------------------------------------
-def hippo_archive(session_id: str, turns: list[dict], timeout: int = 60) -> dict:
+def mc_archive(session_id: str, turns: list[dict], timeout: int = 60) -> dict:
     """POST /sessions/{sid}/archive —— 归档会话，生成 daily 记忆文件。
 
     turns: MessageTurn 列表（用 make_message_turn 构造）。
     返回 SummaryView。
     """
     r = requests.post(
-        f"{HIPPO_BASE}/sessions/{session_id}/archive",
+        f"{MC_BASE}/sessions/{session_id}/archive",
         json={"turns": turns, "project_id": None},
         timeout=timeout,
     )
@@ -175,21 +175,21 @@ def hippo_archive(session_id: str, turns: list[dict], timeout: int = 60) -> dict
     return r.json()
 
 
-def hippo_get_summaries(session_id: str, timeout: int = 15) -> list[dict]:
+def mc_get_summaries(session_id: str, timeout: int = 15) -> list[dict]:
     """GET /sessions/{sid}/summaries —— 返回已归档的摘要列表。"""
-    r = requests.get(f"{HIPPO_BASE}/sessions/{session_id}/summaries", timeout=timeout)
+    r = requests.get(f"{MC_BASE}/sessions/{session_id}/summaries", timeout=timeout)
     r.raise_for_status()
     return r.json()
 
 
-def hippo_get_prompt(session_id: str, timeout: int = 30) -> str:
+def mc_get_prompt(session_id: str, timeout: int = 30) -> str:
     """GET /sessions/{sid}/prompt —— 返回可直接注入 system prompt 的记忆摘要文本。"""
-    r = requests.get(f"{HIPPO_BASE}/sessions/{session_id}/prompt", timeout=timeout)
+    r = requests.get(f"{MC_BASE}/sessions/{session_id}/prompt", timeout=timeout)
     r.raise_for_status()
     return r.json().get("prompt", "")
 
 
-def hippo_retrieve_all_content(session_id: str, timeout: int = 60) -> str:
+def mc_retrieve_all_content(session_id: str, timeout: int = 60) -> str:
     """retrieve 所有 MemoryFile 的完整对话内容，以紧凑格式返回。
 
     流程：
@@ -198,10 +198,10 @@ def hippo_retrieve_all_content(session_id: str, timeout: int = 60) -> str:
     3. 从 MemoryFile.turns 提取 user_message.text + llm_message.text
     4. 以紧凑格式拼接返回（User: xxx\\n\\nAssistant: yyy）
 
-    用于评测：hippo 条件下除了 /prompt 摘要钩子，还需 retrieve 完整对话内容，
+    用于评测：memory_center 条件下除了 /prompt 摘要钩子，还需 retrieve 完整对话内容，
     否则模型只看到摘要标题，无法回答需要具体细节的问题。
     """
-    summaries = hippo_get_summaries(session_id)
+    summaries = mc_get_summaries(session_id)
     if not summaries:
         return ""
 
@@ -211,7 +211,7 @@ def hippo_retrieve_all_content(session_id: str, timeout: int = 60) -> str:
         if not hook_id:
             continue
         r = requests.get(
-            f"{HIPPO_BASE}/sessions/{session_id}/memories/{hook_id}",
+            f"{MC_BASE}/sessions/{session_id}/memories/{hook_id}",
             timeout=timeout,
         )
         r.raise_for_status()
@@ -228,16 +228,16 @@ def hippo_retrieve_all_content(session_id: str, timeout: int = 60) -> str:
     return "\n\n".join(parts)
 
 
-def hippo_ensure_archived(session_id: str, turns: list[dict]) -> dict | None:
+def mc_ensure_archived(session_id: str, turns: list[dict]) -> dict | None:
     """幂等归档：若 session 已有摘要则跳过，否则归档。
 
-    用于断点续传场景——重跑 hippo 条件时不会重复归档。
+    用于断点续传场景——重跑 memory_center 条件时不会重复归档。
     返回：新建摘要（首次归档）或 None（已存在）。
     """
-    existing = hippo_get_summaries(session_id)
+    existing = mc_get_summaries(session_id)
     if existing:
         return None  # 已有数据，跳过
-    return hippo_archive(session_id, turns)
+    return mc_archive(session_id, turns)
 
 
 # ---------------------------------------------------------------------------

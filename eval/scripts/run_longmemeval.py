@@ -1,11 +1,11 @@
-"""LongMemEval 评测脚本：baseline（裸考）vs hippo（记忆摘要）对比。
+"""LongMemEval 评测脚本：baseline（裸考）vs memory_center（记忆摘要）对比。
 
 流程：
 1. 加载 longmemeval_oracle.json（500 题）
 2. 分层抽样 N 题（seed=42，覆盖所有 question_type）
 3. 对每题×每个模型×每个条件，生成 hypothesis：
    - baseline：原始 haystack 作为对话历史，直接问 LLM
-   - hippo：每 session 归档为 1 个 daily 记忆 → /prompt 拉摘要 → 注入 system prompt
+   - memory_center：每 session 归档为 1 个 daily 记忆 → /prompt 拉摘要 → 注入 system prompt
 4. DeepSeek-V4-Pro 做 LLM-as-judge（temperature=0, max_tokens=10）
 5. 输出 JSONL + 统计报告
 
@@ -36,10 +36,10 @@ from common import (
     call_llm,
     compact_jsonl,
     get_model_config,
-    hippo_archive,
-    hippo_get_prompt,
-    hippo_get_summaries,
-    hippo_retrieve_all_content,
+    mc_archive,
+    mc_get_prompt,
+    mc_get_summaries,
+    mc_retrieve_all_content,
     load_completed_keys,
     make_message_turn,
     parse_lme_timestamp,
@@ -213,8 +213,8 @@ def lme_build_baseline_messages(item: dict) -> list[dict]:
     return messages
 
 
-def lme_run_hippo(item: dict, model_short: str) -> tuple[list[dict], str]:
-    """执行 hippo 条件的归档 + 拉取摘要，返回 (messages, summary_prompt)。
+def lme_run_memory_center(item: dict, model_short: str) -> tuple[list[dict], str]:
+    """执行 memory_center 条件的归档 + 拉取摘要，返回 (messages, summary_prompt)。
 
     - session_id = f"lme-{question_id}-{model_short}"
     - 每个 haystack_session 归档为 1 个 daily 文件（幂等：已有则跳过）
@@ -225,18 +225,18 @@ def lme_run_hippo(item: dict, model_short: str) -> tuple[list[dict], str]:
     session_id = f"lme-{question_id}-{model_short}"
 
     # 幂等检查：若已有摘要，直接拉 prompt
-    existing = hippo_get_summaries(session_id)
+    existing = mc_get_summaries(session_id)
     if not existing:
         # 需要归档：逐 session 归档
         for date_str, session in zip(item["haystack_dates"], item["haystack_sessions"]):
             ts = parse_lme_timestamp(date_str)
             turns = lme_session_to_turns(session, ts)
             if turns:
-                hippo_archive(session_id, turns)
+                mc_archive(session_id, turns)
 
     # 拉取记忆摘要 + 完整对话内容
-    summary_prompt = hippo_get_prompt(session_id)
-    full_content = hippo_retrieve_all_content(session_id)
+    summary_prompt = mc_get_prompt(session_id)
+    full_content = mc_retrieve_all_content(session_id)
     system_prompt = (
         summary_prompt
         + "\n\n---\n\n以下是完整的对话记录：\n\n"
@@ -288,8 +288,8 @@ def evaluate_one(
         # 1. 生成 hypothesis
         if condition == "baseline":
             messages = lme_build_baseline_messages(item)
-        elif condition == "hippo":
-            messages, _ = lme_run_hippo(item, model_short)
+        elif condition == "memory_center":
+            messages, _ = lme_run_memory_center(item, model_short)
         else:
             raise ValueError(f"未知 condition: {condition}")
 
@@ -345,7 +345,7 @@ def compute_stats(records: list[dict]) -> dict:
 # 主流程
 # ---------------------------------------------------------------------------
 def main() -> int:
-    parser = argparse.ArgumentParser(description="LongMemEval 评测：baseline vs hippo")
+    parser = argparse.ArgumentParser(description="LongMemEval 评测：baseline vs memory_center")
     parser.add_argument("--n-questions", type=int, default=30, help="抽样题数（默认 30）")
     parser.add_argument("--models", type=str, default=",".join(DEFAULT_MODELS), help="逗号分隔的模型列表")
     parser.add_argument("--conditions", type=str, default=",".join(DEFAULT_CONDITIONS), help="逗号分隔的条件列表")

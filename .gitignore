@@ -34,7 +34,7 @@ coverage/
 **/.env
 eval/scripts/.env
 eval/results/
-eval/hippo_data/
+eval/mc_data/
 
 # MCP 客户端配置（含服务器地址，不提交）
 .mcp.json

@@ -199,7 +199,7 @@ nginx -s reload   # 重新加载
 | `https://openworld.dpdns.org/memory-center/api/v1/sessions/{sid}/summaries` | `http://127.0.0.1:8765/api/v1/sessions/{sid}/summaries` |
 | `https://openworld.dpdns.org/memory-center/mcp` | `http://127.0.0.1:8765/mcp`（MCP Streamable HTTP） |
 
-> `proxy_pass` 末尾带 `/` 会自动去除 `/hippo` 前缀。注意：`/memory-center/mcp` 的 `proxy_pass` 不带末尾 `/`，因为需要保留完整路径。
+> `proxy_pass` 末尾带 `/` 会自动去除 `/memory-center` 前缀。注意：`/memory-center/mcp` 的 `proxy_pass` 不带末尾 `/`，因为需要保留完整路径。
 
 ## 5. 验证部署
 

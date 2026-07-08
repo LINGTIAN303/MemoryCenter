@@ -1,10 +1,10 @@
-"""LoCoMo 评测脚本：baseline（裸考）vs hippo（记忆摘要）对比。
+"""LoCoMo 评测脚本：baseline（裸考）vs memory_center（记忆摘要）对比。
 
 流程：
 1. 加载 locomo10.json（10 个 sample）
 2. 对每个 sample×模型×条件，对每个 QA 生成 hypothesis：
    - baseline：所有 session 拼成对话历史，直接问 LLM
-   - hippo：每 session 归档为 1 个 daily 文件 → /prompt 拉摘要 → 注入 system prompt
+   - memory_center：每 session 归档为 1 个 daily 文件 → /prompt 拉摘要 → 注入 system prompt
 3. F1/EM 评分（严格复制自 locomo 官方 evaluation.py）
 4. 输出 JSONL + 统计报告
 
@@ -38,10 +38,10 @@ from common import (
     call_llm,
     compact_jsonl,
     get_model_config,
-    hippo_archive,
-    hippo_get_prompt,
-    hippo_get_summaries,
-    hippo_retrieve_all_content,
+    mc_archive,
+    mc_get_prompt,
+    mc_get_summaries,
+    mc_retrieve_all_content,
     load_completed_keys,
     make_message_turn,
     parse_locomo_timestamp,
@@ -200,8 +200,8 @@ def locomo_build_baseline_messages(sample: dict, question: str) -> list[dict]:
     return messages
 
 
-def locomo_run_hippo(sample: dict, model_short: str) -> tuple[str, str]:
-    """执行 hippo 条件的归档 + 拉取摘要和完整内容，返回 (summary_prompt, full_content)。
+def locomo_run_memory_center(sample: dict, model_short: str) -> tuple[str, str]:
+    """执行 memory_center 条件的归档 + 拉取摘要和完整内容，返回 (summary_prompt, full_content)。
 
     - session_id = f"locomo-{sample_id}-{model_short}"
     - 每个 session_N 归档为 1 个 daily 文件（幂等：已有则跳过）
@@ -212,17 +212,17 @@ def locomo_run_hippo(sample: dict, model_short: str) -> tuple[str, str]:
     speaker_a = conv["speaker_a"]
 
     # 幂等检查
-    existing = hippo_get_summaries(session_id)
+    existing = mc_get_summaries(session_id)
     if not existing:
         sessions = get_locomo_sessions(conv)
         for date_str, session_turns in sessions:
             ts = parse_locomo_timestamp(date_str)
             turns = locomo_session_to_turns(session_turns, speaker_a, ts)
             if turns:
-                hippo_archive(session_id, turns)
+                mc_archive(session_id, turns)
 
-    summary_prompt = hippo_get_prompt(session_id)
-    full_content = hippo_retrieve_all_content(session_id)
+    summary_prompt = mc_get_prompt(session_id)
+    full_content = mc_retrieve_all_content(session_id)
     return summary_prompt, full_content
 
 
@@ -244,12 +244,12 @@ def evaluate_sample(
 
     results: list[dict] = []
 
-    # hippo 条件：先归档一次，所有 QA 共享同一份记忆摘要
-    hippo_summary = ""
-    hippo_content = ""
-    if condition == "hippo":
+    # memory_center 条件：先归档一次，所有 QA 共享同一份记忆摘要
+    mc_summary = ""
+    mc_content = ""
+    if condition == "memory_center":
         try:
-            hippo_summary, hippo_content = locomo_run_hippo(sample, model_short)
+            mc_summary, mc_content = locomo_run_memory_center(sample, model_short)
         except Exception as e:  # noqa: BLE001
             # 归档失败，所有 QA 标记 error
             for idx, qa in enumerate(qas):
@@ -263,7 +263,7 @@ def evaluate_sample(
                     "answer": qa["answer"],
                     "hypothesis": "",
                     "f1": None,
-                    "error": f"hippo archive/prompt failed: {type(e).__name__}: {e}",
+                    "error": f"memory_center archive/prompt failed: {type(e).__name__}: {e}",
                 })
             return results
 
@@ -287,11 +287,11 @@ def evaluate_sample(
             # 构造 messages
             if condition == "baseline":
                 messages = locomo_build_baseline_messages(sample, qa["question"])
-            elif condition == "hippo":
+            elif condition == "memory_center":
                 system_prompt = (
-                    hippo_summary
+                    mc_summary
                     + "\n\n---\n\n以下是完整的对话记录：\n\n"
-                    + hippo_content
+                    + mc_content
                     + "\n\n---\n\n"
                     + "Based on the memory and conversation history above, answer the user's question. "
                     + "Do NOT attempt to call any tools or request memory retrieval. "
@@ -355,7 +355,7 @@ def compute_stats(records: list[dict]) -> dict:
 # 主流程
 # ---------------------------------------------------------------------------
 def main() -> int:
-    parser = argparse.ArgumentParser(description="LoCoMo 评测：baseline vs hippo")
+    parser = argparse.ArgumentParser(description="LoCoMo 评测：baseline vs memory_center")
     parser.add_argument("--n-samples", type=int, default=10, help="评测 sample 数（默认 10）")
     parser.add_argument("--models", type=str, default=",".join(DEFAULT_MODELS), help="逗号分隔的模型列表")
     parser.add_argument("--conditions", type=str, default=",".join(DEFAULT_CONDITIONS), help="逗号分隔的条件列表")

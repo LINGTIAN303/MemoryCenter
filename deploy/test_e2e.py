@@ -98,7 +98,7 @@ print(f"前 200 字符: {prompt[:200]}")
 # 5. 公网 Nginx 反代测试（走 openworld 域名 + Mozilla UA，避免 WAF 拦截）
 print(f"\n=== 5. 公网 Nginx 反代测试 ===")
 req = urllib.request.Request(
-    "https://openworld.dpdns.org/hippo/api/v1/sessions/e2e-test/summaries",
+    "https://openworld.dpdns.org/memory-center/api/v1/sessions/e2e-test/summaries",
     headers={**auth_headers(), "User-Agent": "Mozilla/5.0"},
 )
 resp = urllib.request.urlopen(req, timeout=10)
