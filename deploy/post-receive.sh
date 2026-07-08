@@ -6,8 +6,8 @@ set -e
 export PATH=/root/.cargo/bin:/usr/bin:/bin:/usr/local/bin:$PATH
 
 GIT_DIR=/root/memory-center.git
-WORK_DIR=/root/MemoryCenter-work
-BIN_DIR=/opt/memory-center-server/bin
+WORK_DIR=/root/memory-center-work
+BIN_DIR=/opt/memory-center/bin
 BIN_FILE=$BIN_DIR/memory-center-server
 
 while read oldrev newrev ref; do
@@ -28,8 +28,8 @@ while read oldrev newrev ref; do
         cargo build --release -p memory-center-server
 
         # 停止服务（二进制运行中无法直接覆盖）
-        echo "[deploy] 停止 memory-center-server 服务..."
-        systemctl stop memory-center-server || true
+        echo "[deploy] 停止 memory-center 服务..."
+        systemctl stop memory-center || true
 
         # 复制二进制
         echo "[deploy] 复制二进制到 $BIN_FILE..."
@@ -37,18 +37,18 @@ while read oldrev newrev ref; do
         cp target/release/memory-center-server "$BIN_FILE"
 
         # 启动服务
-        echo "[deploy] 启动 memory-center-server 服务..."
-        systemctl start memory-center-server
+        echo "[deploy] 启动 memory-center 服务..."
+        systemctl start memory-center
 
         # 验证
         sleep 2
-        if systemctl is-active --quiet memory-center-server; then
+        if systemctl is-active --quiet memory-center; then
             echo "[deploy] ============================================"
             echo "[deploy] 部署成功"
             echo "[deploy] ============================================"
         else
             echo "[deploy] 错误：服务启动失败"
-            systemctl status memory-center-server --no-pager | tail -20
+            systemctl status memory-center --no-pager | tail -20
             exit 1
         fi
     fi

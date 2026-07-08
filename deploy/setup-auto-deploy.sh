@@ -6,8 +6,8 @@ set -e
 export PATH=/root/.cargo/bin:/usr/bin:/bin:/usr/local/bin:$PATH
 
 GIT_DIR=/root/memory-center.git
-WORK_DIR=/root/MemoryCenter-work
-BIN_DIR=/opt/memory-center-server/bin
+WORK_DIR=/root/memory-center-work
+BIN_DIR=/opt/memory-center/bin
 
 echo "=== 1. 创建裸仓库 ==="
 if [ -d "$GIT_DIR" ]; then
@@ -26,8 +26,8 @@ set -e
 export PATH=/root/.cargo/bin:/usr/bin:/bin:/usr/local/bin:$PATH
 
 GIT_DIR=/root/memory-center.git
-WORK_DIR=/root/MemoryCenter-work
-BIN_DIR=/opt/memory-center-server/bin
+WORK_DIR=/root/memory-center-work
+BIN_DIR=/opt/memory-center/bin
 
 while read oldrev newrev ref; do
     if [ "$ref" = "refs/heads/main" ]; then
@@ -52,19 +52,19 @@ while read oldrev newrev ref; do
         cp target/release/memory-center-server "$BIN_DIR/"
 
         # 重启服务
-        echo "[deploy] 重启 memory-center-server 服务..."
-        systemctl restart memory-center-server
+        echo "[deploy] 重启 memory-center 服务..."
+        systemctl restart memory-center
 
         # 验证
         sleep 2
-        if systemctl is-active --quiet memory-center-server; then
+        if systemctl is-active --quiet memory-center; then
             echo "[deploy] 服务启动成功"
             echo "[deploy] ============================================"
             echo "[deploy] 部署完成"
             echo "[deploy] ============================================"
         else
             echo "[deploy] 错误：服务启动失败"
-            systemctl status memory-center-server --no-pager | tail -20
+            systemctl status memory-center --no-pager | tail -20
             exit 1
         fi
     fi
@@ -78,10 +78,10 @@ mkdir -p "$WORK_DIR"
 echo "工作目录: $WORK_DIR"
 
 echo "=== 4. 验证现有服务状态 ==="
-if systemctl is-active --quiet memory-center-server; then
-    echo "memory-center-server 服务运行中"
+if systemctl is-active --quiet memory-center; then
+    echo "memory-center 服务运行中"
 else
-    echo "警告：memory-center-server 服务未运行"
+    echo "警告：memory-center 服务未运行"
 fi
 
 echo ""

@@ -116,7 +116,7 @@ RestartSec=3
 WantedBy=multi-user.target
 ```
 
-> 仓库提供模板文件 `deploy/memory-center-server.service.template`，可复制后修改路径和 API Key。
+> 仓库提供模板文件 `deploy/memory-center.service.example`，可复制后修改路径和 API Key。
 
 启用并启动：
 

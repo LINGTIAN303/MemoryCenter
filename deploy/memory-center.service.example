@@ -1,0 +1,55 @@
+# MemoryCenter systemd 服务模板
+# 使用方式：
+#   1. 复制此文件到服务器：scp deploy/memory-center.service.example root@your-server:/etc/systemd/system/memory-center.service
+#   2. 替换所有 <PLACEHOLDER> 占位符为真实值
+#   3. systemctl daemon-reload && systemctl enable --now memory-center
+#
+# 安全提示：
+#   - MEMORY_CENTER_API_KEY 用 `openssl rand -hex 32` 生成强随机值
+#   - LLM API Key 切勿提交到 Git 仓库
+#   - 生产环境的真实 service 文件不应入库，仅在服务器本地维护
+
+[Unit]
+Description=MemoryCenter Memory Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/memory-center
+Environment=MEMORY_CENTER_HOST=127.0.0.1
+Environment=MEMORY_CENTER_PORT=8765
+Environment=MEMORY_CENTER_ROOT=/opt/memory-center/data
+# 必填：API Key（openssl rand -hex 32 生成）
+Environment=MEMORY_CENTER_API_KEY=<your-api-key-here>
+# MCP Streamable HTTP 端点（v2.36+）
+Environment=MEMORY_CENTER_MCP_ENABLED=true
+# MCP session 模式（true: 支持 SSE 流 + session 管理）
+Environment=MEMORY_CENTER_MCP_STATEFUL=true
+# DNS rebinding 防护：允许的 Host 列表（逗号分隔）
+Environment=MEMORY_CENTER_MCP_ALLOWED_HOSTS=localhost,127.0.0.1,::1,<your-domain>
+# CORS 防护：允许的 Origin 列表（逗号分隔）
+Environment=MEMORY_CENTER_MCP_ALLOWED_ORIGINS=https://<your-domain>
+# 日志级别
+Environment=RUST_LOG=memory_center_server=info,tower_http=info
+
+# ===== LLM 摘要生成器（可选，未配置则降级为启发式摘要）=====
+Environment=MEMORY_CENTER_GENERATOR_API_URL=<https://your-llm-api.example.com/v1/chat/completions>
+Environment=MEMORY_CENTER_GENERATOR_API_KEY=<sk-your-generator-key-here>
+Environment=MEMORY_CENTER_GENERATOR_MODEL=<your-generator-model>
+Environment=MEMORY_CENTER_GENERATOR_TIMEOUT=60
+Environment=MEMORY_CENTER_GENERATOR_MAX_TOKENS=500
+
+# ===== LLM 冲突检测器（可选，未配置则降级为启发式纯算法）=====
+Environment=MEMORY_CENTER_DETECTOR_API_URL=<https://your-llm-api.example.com/chat/completions>
+Environment=MEMORY_CENTER_DETECTOR_API_KEY=<sk-your-detector-key-here>
+Environment=MEMORY_CENTER_DETECTOR_MODEL=<your-detector-model>
+Environment=MEMORY_CENTER_DETECTOR_TIMEOUT=30
+Environment=MEMORY_CENTER_DETECTOR_MAX_TOKENS=500
+
+ExecStart=/opt/memory-center/bin/memory-center-server
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
