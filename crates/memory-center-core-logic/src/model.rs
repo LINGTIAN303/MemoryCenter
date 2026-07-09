@@ -44,10 +44,11 @@ fn default_tags() -> Vec<Tag> {
 /// 3. `attachments` 含视频 → `Video`
 /// 4. `attachments` 含语音 → `Voice`
 /// 5. `attachments` 含文件 → `FileAttachment`
-/// 6. `thinking` 非空 → `Thinking`
-/// 7. `text` 含代码块（``` ） → `CodeBlock`
-/// 8. `text` 含 URL（http:// 或 https://） → `Url`
-/// 9. 以上都不匹配 → `Text`（兜底）
+/// 6. `file_changes` 非空 → `CodeBlock`（文件修改通常涉及代码）
+/// 7. `thinking` 非空 → `Thinking`
+/// 8. `text` 含代码块（``` ） → `CodeBlock`
+/// 9. `text` 含 URL（http:// 或 https://） → `Url`
+/// 10. 以上都不匹配 → `Text`（兜底）
 pub fn infer_tags(content: &MessageContent) -> Vec<Tag> {
     let mut tags: Vec<Tag> = Vec::new();
 
@@ -83,16 +84,25 @@ pub fn infer_tags(content: &MessageContent) -> Vec<Tag> {
         }
     }
 
-    // 6. 思考过程（reasoning model 的思考链）
+    // 6. 文件变更（v2.45 新增）
+    if !content.file_changes.is_empty() {
+        if !tags.contains(&Tag::CodeBlock) {
+            tags.push(Tag::CodeBlock);
+        }
+    }
+
+    // 7. 思考过程（reasoning model 的思考链）
     if content.thinking.as_ref().is_some_and(|s| !s.is_empty()) {
         tags.push(Tag::Thinking);
     }
 
-    // 7-8. 文本特征检测
+    // 8-9. 文本特征检测
     if let Some(text) = &content.text {
         // 代码块检测（``` 或缩进 4 空格的代码风格）
         if text.contains("```") {
-            tags.push(Tag::CodeBlock);
+            if !tags.contains(&Tag::CodeBlock) {
+                tags.push(Tag::CodeBlock);
+            }
         }
         // URL 检测（简单的 http/https 协议匹配）
         if text.contains("http://") || text.contains("https://") {
@@ -100,7 +110,7 @@ pub fn infer_tags(content: &MessageContent) -> Vec<Tag> {
         }
     }
 
-    // 9. 兜底：如果没有任何特征标签，标为 Text
+    // 10. 兜底：如果没有任何特征标签，标为 Text
     if tags.is_empty() {
         tags.push(Tag::Text);
     }
@@ -113,7 +123,7 @@ pub fn infer_tags(content: &MessageContent) -> Vec<Tag> {
 /// 经验值：英文 4 char ≈ 1 token，中文 1.5 char ≈ 1 token
 /// 取折中：3 char ≈ 1 token（中文偏高，英文偏低，整体可接受）
 ///
-/// 估算范围：text + thinking + tool_calls(arguments + result)
+/// 估算范围：text + thinking + tool_calls(arguments + result) + file_changes(patch)
 pub fn estimate_tokens(content: &MessageContent) -> usize {
     let mut chars: usize = 0;
 
@@ -132,6 +142,17 @@ pub fn estimate_tokens(content: &MessageContent) -> usize {
         chars += tc.name.chars().count();
         chars += tc.arguments.chars().count();
         chars += tc.result.chars().count();
+        // v2.45：纳入错误信息
+        if let Some(err) = &tc.error {
+            chars += err.chars().count();
+        }
+    }
+
+    // v2.45：文件变更的 patch 内容
+    for fc in &content.file_changes {
+        if let Some(patch) = &fc.patch {
+            chars += patch.chars().count();
+        }
     }
 
     // 3 char ≈ 1 token（折中估算）
@@ -246,9 +267,23 @@ pub struct MessageTurn {
     /// 该轮次消耗的 token 数（用于归档阈值计量，缺省时为 0）
     #[serde(default)]
     pub token_count: usize,
+    /// LLM 停止原因（v2.45 新增，可选）
+    ///
+    /// 通用值：`"stop"` / `"length"` / `"tool_use"` / `"max_tokens"` / `"content_filter"`。
+    /// 不同 provider 的停止原因枚举不同，直接透传字符串。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// 单轮成本（v2.45 新增，可选，单位：美元）
+    ///
+    /// 来源：LLM provider 返回的 usage 费用。
+    /// 不同 Agent adapter 按能力填充。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
 }
 
 /// 消息内容（支持多种媒介）
+///
+/// v2.45 新增 file_changes 字段，记录文件变更信息。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageContent {
     /// 文本部分（可能为空，如纯图片消息）
@@ -263,9 +298,19 @@ pub struct MessageContent {
     /// 思考过程（如 reasoning model 的思考链）
     #[serde(default)]
     pub thinking: Option<String>,
+    /// 文件变更记录（v2.45 新增）
+    ///
+    /// 记录该消息触发的文件修改（增/删/改）。
+    /// 不同 Agent adapter 按能力填充：
+    /// - OpenCode：patch part + user 消息的 summary.diffs
+    /// - ClaudeCode：edit/write 工具的执行结果
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_changes: Vec<FileChange>,
 }
 
 /// 附件（文件/图片/视频/语音等非文本内容）
+///
+/// v2.45 新增 filename/source 字段，均为可选。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attachment {
     /// 附件类型
@@ -276,6 +321,15 @@ pub struct Attachment {
     pub mime_type: Option<String>,
     /// 大小（字节）
     pub size: Option<u64>,
+    /// 文件名（v2.45 新增，可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    /// 来源类型（v2.45 新增，可选）
+    ///
+    /// 通用值：`"file"` / `"symbol"` / `"resource"` / `"data_url"`。
+    /// 不同 Agent 的来源分类不同，直接透传。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// 附件种类
@@ -292,6 +346,9 @@ pub enum AttachmentKind {
 }
 
 /// 工具调用记录
+///
+/// v2.45 新增 status/error/call_id 字段，均为可选，向后兼容。
+/// 不同 Agent adapter 按能力填充，缺失时为 None。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolInvocation {
     /// 工具名称（如 Codex / WebSearch 等）
@@ -301,7 +358,53 @@ pub struct ToolInvocation {
     /// 调用结果（JSON 字符串）
     pub result: String,
     /// 调用耗时（毫秒）
+    #[serde(default)]
     pub duration_ms: Option<u64>,
+    /// 工具执行状态（v2.45 新增）
+    ///
+    /// 通用值：`"completed"` / `"error"` / `"running"` / `"pending"`。
+    /// 不同 Agent 可能有自己的状态枚举，直接透传字符串。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// 错误信息（v2.45 新增）
+    ///
+    /// 工具执行失败时的错误描述，仅 status="error" 时有值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// 工具调用唯一标识（v2.45 新增）
+    ///
+    /// 用于关联同一工具调用的多个 part（如 OpenCode 的 callID）。
+    /// 不同 Agent 的标识格式不同，直接透传字符串。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+}
+
+/// 文件变更记录（v2.45 新增）
+///
+/// 通用结构，记录一轮对话中发生的文件修改。
+/// 不同 Agent 的 adapter 各自映射：
+/// - OpenCode：patch part（hash + files）+ user 消息的 summary.diffs
+/// - ClaudeCode：tool_use 的 edit/write 结果
+/// - 其他 Agent：按实际能力填充
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileChange {
+    /// 文件路径
+    pub file_path: String,
+    /// 变更状态：`"added"` / `"deleted"` / `"modified"` / `"renamed"`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// 新增行数
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additions: Option<usize>,
+    /// 删除行数
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<usize>,
+    /// diff patch 内容（Unified diff 格式）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<String>,
+    /// git hash（如 OpenCode patch part 的 hash 字段）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
 }
 
 /// 记忆文件（一次归档的完整上下文）

@@ -744,16 +744,20 @@ mod tests {
                 attachments: Vec::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                file_changes: Vec::new(),
             },
             llm_message: MessageContent {
                 text: Some(llm_text.into()),
                 attachments: Vec::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                file_changes: Vec::new(),
             },
             tags,
             timestamp: Utc::now(),
             token_count,
+            stop_reason: None,
+            cost: None,
         }
     }
 

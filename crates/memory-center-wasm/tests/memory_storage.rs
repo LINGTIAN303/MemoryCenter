@@ -24,16 +24,20 @@ fn make_test_memory_file() -> MemoryFile {
             attachments: vec![],
             tool_calls: vec![],
             thinking: None,
+            file_changes: Vec::new(),
         },
         llm_message: MessageContent {
             text: Some("测试 LLM 回复".to_string()),
             attachments: vec![],
             tool_calls: vec![],
             thinking: None,
+            file_changes: Vec::new(),
         },
         tags: vec![Tag::Text],
         timestamp: Utc::now(),
         token_count: 10,
+        stop_reason: None,
+        cost: None,
     };
     MemoryFile::new(
         "test-session",

@@ -1149,16 +1149,20 @@ mod tests {
                 attachments: Vec::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                file_changes: Vec::new(),
             },
             llm_message: MessageContent {
                 text: Some("reply".into()),
                 attachments: Vec::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                file_changes: Vec::new(),
             },
             tags: vec![Tag::Text],
             timestamp: Utc::now(),
             token_count: 10,
+            stop_reason: None,
+            cost: None,
         });
 
         let (_, hook) = archiver.archive().await.expect("归档失败");
@@ -1280,16 +1284,20 @@ mod tests {
                 attachments: Vec::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                file_changes: Vec::new(),
             },
             llm_message: MessageContent {
                 text: Some("回复".into()),
                 attachments: Vec::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                file_changes: Vec::new(),
             },
             tags: vec![Tag::Text],
             timestamp: Utc::now(),
             token_count: 10,
+            stop_reason: None,
+            cost: None,
         });
 
         let (_, hook) = archiver.archive().await.unwrap();

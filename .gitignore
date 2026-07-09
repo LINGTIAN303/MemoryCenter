@@ -1,6 +1,7 @@
 # Rust
 /target
 **/target
+target_new/
 Cargo.lock
 *.pdb
 

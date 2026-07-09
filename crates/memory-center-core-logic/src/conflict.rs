@@ -732,16 +732,20 @@ mod tests {
                 attachments: vec![],
                 tool_calls: vec![],
                 thinking: None,
+                file_changes: Vec::new(),
             },
             llm_message: MessageContent {
                 text: Some("助手回复".to_string()),
                 attachments: vec![],
                 tool_calls: vec![],
                 thinking: None,
+                file_changes: Vec::new(),
             },
             tags: vec![],
             timestamp: Utc::now(),
             token_count: 100,
+            stop_reason: None,
+            cost: None,
         };
 
         MemoryFile {
@@ -1721,16 +1725,20 @@ mod v2_28_merge_tests {
                 attachments: vec![],
                 tool_calls: vec![],
                 thinking: None,
+                file_changes: Vec::new(),
             },
             llm_message: MessageContent {
                 text: Some("助手回复".to_string()),
                 attachments: vec![],
                 tool_calls: vec![],
                 thinking: None,
+                file_changes: Vec::new(),
             },
             tags: vec![],
             timestamp: Utc::now(),
             token_count: 100,
+            stop_reason: None,
+            cost: None,
         };
         MemoryFile {
             id: Uuid::new_v4(),

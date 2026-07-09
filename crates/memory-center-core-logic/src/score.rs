@@ -298,16 +298,20 @@ mod tests {
                 attachments: Vec::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                file_changes: Vec::new(),
             },
             llm_message: MessageContent {
                 text: Some("测试回复".into()),
                 attachments: Vec::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                file_changes: Vec::new(),
             },
             tags: vec![Tag::Text],
             timestamp: archived_at,
             token_count: 100,
+            stop_reason: None,
+            cost: None,
         };
         let mut file = MemoryFile::new("test-session", None, vec![turn], ArchivePeriod::Weekly);
         file.archived_at = archived_at;

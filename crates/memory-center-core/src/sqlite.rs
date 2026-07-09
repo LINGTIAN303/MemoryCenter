@@ -1182,16 +1182,20 @@ mod tests {
                 attachments: Vec::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                file_changes: Vec::new(),
             },
             llm_message: MessageContent {
                 text: Some("LLM 答：通过归档+索引+检索三级机制".into()),
                 attachments: Vec::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                file_changes: Vec::new(),
             },
             tags: vec![Tag::Text, Tag::CodeBlock],
             timestamp: Utc::now(),
             token_count: 100,
+            stop_reason: None,
+            cost: None,
         };
         MemoryFile::new(
             String::from(session_id),
@@ -1578,16 +1582,20 @@ mod tests {
                     attachments: Vec::new(),
                     tool_calls: Vec::new(),
                     thinking: None,
+                    file_changes: Vec::new(),
                 },
                 llm_message: MessageContent {
                     text: Some("WAL 模式支持并发读".into()),
                     attachments: Vec::new(),
                     tool_calls: Vec::new(),
                     thinking: None,
+                    file_changes: Vec::new(),
                 },
                 tags: vec![Tag::Text],
                 timestamp: Utc::now(),
                 token_count: 60,
+                stop_reason: None,
+                cost: None,
             };
             t
         });
@@ -1599,16 +1607,20 @@ mod tests {
                     attachments: Vec::new(),
                     tool_calls: Vec::new(),
                     thinking: None,
+                    file_changes: Vec::new(),
                 },
                 llm_message: MessageContent {
                     text: Some("r2d2 提供 8 个连接".into()),
                     attachments: Vec::new(),
                     tool_calls: Vec::new(),
                     thinking: None,
+                    file_changes: Vec::new(),
                 },
                 tags: vec![Tag::Text],
                 timestamp: Utc::now(),
                 token_count: 50,
+                stop_reason: None,
+                cost: None,
             };
             t
         });

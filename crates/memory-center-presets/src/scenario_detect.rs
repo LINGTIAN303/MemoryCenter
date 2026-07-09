@@ -573,16 +573,20 @@ mod tests {
                 attachments: vec![],
                 tool_calls: vec![],
                 thinking: None,
+                file_changes: Vec::new(),
             },
             llm_message: MessageContent {
                 text: Some(llm.to_string()),
                 attachments: vec![],
                 tool_calls: vec![],
                 thinking: None,
+                file_changes: Vec::new(),
             },
             tags: vec![],
             timestamp: Utc::now(),
             token_count: 100,
+            stop_reason: None,
+            cost: None,
         }
     }
 

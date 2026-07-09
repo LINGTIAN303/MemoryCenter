@@ -24,16 +24,20 @@ fn make_turn(user: &str, llm: &str) -> MessageTurn {
             attachments: Vec::new(),
             tool_calls: Vec::new(),
             thinking: None,
+            file_changes: Vec::new(),
         },
         llm_message: MessageContent {
             text: Some(llm.into()),
             attachments: Vec::new(),
             tool_calls: Vec::new(),
             thinking: None,
+            file_changes: Vec::new(),
         },
         tags: vec![Tag::Text],
         timestamp: Utc::now(),
         token_count: 100,
+        stop_reason: None,
+        cost: None,
     }
 }
 

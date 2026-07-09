@@ -302,7 +302,9 @@ async fn archive_compaction_event(
             "{}\n\n--- Recent Context ---\n{}",
             compaction.summary, compaction.recent
         )),
-        token_count: None, // 压缩摘要无真实 token 数
+        token_count: None,      // 压缩摘要无真实 token 数
+        stop_reason: None,      // 压缩摘要无停止原因
+        cost: None,             // 压缩摘要无成本
     };
     turns.push(summary_turn);
 

@@ -1158,16 +1158,20 @@ mod tests {
                 attachments: Vec::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                file_changes: Vec::new(),
             },
             llm_message: MessageContent {
                 text: Some("LLM 答：可以通过归档+索引+检索三级机制实现...".into()),
                 attachments: Vec::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                file_changes: Vec::new(),
             },
             tags: vec![Tag::Text, Tag::CodeBlock],
             timestamp: Utc::now(),
             token_count: 100,
+            stop_reason: None,
+            cost: None,
         };
         MemoryFile::new(session_id, None, vec![turn], period)
     }

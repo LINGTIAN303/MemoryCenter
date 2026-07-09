@@ -34,16 +34,20 @@ fn make_turn_with_tags(
             attachments: Vec::new(),
             tool_calls: Vec::new(),
             thinking: None,
+            file_changes: Vec::new(),
         },
         llm_message: MessageContent {
             text: Some(llm_text.into()),
             attachments: Vec::new(),
             tool_calls: Vec::new(),
             thinking: None,
+            file_changes: Vec::new(),
         },
         tags,
         timestamp: Utc::now(),
         token_count,
+        stop_reason: None,
+        cost: None,
     }
 }
 
@@ -70,6 +74,9 @@ fn make_turn_with_tool_call(user_text: &str, token_count: usize) -> MessageTurn 
         arguments: r#"{"query":"Rust memory库"}"#.into(),
         result: r#"{"results":[]}"#.into(),
         duration_ms: Some(120),
+        status: None,
+        error: None,
+        call_id: None,
     }];
     turn
 }

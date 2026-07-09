@@ -3982,6 +3982,7 @@ mod tests {
         let params = Parameters(PromptParams {
             session_id: session_id.to_string(),
             project_id: None,
+            max_hooks: None,
         });
         let prompt = mcp.prompt(params).await.expect("渲染 prompt 失败");
         assert!(!prompt.is_empty(), "prompt 不应为空");
@@ -4176,6 +4177,7 @@ mod tests {
         let params = Parameters(PromptParams {
             session_id: session_id.to_string(),
             project_id: Some("proj-1".to_string()),
+            max_hooks: None,
         });
         let prompt = mcp.prompt(params).await.unwrap();
         assert!(!prompt.is_empty());

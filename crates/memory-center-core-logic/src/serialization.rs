@@ -116,16 +116,20 @@ mod tests {
                 attachments: Vec::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                file_changes: Vec::new(),
             },
             llm_message: MessageContent {
                 text: Some("测试 LLM 回复".into()),
                 attachments: Vec::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                file_changes: Vec::new(),
             },
             tags: vec![Tag::Text],
             timestamp: Utc::now(),
             token_count: 50,
+            stop_reason: None,
+            cost: None,
         };
         MemoryFile::new(
             String::from("test-session"),
