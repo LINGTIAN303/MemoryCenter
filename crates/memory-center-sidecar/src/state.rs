@@ -8,7 +8,7 @@
 //! 路径：`--state-file` 指定，默认按平台：
 //! - Linux: `~/.local/share/mc-sidecar/state.json`
 //! - macOS: `~/Library/Application Support/mc-sidecar/state.json`
-//! - Windows: `%APPDATA%\mc-sidecar\state.json`
+//! - Windows: `~/.local/share/mc-sidecar/state.json`
 //!
 //! ## 结构
 //!
@@ -106,16 +106,14 @@ pub fn resolve_state_path(cli_path: Option<&PathBuf>) -> Result<PathBuf, std::io
     }
 
     // 平台默认路径
+    // 注意：Windows 上也使用 ~/.local/share/mc-sidecar/ 路径（与 opencode 一致）
     let path = if cfg!(target_os = "linux") {
         dirs_home().join(".local/share/mc-sidecar/state.json")
     } else if cfg!(target_os = "macos") {
         dirs_home()
             .join("Library/Application Support/mc-sidecar/state.json")
     } else if cfg!(target_os = "windows") {
-        std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| dirs_home().join("AppData/Roaming"))
-            .join("mc-sidecar/state.json")
+        dirs_home().join(".local/share/mc-sidecar/state.json")
     } else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,

@@ -60,7 +60,7 @@ pub struct SidecarConfig {
     /// 默认按平台：
     /// - Linux: ~/.local/share/mc-sidecar/state.json
     /// - macOS: ~/Library/Application Support/mc-sidecar/state.json
-    /// - Windows: %APPDATA%\mc-sidecar\state.json
+    /// - Windows: ~/.local/share/mc-sidecar/state.json
     #[arg(long, env = "MC_SIDECAR_STATE_FILE")]
     pub state_file: Option<PathBuf>,
 }
@@ -75,15 +75,14 @@ impl SidecarConfig {
         }
 
         // 平台默认路径
+        // 注意：opencode 在所有平台都使用类 Unix 路径风格（~/.local/share/opencode）
         let path = if cfg!(target_os = "linux") {
             dirs_home().join(".local/share/opencode/opencode.db")
         } else if cfg!(target_os = "macos") {
             dirs_home().join("Library/Application Support/opencode/opencode.db")
         } else if cfg!(target_os = "windows") {
-            std::env::var("APPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| dirs_home().join("AppData/Roaming"))
-                .join("opencode/opencode.db")
+            // opencode 在 Windows 上也使用 ~/.local/share/opencode 路径（非 %APPDATA%）
+            dirs_home().join(".local/share/opencode/opencode.db")
         } else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
