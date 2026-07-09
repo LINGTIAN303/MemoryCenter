@@ -28,17 +28,13 @@
 //! 对每条 compaction 消息执行增量归档。
 
 use crate::opencode_db::{CompactionRecord, OpenCodeDb};
-use std::collections::{HashMap, HashSet};
+use crate::state::SidecarState;
+use std::collections::HashMap;
 
-/// 压缩事件检测器（v2.39 重构）
+/// 压缩事件检测器（v2.39 重构，v2.41 改为持有 SidecarState 引用）
 pub struct CompactionWatcher {
-    /// 已处理的 compaction 消息 ID 集合（msg_xxx），避免重复归档
-    processed_message_ids: HashSet<String>,
-    /// 每个 session 上次归档的 compaction seq（用于增量归档）
-    ///
-    /// key: session_id, value: 上次 compaction 的 seq
-    /// None 表示该 session 尚未归档过任何 compaction
-    last_archived_seq: HashMap<String, i64>,
+    /// 持久化状态（v2.41：从内部维护改为外部传入，支持重启后恢复）
+    state: SidecarState,
 }
 
 /// 单次轮询检测结果
@@ -62,15 +58,17 @@ pub struct CompactionChangeEvent {
 }
 
 impl CompactionWatcher {
-    /// 创建新的检测器
-    pub fn new() -> Self {
-        Self {
-            processed_message_ids: HashSet::new(),
-            last_archived_seq: HashMap::new(),
-        }
+    /// 创建新的检测器（v2.41：接收外部 SidecarState）
+    pub fn new(state: SidecarState) -> Self {
+        Self { state }
     }
 
-    /// 执行一次轮询（v2.39 重构）
+    /// 获取状态的不可变引用（用于保存）
+    pub fn state(&self) -> &SidecarState {
+        &self.state
+    }
+
+    /// 执行一次轮询（v2.39 重构，v2.41 改用 SidecarState）
     ///
     /// 查询所有 compaction 消息，对比已处理集合，
     /// 返回新检测到的 compaction 事件列表。
@@ -82,12 +80,12 @@ impl CompactionWatcher {
 
         for compaction in all_compactions {
             // 跳过已处理的消息
-            if self.processed_message_ids.contains(&compaction.message_id) {
+            if self.state.is_processed(&compaction.message_id) {
                 continue;
             }
 
             // 获取上次归档的 seq（增量归档范围起点）
-            let from_seq = self.last_archived_seq.get(&compaction.session_id).copied();
+            let from_seq = self.state.get_last_seq(&compaction.session_id);
 
             tracing::info!(
                 session_id = %compaction.session_id,
@@ -113,19 +111,20 @@ impl CompactionWatcher {
         })
     }
 
-    /// 标记 compaction 事件已归档（v2.39 新增）
+    /// 标记 compaction 事件已归档（v2.39 新增，v2.41 改用 SidecarState）
     ///
-    /// 归档成功后调用，更新内部状态：
+    /// 归档成功后调用，更新状态：
     /// - 将 message_id 加入已处理集合
     /// - 更新该 session 的 last_archived_seq
     pub fn mark_archived(&mut self, event: &CompactionChangeEvent) {
-        self.processed_message_ids
-            .insert(event.compaction.message_id.clone());
-        self.last_archived_seq
-            .insert(event.compaction.session_id.clone(), event.compaction.seq);
+        self.state.mark_archived(
+            &event.compaction.message_id,
+            &event.compaction.session_id,
+            event.compaction.seq,
+        );
     }
 
-    /// backfill 模式：获取所有历史 compaction 事件（v2.39 重构）
+    /// backfill 模式：获取所有历史 compaction 事件（v2.39 重构，v2.41 改用 SidecarState）
     ///
     /// 查询所有 compaction 消息，对每个 session 按 seq 排序，
     /// 返回所有未处理的 compaction 事件（含 from_seq 用于增量归档）。
@@ -145,12 +144,14 @@ impl CompactionWatcher {
         }
 
         let mut result = Vec::new();
+        let mut skipped = 0;
         for (_session_id, compactions) in &by_session {
             let mut prev_seq: Option<i64> = None;
             for compaction in compactions {
-                // 跳过已处理的
-                if self.processed_message_ids.contains(&compaction.message_id) {
+                // 跳过已处理的（v2.41：从持久化状态恢复）
+                if self.state.is_processed(&compaction.message_id) {
                     prev_seq = Some(compaction.seq);
+                    skipped += 1;
                     continue;
                 }
 
@@ -164,8 +165,10 @@ impl CompactionWatcher {
 
         tracing::info!(
             backfill_count = result.len(),
+            skipped_count = skipped,
             session_count = by_session.len(),
-            "backfill 扫描完成"
+            "backfill 扫描完成（已跳过 {} 条已归档的 compaction）",
+            skipped
         );
 
         Ok(result)
@@ -174,6 +177,6 @@ impl CompactionWatcher {
 
 impl Default for CompactionWatcher {
     fn default() -> Self {
-        Self::new()
+        Self::new(SidecarState::default())
     }
 }

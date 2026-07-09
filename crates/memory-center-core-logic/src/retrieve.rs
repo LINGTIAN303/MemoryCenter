@@ -197,7 +197,12 @@ impl Retriever {
     ///
     /// 实时从 Storage 读取 daily/weekly/monthly 三个周期的索引文档，
     /// 合并所有钩子转为摘要视图。
+    ///
+    /// v2.31 软删除感知：跳过 `FileStatus::Deleted` 的 hook，
+    /// 避免 summaries/prompt 端点返回幽灵摘要（文件已删但索引元数据保留）。
     pub async fn get_summaries(&self) -> crate::Result<Vec<SummaryView>> {
+        use crate::model::FileStatus;
+
         let mut all_summaries = Vec::new();
 
         for period in ArchivePeriod::all() {
@@ -213,6 +218,10 @@ impl Retriever {
 
             if let Some(doc) = doc {
                 for hook in &doc.hooks {
+                    // v2.31：跳过已软删除的 hook，避免返回幽灵摘要
+                    if hook.file_status == FileStatus::Deleted {
+                        continue;
+                    }
                     all_summaries.push(SummaryView::from(hook));
                 }
             }

@@ -43,12 +43,14 @@
 mod config;
 mod opencode_db;
 mod archive;
+mod state;
 mod watcher;
 
 use clap::Parser;
 use config::SidecarConfig;
 use opencode_db::OpenCodeDb;
 use archive::ArchiveClient;
+use state::{resolve_state_path, SidecarState};
 use watcher::{CompactionChangeEvent, CompactionWatcher};
 
 #[tokio::main]
@@ -72,13 +74,23 @@ async fn main() {
         }
     };
 
+    // 解析状态文件路径（v2.41 新增）
+    let state_path = match resolve_state_path(config.state_file.as_ref()) {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::error!(error = %e, "无法解析状态文件路径，请通过 --state-file 指定");
+            std::process::exit(1);
+        }
+    };
+
     tracing::info!(
         db_path = %db_path.display(),
+        state_path = %state_path.display(),
         memorycenter_url = %config.memorycenter_url,
         poll_interval_secs = config.poll_interval,
         project_id = %config.project_id,
         backfill = config.backfill,
-        "mc-sidecar 启动（v2.39 compaction 消息检测模式）"
+        "mc-sidecar 启动（v2.41 compaction 消息检测模式 + 状态持久化）"
     );
 
     // 检查 db 文件是否存在
@@ -87,6 +99,15 @@ async fn main() {
         tracing::error!("请确认 OpenCode 已安装并至少运行过一次");
         std::process::exit(1);
     }
+
+    // 加载持久化状态（v2.41 新增）
+    let sidecar_state = match SidecarState::load(&state_path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "状态文件加载失败，使用空状态继续");
+            SidecarState::default()
+        }
+    };
 
     // 打开数据库
     let db = match OpenCodeDb::open(&db_path) {
@@ -111,17 +132,23 @@ async fn main() {
         tracing::info!(url = %config.memorycenter_url, "MemoryCenter 服务连接正常");
     }
 
-    // 创建压缩事件检测器
-    let mut watcher = CompactionWatcher::new();
+    // 创建压缩事件检测器（v2.41：传入持久化状态）
+    let mut watcher = CompactionWatcher::new(sidecar_state);
 
     // backfill 模式：归档历史压缩会话
     if config.backfill {
         tracing::info!("backfill 模式：扫描历史 compaction 事件...");
         match watcher.backfill_events(&db) {
             Ok(events) => {
-                tracing::info!(count = events.len(), "发现历史 compaction 事件");
+                tracing::info!(count = events.len(), "发现未归档的历史 compaction 事件");
                 for event in events {
                     archive_compaction_event(&db, &archive_client, &event, &config).await;
+                    // 归档成功后标记为已处理（避免主循环 poll 重复归档）
+                    watcher.mark_archived(&event);
+                    // v2.41：每次归档后保存状态（防止 sidecar 异常退出丢失进度）
+                    if let Err(e) = watcher.state().save(&state_path) {
+                        tracing::warn!(error = %e, "状态保存失败（不影响本次归档）");
+                    }
                 }
             }
             Err(e) => {
@@ -138,6 +165,10 @@ async fn main() {
                 // 把现有 compaction 全部标记为已处理（建立基线，不归档历史）
                 for event in &result.new_compactions {
                     watcher.mark_archived(event);
+                }
+                // 保存基线状态
+                if let Err(e) = watcher.state().save(&state_path) {
+                    tracing::warn!(error = %e, "基线状态保存失败");
                 }
                 tracing::info!(
                     baseline_count = result.new_compactions.len(),
@@ -175,10 +206,19 @@ async fn main() {
         }
 
         // 处理新检测到的 compaction 事件
+        let mut had_new = false;
         for event in poll_result.new_compactions {
             archive_compaction_event(&db, &archive_client, &event, &config).await;
             // 归档成功后标记为已处理
             watcher.mark_archived(&event);
+            had_new = true;
+        }
+
+        // v2.41：有新归档时保存状态
+        if had_new {
+            if let Err(e) = watcher.state().save(&state_path) {
+                tracing::warn!(error = %e, "状态保存失败（不影响本次归档）");
+            }
         }
     }
 }

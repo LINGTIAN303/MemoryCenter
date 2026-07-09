@@ -116,9 +116,14 @@ impl ArchiveClient {
     /// 健康检查（ping MemoryCenter 服务）
     ///
     /// 使用 `/api/v1/presets/agents` 端点（GET，无状态）确认服务在线。
+    /// 带 API key 避免被 401 鉴权拦截误判为"不可达"。
     pub async fn health_check(&self) -> Result<bool, ArchiveError> {
         let url = format!("{}/api/v1/presets/agents", self.base_url);
-        let resp = self.client.get(&url).send().await;
+        let mut req = self.client.get(&url);
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req.send().await;
         match resp {
             Ok(r) => Ok(r.status().is_success()),
             Err(_) => Ok(false),

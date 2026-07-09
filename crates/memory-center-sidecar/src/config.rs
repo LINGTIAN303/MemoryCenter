@@ -54,6 +54,15 @@ pub struct SidecarConfig {
     /// 单次会话最多归档的 turns 数（防止超大会话撑爆 MemoryCenter）
     #[arg(long, env = "OPENCODE_SIDECAR_MAX_TURNS", default_value = "100")]
     pub max_turns: usize,
+
+    /// 状态文件路径（持久化已处理的 compaction ID，避免重复归档）
+    ///
+    /// 默认按平台：
+    /// - Linux: ~/.local/share/mc-sidecar/state.json
+    /// - macOS: ~/Library/Application Support/mc-sidecar/state.json
+    /// - Windows: %APPDATA%\mc-sidecar\state.json
+    #[arg(long, env = "MC_SIDECAR_STATE_FILE")]
+    pub state_file: Option<PathBuf>,
 }
 
 impl SidecarConfig {
