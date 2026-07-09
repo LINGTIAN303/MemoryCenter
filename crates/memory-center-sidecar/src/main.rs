@@ -1,8 +1,8 @@
-//! # OpenCode 压缩事件监听 sidecar（v2.36 新增）
+//! # OpenCode 压缩事件监听 sidecar（v2.36 新增，v2.39 重构）
 //!
 //! 监听 OpenCode SQLite 会话库的压缩事件，自动触发 MemoryCenter 归档。
 //!
-//! ## 架构
+//! ## 架构（v2.39 重构）
 //!
 //! ```text
 //! ┌─────────────────┐      ┌──────────────────┐      ┌─────────────────┐
@@ -11,11 +11,21 @@
 //! │  session.db     │◄────│  SQLite 轮询     │      │  HTTP Server    │
 //! │  (WAL mode)     │      │  (5s interval)   │      │                 │
 //! │                 │      │                  │      │                 │
-//! │  time_compacting│      │  检测压缩完成    │      │  /pre-compress  │
-//! │  NULL→ts→NULL   │────►│  → 读 turns      │────►│  归档 + 摘要     │
+//! │  session_message│      │  检测 compaction │      │  /pre-compress  │
+//! │  type=compaction│────►│  新消息 → 读增量 │────►│  归档 + 摘要     │
 //! │                 │      │  → 序列化        │      │                 │
 //! └─────────────────┘      └──────────────────┘      └─────────────────┘
 //! ```
+//!
+//! ## 检测原理（v2.39 重构）
+//!
+//! **旧策略（v2.36，已废弃）**：监控 `session.time_compacting` 字段变化
+//! **问题**：该字段在 OpenCode 源码（compaction.ts）中从未被写入
+//!
+//! **新策略（v2.39）**：轮询 `session_message` 表中 `type='compaction'` 的新消息
+//! - 压缩完成后，OpenCode 往 session_message 表插入 compaction 消息
+//! - sidecar 用 message_id 去重，发现新消息即触发归档
+//! - 增量归档：只归档上次 compaction 到本次 compaction 之间的消息
 //!
 //! ## 使用方式
 //!
@@ -24,18 +34,11 @@
 //! mc-server
 //!
 //! # 2. 启动 sidecar（默认 5 秒轮询）
-//! mc-sidecar --memorycenter-url http://127.0.0.1:8080
+//! mc-sidecar --memorycenter-url http://127.0.0.1:8765
 //!
 //! # 3. backfill 模式（归档历史压缩会话）
 //! mc-sidecar --backfill
 //! ```
-//!
-//! ## 手动/自动压缩覆盖
-//!
-//! OpenCode 的压缩事件无论触发方式（自动 `compactIfNeeded` 或手动 `/compact`），
-//! 最终都走 `compactAfterOverflow` → `Compaction.Started` → `Compaction.Ended` 流程，
-//! `time_compacting` 字段都会经历 NULL → ts → NULL 变化。
-//! 因此 sidecar 能覆盖两种压缩场景。
 
 mod config;
 mod opencode_db;
@@ -46,7 +49,7 @@ use clap::Parser;
 use config::SidecarConfig;
 use opencode_db::OpenCodeDb;
 use archive::ArchiveClient;
-use watcher::CompactionWatcher;
+use watcher::{CompactionChangeEvent, CompactionWatcher};
 
 #[tokio::main]
 async fn main() {
@@ -75,7 +78,7 @@ async fn main() {
         poll_interval_secs = config.poll_interval,
         project_id = %config.project_id,
         backfill = config.backfill,
-        "mc-sidecar 启动"
+        "mc-sidecar 启动（v2.39 compaction 消息检测模式）"
     );
 
     // 检查 db 文件是否存在
@@ -113,11 +116,12 @@ async fn main() {
 
     // backfill 模式：归档历史压缩会话
     if config.backfill {
-        tracing::info!("backfill 模式：扫描历史压缩会话...");
-        match watcher.backfill_sessions(&db) {
-            Ok(sessions) => {
-                for session in sessions {
-                    archive_session(&db, &archive_client, &session, &config).await;
+        tracing::info!("backfill 模式：扫描历史 compaction 事件...");
+        match watcher.backfill_events(&db) {
+            Ok(events) => {
+                tracing::info!(count = events.len(), "发现历史 compaction 事件");
+                for event in events {
+                    archive_compaction_event(&db, &archive_client, &event, &config).await;
                 }
             }
             Err(e) => {
@@ -127,11 +131,24 @@ async fn main() {
         tracing::info!("backfill 完成，进入持续监听模式");
     } else {
         // 首次轮询：建立基线状态（不触发归档）
+        // 将现有 compaction 消息标记为已处理，只归档后续新增的
         tracing::info!("首次轮询：建立基线状态...");
-        if let Err(e) = watcher.poll(&db) {
-            tracing::warn!(error = %e, "首次轮询失败");
+        match watcher.poll(&db) {
+            Ok(result) => {
+                // 把现有 compaction 全部标记为已处理（建立基线，不归档历史）
+                for event in &result.new_compactions {
+                    watcher.mark_archived(event);
+                }
+                tracing::info!(
+                    baseline_count = result.new_compactions.len(),
+                    total_compactions = result.total_compactions,
+                    "基线状态已建立（历史 compaction 不归档，只监听新增）"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "首次轮询失败");
+            }
         }
-        tracing::info!("基线状态已建立，进入持续监听模式");
     }
 
     // 主循环
@@ -139,7 +156,7 @@ async fn main() {
     loop {
         tokio::time::sleep(poll_interval).await;
 
-        // 轮询检测压缩事件
+        // 轮询检测新的 compaction 事件
         let poll_result = match watcher.poll(&db) {
             Ok(result) => result,
             Err(e) => {
@@ -148,77 +165,106 @@ async fn main() {
             }
         };
 
-        if poll_result.compacting_count > 0 {
+        if poll_result.total_compactions > 0 {
             tracing::debug!(
-                compacting = poll_result.compacting_count,
-                total = poll_result.total_sessions,
-                "检测到正在压缩中的 session"
+                total = poll_result.total_compactions,
+                processed = poll_result.processed_count,
+                new = poll_result.new_compactions.len(),
+                "compaction 消息统计"
             );
         }
 
-        // 处理新完成压缩的 session
-        for session in poll_result.newly_compacted {
-            archive_session(&db, &archive_client, &session, &config).await;
+        // 处理新检测到的 compaction 事件
+        for event in poll_result.new_compactions {
+            archive_compaction_event(&db, &archive_client, &event, &config).await;
+            // 归档成功后标记为已处理
+            watcher.mark_archived(&event);
         }
     }
 }
 
-/// 归档单个 session
+/// 归档单个 compaction 事件（v2.39 新增）
 ///
-/// 1. 从 OpenCode SQLite 读取 session 的完整消息
-/// 2. 序列化为 full_context 字符串
-/// 3. 调用 MemoryCenter pre-compress 端点归档
-async fn archive_session(
+/// 增量归档：读取 (from_seq, compaction.seq) 之间的消息，
+/// 附加 compaction summary 作为标签，调用 MemoryCenter pre-compress 端点。
+async fn archive_compaction_event(
     db: &OpenCodeDb,
     archive_client: &ArchiveClient,
-    session: &opencode_db::SessionInfo,
+    event: &CompactionChangeEvent,
     config: &SidecarConfig,
 ) {
+    let compaction = &event.compaction;
+
     tracing::info!(
-        session_id = %session.id,
-        session_title = %session.title,
-        "开始归档压缩会话"
+        session_id = %compaction.session_id,
+        message_id = %compaction.message_id,
+        seq = compaction.seq,
+        reason = %compaction.reason,
+        from_seq = ?event.from_seq,
+        "开始增量归档 compaction 事件"
     );
 
-    // 读取 session 消息
-    let full_context = match db.read_session_context(&session.id, config.max_turns) {
+    // 读取增量上下文：(from_seq, compaction.seq) 之间的消息
+    let mut full_context = match db.read_session_context_between(
+        &compaction.session_id,
+        event.from_seq,
+        compaction.seq,
+        config.max_turns,
+    ) {
         Ok(ctx) => ctx,
         Err(e) => {
             tracing::error!(
-                session_id = %session.id,
+                session_id = %compaction.session_id,
                 error = %e,
-                "读取 session 消息失败"
+                "读取增量上下文失败"
             );
             return;
         }
     };
 
+    // 若增量上下文为空（可能首次压缩前无消息），附加 compaction summary 保证非空
     if full_context.trim().is_empty() {
         tracing::warn!(
-            session_id = %session.id,
-            "session 消息为空，跳过归档"
+            session_id = %compaction.session_id,
+            seq = compaction.seq,
+            "增量上下文为空，使用 compaction summary 作为兜底"
         );
-        return;
+        full_context = format!(
+            "System: 压缩摘要（reason={})\n\n{}\n\n{}",
+            compaction.reason,
+            compaction.summary,
+            compaction.recent
+        );
+    } else {
+        // 附加 compaction summary 作为高价值标签（决策点2）
+        // 让 MemoryCenter 知道这批上下文对应的压缩摘要
+        full_context.push_str(&format!(
+            "\n\n--- Compaction Summary (reason={}) ---\n{}\n--- End Summary ---",
+            compaction.reason, compaction.summary
+        ));
     }
 
     // 估算 token 数（字符数 / 3，与 MemoryCenter 默认估算一致）
     let estimated_tokens = full_context.len() / 3;
 
     tracing::info!(
-        session_id = %session.id,
+        session_id = %compaction.session_id,
         context_chars = full_context.len(),
         estimated_tokens,
-        "读取完成，调用 MemoryCenter pre-compress"
+        from_seq = ?event.from_seq,
+        to_seq = compaction.seq,
+        "读取增量上下文完成，调用 MemoryCenter pre-compress"
     );
 
     // 调用 MemoryCenter 归档
     match archive_client
-        .pre_compress(&session.id, full_context, estimated_tokens, &config.project_id)
+        .pre_compress(&compaction.session_id, full_context, estimated_tokens, &config.project_id)
         .await
     {
         Ok(resp) => {
             tracing::info!(
-                session_id = %session.id,
+                session_id = %compaction.session_id,
+                compaction_seq = compaction.seq,
                 hook_id = %resp.hook_id,
                 parse_success = resp.parse_success,
                 parsed_turns = resp.parsed_turns_count,
@@ -226,14 +272,15 @@ async fn archive_session(
                 threshold = resp.threshold,
                 ratio_percent = resp.threshold_ratio_percent,
                 suggestion = %resp.suggestion,
-                "✅ 归档成功"
+                "归档成功"
             );
         }
         Err(e) => {
             tracing::error!(
-                session_id = %session.id,
+                session_id = %compaction.session_id,
+                compaction_seq = compaction.seq,
                 error = %e,
-                "❌ 归档失败"
+                "归档失败"
             );
         }
     }

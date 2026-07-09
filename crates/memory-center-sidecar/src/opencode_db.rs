@@ -1,4 +1,4 @@
-//! # OpenCode SQLite 读取模块（v2.36 新增）
+//! # OpenCode SQLite 读取模块（v2.36 新增，v2.39 重构）
 //!
 //! 从 OpenCode 的会话 SQLite 数据库读取压缩事件和会话消息。
 //!
@@ -7,26 +7,31 @@
 //! ### session 表
 //! - `id` (text PK): Session ID
 //! - `title` (text): 会话标题
-//! - `time_compacting` (integer|null): 压缩开始时间戳，NULL 表示未在压缩中
+//! - `time_compacting` (integer|null): 遗留字段，v2.39 确认源码未写入，不作为检测依据
 //! - `time_created` / `time_updated`: 时间戳
 //!
 //! ### session_message 表（V2 消息系统）
-//! - `id` (text PK): 消息 ID
+//! - `id` (text PK): 消息 ID（msg_xxx）
 //! - `session_id` (text FK): 所属 session
 //! - `type` (text): 消息类型（user/assistant/system/synthetic/shell/compaction）
-//! - `seq` (integer): 序列号
+//! - `seq` (integer): 序列号（同 session 内递增）
 //! - `data` (text JSON): 消息内容（不含 id 和 type）
+//!   - compaction 消息的 data 含 `summary`/`recent`/`reason` 字段
 //! - `time_created` (integer): 创建时间
 //!
 //! ### message + part 表（V1 消息系统，回退用）
 //! - `message.id` / `message.session_id` / `message.data` (JSON)
 //! - `part.id` / `part.message_id` / `part.session_id` / `part.data` (JSON)
 //!
-//! ## 压缩检测策略
+//! ## 压缩检测策略（v2.39 重构）
 //!
-//! 监控 `session.time_compacting` 字段变化：
-//! - NULL → 有值：压缩开始
-//! - 有值 → NULL：压缩完成，触发归档
+//! **旧策略（v2.36，已废弃）**：监控 `session.time_compacting` 字段变化
+//! **问题**：该字段在 OpenCode 源码（compaction.ts）中从未被写入，检测基础不成立
+//!
+//! **新策略（v2.39）**：轮询 `session_message` 表中 `type='compaction'` 的新消息
+//! - 压缩完成后，OpenCode 往 session_message 表插入一条 compaction 消息
+//! - sidecar 记录已处理的 compaction 消息 ID，检测新消息即触发归档
+//! - 归档范围：上次 compaction（exclusive）到本次 compaction（exclusive）之间的消息（增量归档）
 
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
@@ -45,13 +50,34 @@ pub struct SessionInfo {
     pub time_compacting: Option<i64>,
 }
 
-/// 压缩状态变化检测结果
+/// compaction 消息记录（v2.39 新增）
+///
+/// 对应 session_message 表中 type='compaction' 的一行。
+#[derive(Debug, Clone)]
+pub struct CompactionRecord {
+    /// 消息 ID（msg_xxx），用于去重
+    pub message_id: String,
+    /// 所属 session ID
+    pub session_id: String,
+    /// seq 序列号（用于确定归档范围）
+    pub seq: i64,
+    /// 创建时间戳（毫秒）
+    pub time_created: i64,
+    /// 压缩原因："auto" 或 "manual"
+    pub reason: String,
+    /// LLM 生成的压缩摘要
+    pub summary: String,
+    /// 保留的最近上下文
+    pub recent: String,
+}
+
+/// 压缩状态变化检测结果（v2.39 重构）
 #[derive(Debug)]
 pub struct CompactionChange {
     pub session_id: String,
     pub session_title: String,
-    /// 压缩开始时间戳（用于日志）
-    pub compaction_started_at: i64,
+    /// 触发归档的 compaction 消息
+    pub compaction: CompactionRecord,
 }
 
 impl OpenCodeDb {
@@ -66,9 +92,7 @@ impl OpenCodeDb {
         Ok(Self { conn })
     }
 
-    /// 查询所有 session 的压缩状态
-    ///
-    /// 返回 (session_id, title, time_compacting) 列表。
+    /// 查询所有 session 的压缩状态（v2.39：仅用于日志统计，不再用于检测）
     pub fn query_all_compaction_states(&self) -> Result<Vec<SessionInfo>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, time_compacting FROM session",
@@ -85,6 +109,123 @@ impl OpenCodeDb {
             result.push(row?);
         }
         Ok(result)
+    }
+
+    /// 查询 session 标题（v2.39 新增）
+    ///
+    /// 用于 compaction 事件触发时获取 session 标题。
+    pub fn query_session_title(&self, session_id: &str) -> Result<String, DbError> {
+        let mut stmt = self.conn.prepare("SELECT title FROM session WHERE id = ?1")?;
+        let title: Option<String> = stmt.query_row([session_id], |row| row.get(0)).ok();
+        Ok(title.unwrap_or_else(|| session_id.to_string()))
+    }
+
+    /// 查询所有 compaction 消息（v2.39 新增，核心检测方法）
+    ///
+    /// 扫描 session_message 表中所有 type='compaction' 的消息，
+    /// 按创建时间倒序返回。sidecar 用 message_id 去重，发现新消息即触发归档。
+    ///
+    /// 利用索引 `session_message_session_type_seq_idx` 高效查询。
+    pub fn query_all_compactions(&self) -> Result<Vec<CompactionRecord>, DbError> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT id, session_id, seq, time_created, data
+             FROM session_message
+             WHERE type = 'compaction'
+             ORDER BY time_created ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => {
+                // session_message 表可能不存在（老版本 OpenCode）
+                tracing::warn!("session_message 表查询失败，可能 OpenCode 版本过旧");
+                return Ok(Vec::new());
+            }
+        };
+
+        let rows = stmt.query_map([], |row| {
+            let message_id: String = row.get(0)?;
+            let session_id: String = row.get(1)?;
+            let seq: i64 = row.get(2)?;
+            let time_created: i64 = row.get(3)?;
+            let data_json: String = row.get(4)?;
+            let data: serde_json::Value = serde_json::from_str(&data_json).unwrap_or_default();
+
+            let reason = data.get("reason").and_then(|v| v.as_str()).unwrap_or("auto").to_string();
+            let summary = data.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let recent = data.get("recent").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+            Ok(CompactionRecord {
+                message_id,
+                session_id,
+                seq,
+                time_created,
+                reason,
+                summary,
+                recent,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// 读取 session 中两个 seq 之间的消息（v2.39 新增，增量归档核心）
+    ///
+    /// 归档范围：(from_seq, to_seq)，即 from_seq < seq < to_seq
+    /// - from_seq：上次 compaction 的 seq（exclusive），None 表示从会话开头
+    /// - to_seq：本次 compaction 的 seq（exclusive）
+    ///
+    /// 跳过 compaction 类型消息本身。
+    /// 输出格式：`User: ...\n\nAssistant: ...`
+    pub fn read_session_context_between(
+        &self,
+        session_id: &str,
+        from_seq: Option<i64>,
+        to_seq: i64,
+        max_turns: usize,
+    ) -> Result<String, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT type, data FROM session_message
+             WHERE session_id = ?1
+               AND seq > ?2
+               AND seq < ?3
+               AND type != 'compaction'
+             ORDER BY seq ASC",
+        )?;
+
+        let from_seq_val = from_seq.unwrap_or(-1);
+
+        let rows = stmt.query_map(rusqlite::params![session_id, from_seq_val, to_seq], |row| {
+            Ok((
+                row.get::<_, String>(0)?, // type
+                row.get::<_, String>(1)?, // data (JSON)
+            ))
+        })?;
+
+        let mut parts = Vec::new();
+        let mut turn_count = 0usize;
+
+        for row in rows {
+            let (msg_type, data_json) = row?;
+            let data: serde_json::Value = serde_json::from_str(&data_json).unwrap_or_default();
+
+            let serialized = serialize_v2_message(&msg_type, &data);
+            if serialized.is_empty() {
+                continue;
+            }
+
+            parts.push(serialized);
+            turn_count += 1;
+
+            if turn_count >= max_turns {
+                parts.push("[... truncated by sidecar max_turns ...]".to_string());
+                break;
+            }
+        }
+
+        Ok(parts.join("\n\n"))
     }
 
     /// 读取 session 的完整消息并序列化为 full_context 字符串
@@ -254,12 +395,10 @@ impl OpenCodeDb {
         Ok(parts)
     }
 
-    /// 获取已归档过的 session 集合（通过查询 time_compacting 已清空的历史记录）
+    /// 获取已归档过的 session 集合（v2.39：查询 compaction 消息所在 session）
     ///
     /// 用于 backfill 模式：启动时找出所有曾经压缩过的 session。
     pub fn query_ever_compacted_sessions(&self) -> Result<HashSet<String>, DbError> {
-        // time_archived 不为空，或 time_compacting 曾经不为空（无法直接查询历史）
-        // 简化：查询所有 session_message 中 type='compaction' 的 session_id
         let mut stmt = match self.conn.prepare(
             "SELECT DISTINCT session_id FROM session_message WHERE type = 'compaction'",
         ) {

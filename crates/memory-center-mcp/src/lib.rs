@@ -2922,10 +2922,11 @@ const OPENCODE_RULES_TEMPLATE: &str = r#"# MemoryCenter 记忆归档触发规则
 你是接入了 MemoryCenter 记忆库的 OpenCode Agent。MemoryCenter 帮你保留长对话中的关键信息，
 避免上下文压缩时丢失重要内容。
 
-**双重保障机制**：
-1. **被动保存层（sidecar 自动处理）**：`mc-sidecar` 进程监听 OpenCode SQLite 的
-   `session.time_compacting` 字段变化，压缩完成时自动调 MemoryCenter `pre-compress` 端点
-   归档完整上下文。**你无需手动处理压缩前归档**。
+**真钩子归档机制（sidecar 自动处理，无需 LLM 介入）**：
+1. **被动保存层（sidecar 全自动）**：`mc-sidecar` 进程轮询 OpenCode SQLite 的
+   `session_message` 表，检测 `type='compaction'` 的新消息。压缩完成时自动调
+   MemoryCenter `pre-compress` 端点，**增量归档**上次压缩到本次压缩之间的完整上下文。
+   **你无需手动处理压缩前归档**，这是真钩子（非伪钩子）——基于 OpenCode 开源特性实现。
 2. **主动召回层（你的职责）**：压缩后你需要主动调 `prompt` 拉取历史记忆，
    并在用户提到过去事件时调 `semantic_search` 检索。
 
@@ -2973,8 +2974,9 @@ mcp_memory-center.archive(
 - `threshold_ratio_percent >= 50` → 继续对话，但注意跟踪累计值
 - `< 50` → 继续对话
 
-> 你（LLM）无法直接感知自身 token 消耗，但通过 archive 返回的 `estimated_total_tokens`
-> 可以建立"token 意识"——这是伪钩子方案的核心：通过外部反馈循环模拟主动感知。
+> 你（LLM）无需感知自身 token 消耗——归档由 sidecar 真钩子自动触发。
+> 这里的 archive 调用是**补充手段**（可选），用于你在对话中主动归档重要节点。
+> 与闭源 Agent（Trae/Cursor）的伪钩子方案不同，OpenCode 不依赖 LLM 自感知 token。
 
 ### OpenCode 压缩机制说明
 
@@ -2983,10 +2985,11 @@ OpenCode 有两种压缩方式（都走同一流程）：
 2. **自动压缩**：`compactIfNeeded` 在上下文接近窗口上限时自动触发
 
 压缩流程：`Compaction.Started` → LLM 生成摘要 → `Compaction.Ended`，
-此时 `session.time_compacting` 字段经历 `NULL → ts → NULL` 变化。
+OpenCode 往 `session_message` 表插入一条 `type='compaction'` 的消息。
 
-**sidecar 会监听这个变化**，自动把压缩前的完整上下文归档到 MemoryCenter。
-你无需在压缩前手动调 `pre_compress_hook`，但可以在压缩后主动调 `prompt` 拉取记忆。
+**sidecar 检测到这条新消息后**，自动读取上次压缩到本次压缩之间的完整上下文，
+增量归档到 MemoryCenter。你无需在压缩前手动调 `pre_compress_hook`，
+但可以在压缩后主动调 `prompt` 拉取记忆。
 
 ## 3. 用户提到过去事件：先调 semantic_search 再回复
 
