@@ -1,4 +1,4 @@
-//! # MemoryCenter 归档调用（v2.36 新增）
+//! # MemoryCenter 归档调用（v2.36 新增，v2.43 改为结构化 turns）
 //!
 //! 封装 MemoryCenter HTTP pre-compress 端点调用。
 //!
@@ -6,15 +6,18 @@
 //!
 //! `POST /api/v1/sessions/{sid}/pre-compress`
 //!
-//! ## 请求体
+//! ## 请求体（v2.43 起支持结构化 turns）
 //!
 //! ```json
 //! {
-//!   "full_context": "User: ...\nAssistant: ...",
+//!   "turns": [{"user_message": {"text": "..."}, "llm_message": {"text": "...", "thinking": "...", "tool_calls": [...]}}],
 //!   "estimated_tokens": 12345,
 //!   "project_id": "opencode"
 //! }
 //! ```
+//!
+//! turns 结构与服务器 MessageTurn 兼容（服务器 `#[serde(default)]` 补全缺失字段）。
+//! 服务端调 apply_turn_defaults 自动推断 tags + 估算 token_count。
 //!
 //! ## 响应
 //!
@@ -23,11 +26,61 @@
 use crate::config::SidecarConfig;
 use serde::{Deserialize, Serialize};
 
-/// pre-compress 请求体
+/// sidecar 本地的轮次结构（v2.43 新增）
+///
+/// 与服务器 `MessageTurn` JSON 格式兼容，但只包含 sidecar 能产出的字段。
+/// 服务器反序列化时用 `#[serde(default)]` 补全 id/timestamp/tags/token_count。
+#[derive(Serialize, Clone, Debug)]
+pub struct SidecarTurn {
+    pub user_message: SidecarContent,
+    pub llm_message: SidecarContent,
+}
+
+/// sidecar 本地的消息内容结构
+///
+/// 与服务器 `MessageContent` JSON 格式兼容。
+/// `attachments` 字段 sidecar 不产生，序列化时省略（服务器默认空 Vec）。
+#[derive(Serialize, Clone, Debug)]
+pub struct SidecarContent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<SidecarToolCall>,
+}
+
+/// sidecar 本地的工具调用结构
+///
+/// 与服务器 `ToolInvocation` JSON 格式兼容。
+/// `duration_ms` 字段 sidecar 无法获取，序列化时省略（服务器默认 None）。
+#[derive(Serialize, Clone, Debug)]
+pub struct SidecarToolCall {
+    pub name: String,
+    pub arguments: String,
+    pub result: String,
+}
+
+impl SidecarContent {
+    /// 创建仅含文本的内容
+    pub fn text_only(text: String) -> Self {
+        Self {
+            text: if text.is_empty() { None } else { Some(text) },
+            thinking: None,
+            tool_calls: Vec::new(),
+        }
+    }
+}
+
+/// pre-compress 请求体（v2.43 改为 turns 优先）
 #[derive(Serialize)]
 pub struct PreCompressRequest {
-    /// 完整上下文字符串（User:/Assistant: 分隔符格式）
-    pub full_context: String,
+    /// 结构化轮次列表（v2.43 推荐，保留 tool_calls/thinking）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turns: Option<Vec<SidecarTurn>>,
+    /// 完整上下文字符串（向后兼容，turns 优先时省略）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_context: Option<String>,
     /// 估算 token 数
     pub estimated_tokens: Option<usize>,
     /// 项目 ID
@@ -71,15 +124,16 @@ impl ArchiveClient {
         }
     }
 
-    /// 调用 pre-compress 端点归档会话上下文
+    /// 调用 pre-compress 端点归档会话上下文（v2.43 起传结构化 turns）
     ///
     /// - `session_id`: OpenCode session ID（用作 MemoryCenter session ID）
-    /// - `full_context`: 序列化后的完整对话上下文
+    /// - `turns`: 结构化轮次列表（保留 tool_calls/thinking）
     /// - `estimated_tokens`: 估算的 token 数
+    /// - `project_id`: 项目 ID
     pub async fn pre_compress(
         &self,
         session_id: &str,
-        full_context: String,
+        turns: Vec<SidecarTurn>,
         estimated_tokens: usize,
         project_id: &str,
     ) -> Result<PreCompressResponse, ArchiveError> {
@@ -91,7 +145,8 @@ impl ArchiveClient {
         );
 
         let req_body = PreCompressRequest {
-            full_context,
+            turns: Some(turns),
+            full_context: None,
             estimated_tokens: Some(estimated_tokens),
             project_id: Some(project_id.to_string()),
         };

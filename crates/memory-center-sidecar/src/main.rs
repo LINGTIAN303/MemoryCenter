@@ -49,7 +49,7 @@ mod watcher;
 use clap::Parser;
 use config::SidecarConfig;
 use opencode_db::OpenCodeDb;
-use archive::ArchiveClient;
+use archive::{ArchiveClient, SidecarContent, SidecarTurn};
 use state::{resolve_state_path, SidecarState};
 use watcher::{CompactionChangeEvent, CompactionWatcher};
 
@@ -142,12 +142,23 @@ async fn main() {
             Ok(events) => {
                 tracing::info!(count = events.len(), "发现未归档的历史 compaction 事件");
                 for event in events {
-                    archive_compaction_event(&db, &archive_client, &event, &config).await;
-                    // 归档成功后标记为已处理（避免主循环 poll 重复归档）
-                    watcher.mark_archived(&event);
-                    // v2.41：每次归档后保存状态（防止 sidecar 异常退出丢失进度）
-                    if let Err(e) = watcher.state().save(&state_path) {
-                        tracing::warn!(error = %e, "状态保存失败（不影响本次归档）");
+                    match archive_compaction_event(&db, &archive_client, &event, &config).await {
+                        Ok(()) => {
+                            // 归档成功后标记为已处理（避免主循环 poll 重复归档）
+                            watcher.mark_archived(&event);
+                            // v2.41：每次归档后保存状态（防止 sidecar 异常退出丢失进度）
+                            if let Err(e) = watcher.state().save(&state_path) {
+                                tracing::warn!(error = %e, "状态保存失败（不影响本次归档）");
+                            }
+                        }
+                        Err(e) => {
+                            // 归档失败不标记为已处理，下次启动会重试
+                            tracing::warn!(
+                                session_id = %event.compaction.session_id,
+                                error = %e,
+                                "backfill 归档失败，跳过（下次启动会重试）"
+                            );
+                        }
                     }
                 }
             }
@@ -208,10 +219,21 @@ async fn main() {
         // 处理新检测到的 compaction 事件
         let mut had_new = false;
         for event in poll_result.new_compactions {
-            archive_compaction_event(&db, &archive_client, &event, &config).await;
-            // 归档成功后标记为已处理
-            watcher.mark_archived(&event);
-            had_new = true;
+            match archive_compaction_event(&db, &archive_client, &event, &config).await {
+                Ok(()) => {
+                    // 归档成功后标记为已处理
+                    watcher.mark_archived(&event);
+                    had_new = true;
+                }
+                Err(e) => {
+                    // 归档失败不标记为已处理，下次 poll 会自动重试
+                    tracing::warn!(
+                        session_id = %event.compaction.session_id,
+                        error = %e,
+                        "归档失败，下次 poll 会重试（不标记为已处理）"
+                    );
+                }
+            }
         }
 
         // v2.41：有新归档时保存状态
@@ -223,16 +245,21 @@ async fn main() {
     }
 }
 
-/// 归档单个 compaction 事件（v2.39 新增）
+/// 归档单个 compaction 事件（v2.39 新增，v2.43 改为结构化 turns）
 ///
 /// 增量归档：读取 (from_seq, compaction.seq) 之间的消息，
-/// 附加 compaction summary 作为标签，调用 MemoryCenter pre-compress 端点。
+/// 附加 compaction summary 作为合成 turn，调用 MemoryCenter pre-compress 端点。
+///
+/// v2.43 改动：
+/// - 读取结构化 turns（保留 tool_calls/thinking），替代拼接字符串
+/// - compaction summary 作为额外的合成 SidecarTurn 追加，让服务端 apply_turn_defaults 推断 tags
+/// - token 估算基于各 turn 的文本/tool 内容长度总和
 async fn archive_compaction_event(
     db: &OpenCodeDb,
     archive_client: &ArchiveClient,
     event: &CompactionChangeEvent,
     config: &SidecarConfig,
-) {
+) -> Result<(), String> {
     let compaction = &event.compaction;
 
     tracing::info!(
@@ -241,64 +268,72 @@ async fn archive_compaction_event(
         seq = compaction.seq,
         reason = %compaction.reason,
         from_seq = ?event.from_seq,
-        "开始增量归档 compaction 事件"
+        "开始增量归档 compaction 事件（v2.43 结构化 turns）"
     );
 
-    // 读取增量上下文：(from_seq, compaction.seq) 之间的消息
-    let mut full_context = match db.read_session_context_between(
+    // v2.43：读取结构化 turns（保留 tool_calls/thinking）
+    let mut turns = match db.read_session_turns_between(
         &compaction.session_id,
         event.from_seq,
         compaction.seq,
         config.max_turns,
     ) {
-        Ok(ctx) => ctx,
+        Ok(t) => t,
         Err(e) => {
             tracing::error!(
                 session_id = %compaction.session_id,
                 error = %e,
-                "读取增量上下文失败"
+                "读取增量 turns 失败"
             );
-            return;
+            return Err(format!("读取增量 turns 失败: {e}"));
         }
     };
 
-    // 若增量上下文为空（可能首次压缩前无消息），附加 compaction summary 保证非空
-    if full_context.trim().is_empty() {
-        tracing::warn!(
-            session_id = %compaction.session_id,
-            seq = compaction.seq,
-            "增量上下文为空，使用 compaction summary 作为兜底"
-        );
-        full_context = format!(
-            "System: 压缩摘要（reason={})\n\n{}\n\n{}",
-            compaction.reason,
-            compaction.summary,
-            compaction.recent
-        );
-    } else {
-        // 附加 compaction summary 作为高价值标签（决策点2）
-        // 让 MemoryCenter 知道这批上下文对应的压缩摘要
-        full_context.push_str(&format!(
-            "\n\n--- Compaction Summary (reason={}) ---\n{}\n--- End Summary ---",
-            compaction.reason, compaction.summary
-        ));
-    }
+    // 附加 compaction summary 作为高价值标签（决策点2）
+    // v2.43：作为额外的合成 SidecarTurn 追加，让服务器 apply_turn_defaults 推断 tags
+    // - user_message：标记这是压缩摘要
+    // - llm_message：压缩摘要内容 + recent 保留上下文
+    let summary_turn = SidecarTurn {
+        user_message: SidecarContent::text_only(format!(
+            "System: 压缩摘要（reason={}）",
+            compaction.reason
+        )),
+        llm_message: SidecarContent::text_only(format!(
+            "{}\n\n--- Recent Context ---\n{}",
+            compaction.summary, compaction.recent
+        )),
+    };
+    turns.push(summary_turn);
 
-    // 估算 token 数（字符数 / 3，与 MemoryCenter 默认估算一致）
-    let estimated_tokens = full_context.len() / 3;
+    // 估算 token 数（各 turn 的 text/thinking/tool 内容长度总和 / 3）
+    let estimated_tokens: usize = turns
+        .iter()
+        .map(|t| {
+            let user_len = t.user_message.text.as_ref().map(|s| s.len()).unwrap_or(0);
+            let llm_len = t.llm_message.text.as_ref().map(|s| s.len()).unwrap_or(0);
+            let thinking_len = t.llm_message.thinking.as_ref().map(|s| s.len()).unwrap_or(0);
+            let tool_len: usize = t
+                .llm_message
+                .tool_calls
+                .iter()
+                .map(|c| c.arguments.len() + c.result.len())
+                .sum();
+            (user_len + llm_len + thinking_len + tool_len) / 3
+        })
+        .sum();
 
     tracing::info!(
         session_id = %compaction.session_id,
-        context_chars = full_context.len(),
+        turns_count = turns.len(),
         estimated_tokens,
         from_seq = ?event.from_seq,
         to_seq = compaction.seq,
-        "读取增量上下文完成，调用 MemoryCenter pre-compress"
+        "读取增量 turns 完成，调用 MemoryCenter pre-compress"
     );
 
-    // 调用 MemoryCenter 归档
+    // 调用 MemoryCenter 归档（v2.43 传结构化 turns）
     match archive_client
-        .pre_compress(&compaction.session_id, full_context, estimated_tokens, &config.project_id)
+        .pre_compress(&compaction.session_id, turns, estimated_tokens, &config.project_id)
         .await
     {
         Ok(resp) => {
@@ -314,14 +349,16 @@ async fn archive_compaction_event(
                 suggestion = %resp.suggestion,
                 "归档成功"
             );
+            Ok(())
         }
         Err(e) => {
             tracing::error!(
                 session_id = %compaction.session_id,
                 compaction_seq = compaction.seq,
                 error = %e,
-                "归档失败"
+                "归档失败（不标记为已处理，下次 poll 会重试）"
             );
+            Err(format!("归档失败: {e}"))
         }
     }
 }

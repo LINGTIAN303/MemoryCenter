@@ -11,7 +11,7 @@ use crate::error::AppError;
 use crate::AppState;
 use memory_center_core::archive::Archiver;
 use memory_center_core::compact::Compactor;
-use memory_center_core::model::{ArchiveConfig, MemoryFile, MessageTurn};
+use memory_center_core::model::{apply_turn_defaults, ArchiveConfig, MemoryFile, MessageTurn, Tag};
 use memory_center_core::retrieve::{Retriever, SummaryView};
 use memory_center_core::score::DefaultScorer;
 use memory_center_core::storage::{LocalStorage, Storage};
@@ -74,21 +74,32 @@ pub struct TaskStateSnapshotRequest {
     pub next_step: String,
 }
 
-/// pre_compress 请求体（v2.34 新增）
+/// pre_compress 请求体（v2.34 新增，v2.43 支持结构化 turns）
 ///
-/// 与 archive 的 `ArchiveRequest` 字段集对等，但用 `full_context`（完整字符串）
-/// 替代 `turns`（结构化轮次），实现压缩前一次性完整归档。
+/// 支持两种输入方式（至少传一个）：
+/// - `turns`（v2.43 新增）：结构化轮次数组，保留 tool_calls/thinking 等字段，标签自动推断
+/// - `full_context`：完整上下文字符串，经 context_parser 解析为 turns（向后兼容）
+///
+/// 优先级：`turns` > `full_context`。两者都传时以 `turns` 为准。
+/// raw_context 兜底：优先用 `full_context`，若为空则用 `turns` 的 JSON 序列化。
 #[derive(Deserialize)]
 pub struct PreCompressRequest {
-    /// 完整上下文字符串
+    /// 结构化轮次列表（v2.43 新增，推荐方式）
+    ///
+    /// sidecar 等程序化调用方应优先使用此字段，保留 tool_calls/thinking 等结构化信息，
+    /// 服务端会调用 apply_turn_defaults 自动推断 tags 和估算 token_count。
+    #[serde(default)]
+    pub turns: Option<Vec<MessageTurn>>,
+    /// 完整上下文字符串（向后兼容）
     ///
     /// 客户端 dump 整个对话或 LLM 拼接关键内容。
     /// 支持 JSON 数组（`[{user_message, llm_message}]`）或 `User:`/`Assistant:` 分隔符格式，
     /// 无法识别时仅存 raw_context 不阻塞（parse_success=false）。
-    pub full_context: String,
+    #[serde(default)]
+    pub full_context: Option<String>,
     /// 客户端估算的原始 token 数（可选）
     ///
-    /// 未传时服务端按 `full_context.len() / 3` 估算。
+    /// 未传时服务端按内容长度 / 3 估算。
     #[serde(default)]
     pub estimated_tokens: Option<usize>,
     /// 预设配置（可选，与 archive 的 PresetRequest 一致）
@@ -131,6 +142,24 @@ pub struct PromptResponse {
 #[derive(Deserialize)]
 pub struct ProjectQuery {
     pub project_id: Option<String>,
+    /// 最大返回钩子数（v2.43 新增，可选）
+    ///
+    /// 默认 15，传入 0 表示不限制。
+    #[serde(default)]
+    pub max_hooks: Option<usize>,
+}
+
+/// retrieve 端点查询参数（v2.43 新增 tags 过滤）
+#[derive(Deserialize)]
+pub struct RetrieveQuery {
+    pub project_id: Option<String>,
+    /// 标签过滤（v2.43 新增，可选）
+    ///
+    /// 逗号分隔的标签名列表，如 `?tags=ToolCall,CodeBlock`。
+    /// 支持英文变体名和中文显示名，详见 `Tag::from_name`。
+    /// 不传则返回完整记忆文件。
+    #[serde(default)]
+    pub tags: Option<String>,
 }
 
 // ============================================================================
@@ -247,7 +276,10 @@ pub async fn archive(
     // v2.35：提取 turns 文本用于索引（在 move 消费前 borrow）
     let turns_text = crate::extract_turns_text(&req.turns);
 
-    for turn in req.turns {
+    // v2.43：对每个 turn 应用默认值补全（推断 tags + 估算 token_count）
+    // 与 MCP 端 archive tool 行为一致（lib.rs:837）
+    for mut turn in req.turns {
+        apply_turn_defaults(&mut turn);
         archiver.push_turn(turn);
     }
 
@@ -294,22 +326,45 @@ pub async fn pre_compress(
     Path(sid): Path<String>,
     Json(req): Json<PreCompressRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // v2.34 风险点 1：空 full_context 检查（与 archive 空 turns 检查一致，返回 400）
-    if req.full_context.trim().is_empty() {
+    // v2.43：支持 turns（结构化）和 full_context（字符串）两种输入，至少一个非空
+    let has_turns = req.turns.as_ref().is_some_and(|t| !t.is_empty());
+    let has_full_context = req
+        .full_context
+        .as_ref()
+        .is_some_and(|s| !s.trim().is_empty());
+    if !has_turns && !has_full_context {
         return Err(AppError::BadRequest(
-            "full_context 不能为空。请传入完整的会话上下文。".into(),
+            "turns 和 full_context 至少传一个（且非空）。".into(),
         ));
     }
 
     // 1. 生成 hook_id（提前生成，用于 raw_context 文件命名）
-    //    注意：Archiver 内部会生成另一个 hook_id 给 IndexHook，
-    //         返回的 hook_id 是 raw_context 的 hook_id（与 MCP 端一致）。
     let hook_id = uuid::Uuid::new_v4().to_string();
 
-    // 2. 写 raw_context（spec 第七章：永远先存，失败才阻塞返回错误）
+    // 2. 确定 raw_context 内容：优先 full_context，否则用 turns 的 JSON 序列化
+    //    raw_context 是完整原始上下文备份，无论哪条路径都要写
+    let raw_context_content = if let Some(fc) = &req.full_context {
+        if !fc.trim().is_empty() {
+            fc.clone()
+        } else {
+            // full_context 为空，用 turns 序列化
+            serde_json::to_string_pretty(
+                req.turns.as_ref().expect("前面已校验至少一个非空"),
+            )
+            .unwrap_or_else(|_| "<turns 序列化失败>".to_string())
+        }
+    } else {
+        // 未传 full_context，用 turns 序列化
+        serde_json::to_string_pretty(
+            req.turns.as_ref().expect("前面已校验至少一个非空"),
+        )
+        .unwrap_or_else(|_| "<turns 序列化失败>".to_string())
+    };
+
+    // 3. 写 raw_context（spec 第七章：永远先存，失败才阻塞返回错误）
     let storage = create_storage(&state);
     let raw_context_path = storage
-        .write_raw_context(&sid, &hook_id, &req.full_context)
+        .write_raw_context(&sid, &hook_id, &raw_context_content)
         .await
         .map_err(|e| {
             AppError::Internal(format!(
@@ -319,52 +374,65 @@ pub async fn pre_compress(
             ))
         })?;
 
-    // 3. 估算 token（用 full_context 字符数 / 3，或客户端传入的 estimated_tokens）
+    // 4. 估算 token（用内容长度 / 3，或客户端传入的 estimated_tokens）
     let estimated_total_tokens = req
         .estimated_tokens
-        .unwrap_or_else(|| req.full_context.len() / 3);
+        .unwrap_or_else(|| raw_context_content.len() / 3);
 
-    // 4. 尝试解析 turns（context_parser 支持 JSON 数组 + User:/Assistant: 分隔符）
-    let parse_result = memory_center_core::context_parser::parse_context(&req.full_context);
-
-    // 5. 根据解析结果走不同分支（spec 第五章数据流）
-    let (archived_tokens, parsed_turns_count, parse_success) = match parse_result {
-        Some(parsed) => {
-            // 5a. 解析成功：复用 Archiver 归档（应用 preset + 写 task_state_snapshot）
-            let turns_count = parsed.turns.len();
-            match archive_parsed_turns_in_pre_compress(
-                &state,
-                &sid,
-                req.project_id.as_deref(),
-                parsed.turns,
-                &req.preset,
-                &req.task_state_snapshot,
-                &hook_id,
-                &raw_context_path,
-            )
-            .await
-            {
-                Ok(tokens) => (tokens, turns_count, true),
-                Err(e) => {
-                    // Archiver 失败，降级为仅 raw_context（spec 7.1：不阻塞）
-                    tracing::warn!(
-                        session = %sid,
-                        hook_id = %hook_id,
-                        error = %e,
-                        "Archiver 归档失败，降级为仅 raw_context（parse_success=false）"
-                    );
-                    (estimated_total_tokens, 0, false)
-                }
-            }
+    // 5. v2.43：双路径解析 turns
+    //    路径 A（优先）：req.turns 直接用（结构化，保留 tool_calls/thinking）
+    //    路径 B（回退）：req.full_context 经 context_parser 解析（向后兼容）
+    let (parsed_turns, parse_source) = if let Some(turns) = req.turns {
+        (turns, "structured")
+    } else {
+        let fc = req.full_context.as_ref().expect("前面已校验至少一个非空");
+        match memory_center_core::context_parser::parse_context(fc) {
+            Some(parsed) => (parsed.turns, "string"),
+            None => (Vec::new(), "failed"),
         }
-        None => {
-            // 5b. 解析失败：仅存 raw_context（不阻塞）
-            tracing::info!(
-                session = %sid,
-                hook_id = %hook_id,
-                "full_context 解析失败（非 JSON 数组、无 User:/Assistant: 标记），仅存 raw_context"
-            );
-            (estimated_total_tokens, 0, false)
+    };
+
+    // 6. 根据解析结果走不同分支
+    let (archived_tokens, parsed_turns_count, parse_success) = if parse_source == "failed" {
+        // 路径 B 解析失败：仅存 raw_context（不阻塞）
+        tracing::info!(
+            session = %sid,
+            hook_id = %hook_id,
+            "full_context 解析失败（非 JSON 数组、无 User:/Assistant: 标记），仅存 raw_context"
+        );
+        (estimated_total_tokens, 0, false)
+    } else if parsed_turns.is_empty() {
+        tracing::info!(
+            session = %sid,
+            hook_id = %hook_id,
+            parse_source,
+            "解析得到空 turns，仅存 raw_context"
+        );
+        (estimated_total_tokens, 0, false)
+    } else {
+        let turns_count = parsed_turns.len();
+        match archive_parsed_turns_in_pre_compress(
+            &state,
+            &sid,
+            req.project_id.as_deref(),
+            parsed_turns,
+            &req.preset,
+            &req.task_state_snapshot,
+            &hook_id,
+            &raw_context_path,
+        )
+        .await
+        {
+            Ok(tokens) => (tokens, turns_count, true),
+            Err(e) => {
+                tracing::warn!(
+                    session = %sid,
+                    hook_id = %hook_id,
+                    error = %e,
+                    "Archiver 归档失败，降级为仅 raw_context（parse_success=false）"
+                );
+                (estimated_total_tokens, 0, false)
+            }
         }
     };
 
@@ -524,7 +592,10 @@ async fn archive_parsed_turns_in_pre_compress(
     // v2.35：提取 turns 文本用于索引（在 move 消费前 borrow）
     let turns_text = crate::extract_turns_text(&turns);
 
-    for turn in turns {
+    // v2.43：对每个 turn 应用默认值补全（推断 tags + 估算 token_count）
+    // 无论 turns 来自结构化输入还是 full_context 解析，都需要补全
+    for mut turn in turns {
+        apply_turn_defaults(&mut turn);
         archiver.push_turn(turn);
     }
 
@@ -590,21 +661,46 @@ fn get_archive_threshold_for_pre_compress(preset: &Option<PresetRequest>) -> usi
 
 /// GET /api/v1/sessions/{sid}/memories/{hook_id}
 ///
-/// 按钩子 ID 检索完整记忆文件。
+/// 按钩子 ID 检索完整记忆文件（v2.43 支持 tags 查询参数过滤）。
+///
+/// 查询参数：
+/// - `project_id`（可选）：项目级隔离
+/// - `tags`（可选，v2.43）：逗号分隔的标签名，如 `?tags=ToolCall,CodeBlock`
+///   传入后只返回含这些标签的轮次，避免完整文件过度占用上下文
 pub async fn retrieve(
     State(state): State<AppState>,
     Path((sid, hook_id)): Path<(String, String)>,
-    Query(query): Query<ProjectQuery>,
+    Query(query): Query<RetrieveQuery>,
 ) -> Result<Json<MemoryFile>, AppError> {
     let storage = create_storage(&state);
     let retriever = Retriever::new(storage, &sid, query.project_id);
 
-    let memory = retriever.retrieve_memory(&hook_id).await?;
+    // v2.43：tags 参数存在且非空时按标签过滤
+    let memory = if let Some(tags_str) = &query.tags {
+        let tags_str = tags_str.trim();
+        if tags_str.is_empty() {
+            retriever.retrieve_memory(&hook_id).await?
+        } else {
+            let tags: Vec<Tag> = tags_str
+                .split(',')
+                .map(|s| Tag::from_name(s.trim()))
+                .filter(|t| !matches!(t, Tag::Other(s) if s.is_empty()))
+                .collect();
+            if tags.is_empty() {
+                retriever.retrieve_memory(&hook_id).await?
+            } else {
+                retriever.retrieve_memory_filtered(&hook_id, &tags).await?
+            }
+        }
+    } else {
+        retriever.retrieve_memory(&hook_id).await?
+    };
 
     tracing::info!(
         session = %sid,
         hook_id = %hook_id,
         turns = memory.turns.len(),
+        tags_filter = ?query.tags,
         "检索成功"
     );
 
@@ -614,13 +710,19 @@ pub async fn retrieve(
 /// GET /api/v1/sessions/{sid}/summaries
 ///
 /// 获取所有周期的摘要视图列表。
+///
+/// v2.43：支持 `max_hooks` 查询参数。此端点默认不限制（返回全部），
+/// 与 `render_prompt`（默认 15）不同——summaries 是浏览 API，prompt 是注入 API。
 pub async fn get_summaries(
     State(state): State<AppState>,
     Path(sid): Path<String>,
     Query(query): Query<ProjectQuery>,
 ) -> Result<Json<Vec<SummaryView>>, AppError> {
     let storage = create_storage(&state);
-    let retriever = Retriever::new(storage, &sid, query.project_id);
+    // v2.43：summaries 端点默认不限制（0=不限制），显式传入则应用
+    let max_hooks = query.max_hooks.unwrap_or(0);
+    let retriever = Retriever::new(storage, &sid, query.project_id)
+        .with_max_hooks(max_hooks);
 
     let summaries = retriever.get_summaries().await?;
 
@@ -636,19 +738,25 @@ pub async fn get_summaries(
 /// GET /api/v1/sessions/{sid}/prompt
 ///
 /// 渲染摘要为 system prompt 文本。
+///
+/// v2.43：支持 `max_hooks` 查询参数（默认 15，传入 0 表示不限制）。
 pub async fn render_prompt(
     State(state): State<AppState>,
     Path(sid): Path<String>,
     Query(query): Query<ProjectQuery>,
 ) -> Result<Json<PromptResponse>, AppError> {
     let storage = create_storage(&state);
-    let retriever = Retriever::new(storage, &sid, query.project_id);
+    // v2.43：max_hooks 默认 15，传入 0 表示不限制
+    let max_hooks = query.max_hooks.unwrap_or(15);
+    let retriever = Retriever::new(storage, &sid, query.project_id)
+        .with_max_hooks(max_hooks);
 
     let prompt = retriever.render_to_system_prompt().await?;
 
     tracing::info!(
         session = %sid,
         prompt_len = prompt.len(),
+        max_hooks,
         "渲染 prompt 成功"
     );
 

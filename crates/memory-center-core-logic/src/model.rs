@@ -662,6 +662,57 @@ impl std::fmt::Display for Tag {
     }
 }
 
+impl Tag {
+    /// 从字符串解析标签（v2.43 新增，用于 retrieve 的 tags 过滤参数）
+    ///
+    /// 支持两种输入格式（大小写不敏感）：
+    /// 1. **英文变体名**：如 "ToolCall"、"CodeBlock"、"Text"
+    /// 2. **中文显示名**：如 "工具调用"、"代码块"、"文本消息"（与 Display 输出一致）
+    ///
+    /// 无法匹配的字符串包装为 `Tag::Other(name)`，保证 LLM 传入的自定义标签不丢失。
+    ///
+    /// 用途：MCP retrieve tool 和 server retrieve 端点的 `tags` 参数解析。
+    pub fn from_name(name: &str) -> Self {
+        let lower = name.trim().to_lowercase();
+        match lower.as_str() {
+            // 英文变体名
+            "text" => Self::Text,
+            "fileattachment" | "file_attachment" => Self::FileAttachment,
+            "image" => Self::Image,
+            "video" => Self::Video,
+            "toolcall" | "tool_call" => Self::ToolCall,
+            "thinking" => Self::Thinking,
+            "sessionid" | "session_id" => Self::SessionId,
+            "projectid" | "project_id" => Self::ProjectId,
+            "url" => Self::Url,
+            "citation" => Self::Citation,
+            "status" => Self::Status,
+            "ui" => Self::Ui,
+            "codeblock" | "code_block" => Self::CodeBlock,
+            "voice" => Self::Voice,
+            "plan" => Self::Plan,
+            "agenttool" | "agent_tool" => Self::AgentTool,
+            // 中文显示名（与 Display 输出对应）
+            "文本消息" => Self::Text,
+            "文件附件" => Self::FileAttachment,
+            "图片" => Self::Image,
+            "视频" => Self::Video,
+            "工具调用" => Self::ToolCall,
+            "思考过程" => Self::Thinking,
+            "会话id" => Self::SessionId,
+            "项目id" => Self::ProjectId,
+            "引用" => Self::Citation,
+            "状态" => Self::Status,
+            "代码块" => Self::CodeBlock,
+            "语音" => Self::Voice,
+            "计划" => Self::Plan,
+            "agent工具" => Self::AgentTool,
+            // 未识别 → 包装为 Other
+            _ => Self::Other(name.trim().to_string()),
+        }
+    }
+}
+
 impl ArchivePeriod {
     /// 返回对应目录名（用于文件树路径生成）
     pub fn as_dir_name(&self) -> &'static str {

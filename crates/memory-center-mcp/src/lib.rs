@@ -55,7 +55,7 @@ use memory_center_core::archive::Archiver;
 use memory_center_core::compact::Compactor;
 use memory_center_core::conflict::ConflictDetector;
 use memory_center_core::generate::SummaryGenerator;
-use memory_center_core::model::{apply_turn_defaults, ArchiveConfig, MessageTurn};
+use memory_center_core::model::{apply_turn_defaults, ArchiveConfig, MessageTurn, Tag};
 use memory_center_core::retrieve::{Retriever, SummaryView};
 use memory_center_core::score::DefaultScorer;
 use memory_center_core::storage::{LocalStorage, Storage};
@@ -542,6 +542,19 @@ struct RetrieveParams {
     /// 项目 ID（可选）
     #[schemars(description = "项目 ID（可选）")]
     project_id: Option<String>,
+    /// 标签过滤（v2.43 新增，可选）
+    ///
+    /// 传入标签名列表，只返回含这些标签的轮次，避免一次性返回完整文件
+    /// 导致刚压缩的上下文空间剧增占用。
+    ///
+    /// 支持英文变体名（如 "ToolCall"、"CodeBlock"、"Thinking"）
+    /// 和中文显示名（如 "工具调用"、"代码块"、"思考过程"）。
+    ///
+    /// 常用标签：Text / ToolCall / AgentTool / Thinking / CodeBlock /
+    /// Image / Video / Voice / FileAttachment / Url / Plan
+    #[serde(default)]
+    #[schemars(description = "标签过滤（可选）：只返回含指定标签的轮次，如 [\"ToolCall\",\"CodeBlock\"]。不传则返回完整文件")]
+    tags: Option<Vec<String>>,
 }
 
 /// summaries tool 参数
@@ -564,6 +577,14 @@ struct PromptParams {
     /// 项目 ID（可选）
     #[schemars(description = "项目 ID（可选）")]
     project_id: Option<String>,
+    /// 最大返回钩子数（v2.43 新增，可选）
+    ///
+    /// 默认 15（最近 15 条钩子），传入 0 表示不限制。
+    /// 钩子过多时建议减小此值以避免上下文膨胀；
+    /// 需要更多历史上下文时可增大此值。
+    #[serde(default)]
+    #[schemars(description = "最大返回钩子数（可选，默认 15，传入 0 表示不限制）")]
+    max_hooks: Option<usize>,
 }
 
 /// compaction tool 参数
@@ -1026,8 +1047,8 @@ impl MemoryCenterMcp {
         Ok(result)
     }
 
-    /// 按钩子 ID 检索完整记忆文件。
-    #[tool(description = "按 hook_id 检索完整记忆文件。当 semantic_search 返回 hook_id 后，或你需要的细节不在摘要中时调用此工具，返回完整的记忆文件（含所有轮次的用户消息+LLM消息+标签）。用于回溯历史对话的具体内容。")]
+    /// 按钩子 ID 检索完整记忆文件（v2.43 支持标签过滤）。
+    #[tool(description = "按 hook_id 检索完整记忆文件。当 semantic_search 返回 hook_id 后，或你需要的细节不在摘要中时调用此工具，返回完整的记忆文件（含所有轮次的用户消息+LLM消息+标签）。可选传入 tags 参数按标签过滤轮次（如只返回工具调用或代码块），避免完整文件过度占用上下文。用于回溯历史对话的具体内容。")]
     async fn retrieve(
         &self,
         Parameters(params): Parameters<RetrieveParams>,
@@ -1035,7 +1056,24 @@ impl MemoryCenterMcp {
         let storage = self.create_storage();
         let retriever = Retriever::new(storage, &params.session_id, params.project_id);
 
-        let memory = retriever.retrieve_memory(&params.hook_id).await.map_err(|e| {
+        // v2.43：tags 参数存在时按标签过滤，否则返回完整文件
+        let memory = if let Some(tag_names) = &params.tags {
+            if tag_names.is_empty() {
+                retriever.retrieve_memory(&params.hook_id).await
+            } else {
+                let tags: Vec<Tag> = tag_names
+                    .iter()
+                    .map(|s| Tag::from_name(s))
+                    .collect();
+                retriever
+                    .retrieve_memory_filtered(&params.hook_id, &tags)
+                    .await
+            }
+        } else {
+            retriever.retrieve_memory(&params.hook_id).await
+        };
+
+        let memory = memory.map_err(|e| {
             McpError::internal_error(format!("检索失败: {e}"), None)
         })?;
 
@@ -1074,7 +1112,10 @@ impl MemoryCenterMcp {
     ) -> Result<String, McpError> {
         let storage = self.create_storage();
         // v2.40：克隆 project_id 避免 params 部分移动，后续 append_agent_context 仍需借用 &params
-        let retriever = Retriever::new(storage.clone(), &params.session_id, params.project_id.clone());
+        // v2.43：max_hooks 默认 15（None→15），传入 0 表示不限制
+        let max_hooks = params.max_hooks.unwrap_or(15);
+        let retriever = Retriever::new(storage.clone(), &params.session_id, params.project_id.clone())
+            .with_max_hooks(max_hooks);
 
         let prompt = retriever.render_to_system_prompt().await.map_err(|e| {
             McpError::internal_error(format!("渲染 prompt 失败: {e}"), None)
@@ -3841,6 +3882,7 @@ mod tests {
             session_id: session_id.to_string(),
             hook_id,
             project_id: None,
+            tags: None,
         });
         let result = mcp.retrieve(params).await.expect("检索失败");
         let memory: Value = serde_json::from_str(&result).unwrap();
@@ -4124,6 +4166,7 @@ mod tests {
             session_id: session_id.to_string(),
             hook_id: hook_ids[0].clone(),
             project_id: Some("proj-1".to_string()),
+            tags: None,
         });
         let result = mcp.retrieve(params).await.unwrap();
         let memory: Value = serde_json::from_str(&result).unwrap();

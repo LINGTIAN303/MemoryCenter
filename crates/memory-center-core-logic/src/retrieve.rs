@@ -21,7 +21,7 @@
 //! （daily/weekly/monthly）的索引文档，提取所有钩子转为摘要视图。
 //! 保证与存储的一致性。
 
-use crate::model::{ArchivePeriod, IndexHook, MemoryFile};
+use crate::model::{ArchivePeriod, IndexHook, MemoryFile, Tag};
 use crate::storage::Storage;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
@@ -177,6 +177,13 @@ pub struct Retriever {
     session_id: String,
     /// 项目 ID（可选）
     project_id: Option<String>,
+    /// prompt 渲染时最大返回钩子数（v2.43 新增）
+    ///
+    /// None = 不限制（向后兼容，内部 API 用）
+    /// Some(n) = 仅返回最近 n 条钩子（按 archived_at 降序取前 n）
+    ///
+    /// MCP 端 / server 端调用时默认设为 15，LLM 可通过参数调整。
+    max_hooks: Option<usize>,
 }
 
 impl Retriever {
@@ -190,7 +197,17 @@ impl Retriever {
             storage,
             session_id: session_id.into(),
             project_id,
+            max_hooks: None,
         }
+    }
+
+    /// 设置最大返回钩子数（v2.43 新增）
+    ///
+    /// 链式调用：`Retriever::new(...).with_max_hooks(15)`
+    /// 传入 0 视为不限制（与 None 等价）。
+    pub fn with_max_hooks(mut self, max: usize) -> Self {
+        self.max_hooks = if max == 0 { None } else { Some(max) };
+        self
     }
 
     /// 获取所有周期的摘要视图（用于注入 system prompt）
@@ -229,6 +246,16 @@ impl Retriever {
 
         // 按归档时间排序（旧→新）
         all_summaries.sort_by(|a, b| a.archived_at.cmp(&b.archived_at));
+
+        // v2.43：限制返回的钩子数量（取最近的 N 条）
+        // 用户需求："最后一轮对话的钩子+更前一点的几条钩子"
+        // 排序后末尾是最新的，截取最后 max 条
+        if let Some(max) = self.max_hooks {
+            let len = all_summaries.len();
+            if len > max {
+                all_summaries = all_summaries.split_off(len - max);
+            }
+        }
 
         Ok(all_summaries)
     }
@@ -641,6 +668,54 @@ impl Retriever {
             "hook_id 不存在：{}（前缀长度 < 4，不做前缀匹配）",
             hook_id
         )))
+    }
+
+    /// 按标签过滤检索记忆文件（v2.43 新增）
+    ///
+    /// 在 [`retrieve_memory`] 的基础上，按 `tags` 过滤 `turns`，只保留
+    /// tags 与传入标签有交集的轮次。
+    ///
+    /// **核心价值**（对齐用户架构描述）：
+    /// > 标签比对话主题额外多一个功能：能够让 LLM 直接获取该钩子指向的信息中的
+    /// > 标签信息，如直接精准提取该标签的信息，避免一次性返回完整信息而导致
+    /// > 刚压缩的上下文空间剧增占用，防止冗余占用。
+    ///
+    /// **过滤逻辑**：
+    /// - 遍历 `memory.turns`，保留 `turn.tags` 与 `tags` 有交集的轮次
+    /// - 过滤后更新 `total_tokens` 为保留轮次的 token 之和
+    /// - `tags` 为空时退化为完整检索（等价于 `retrieve_memory`）
+    ///
+    /// **使用场景**：
+    /// - 压缩后 LLM 只需回溯工具调用细节 → `tags=["ToolCall"]`
+    /// - 只需代码片段 → `tags=["CodeBlock"]`
+    /// - 需要思考链 + 代码 → `tags=["Thinking", "CodeBlock"]`
+    pub async fn retrieve_memory_filtered(
+        &self,
+        hook_id: &str,
+        tags: &[Tag],
+    ) -> crate::Result<MemoryFile> {
+        let mut memory = self.retrieve_memory(hook_id).await?;
+
+        if tags.is_empty() {
+            return Ok(memory);
+        }
+
+        let before = memory.turns.len();
+        memory.turns.retain(|t| t.tags.iter().any(|tag| tags.contains(tag)));
+        let after = memory.turns.len();
+
+        // 更新 total_tokens 为过滤后的实际 token 数
+        memory.total_tokens = memory.turns.iter().map(|t| t.token_count).sum();
+
+        tracing::info!(
+            hook_id = %hook_id,
+            before_turns = before,
+            after_turns = after,
+            total_tokens = memory.total_tokens,
+            "标签过滤完成"
+        );
+
+        Ok(memory)
     }
 
     /// 按 hook_id 查找对应的 memory_id（v2.4 批次 3 新增）
