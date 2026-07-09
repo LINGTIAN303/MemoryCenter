@@ -20,7 +20,7 @@
 use crate::model::{ArchivePeriod, IndexDocument, IndexHook, MemoryFile};
 use chrono::{DateTime, Utc};
 
-/// Session 元数据（v2.33 新增）
+/// Session 元数据（v2.33 新增，v2.40 扩展）
 ///
 /// 首次 archive 时由 `HybridScenarioDetector` 识别生成，持久化到
 /// `sessions/{session_id}/meta.json`（LocalStorage）或 `session_meta` 表（SqliteStorage）。
@@ -33,6 +33,14 @@ use chrono::{DateTime, Utc};
 /// - `confidence`：置信度 0.0-1.0（关键词规则按 top/(top+second) 计算，LLM 默认 0.8）
 /// - `method`：识别方法（"keyword" / "llm" / "agent_default"）
 /// - `detected_at`：识别时间（UTC）
+/// - `agent_family`（v2.40 新增）：产生此 session 的 Agent family（如 "OpenCode" / "Trae"）
+/// - `hook_mode`（v2.40 新增）：钩子模式（"real"=真钩子 / "pseudo"=伪钩子）
+///
+/// ## 向后兼容
+///
+/// v2.40 新增的 `agent_family` / `hook_mode` 字段使用 `#[serde(default)]`，
+/// 旧版 meta.json / 旧版 session_meta 行无这两个字段时反序列化为空字符串，
+/// 上层读取时若为空可按需补全（如从 session_id 前缀反解 family）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionMeta {
     /// 识别的场景标签（与 `scenario_to_str` 输出一致）
@@ -43,6 +51,18 @@ pub struct SessionMeta {
     pub method: String,
     /// 识别时间（UTC）
     pub detected_at: DateTime<Utc>,
+    /// 产生此 session 的 Agent family 显示名（v2.40 新增）
+    ///
+    /// 如 "OpenCode" / "Trae" / "Cursor" / "Claude Code"。
+    /// 旧版数据无此字段时为空字符串，上层可从 session_id 前缀补全。
+    #[serde(default)]
+    pub agent_family: String,
+    /// 钩子模式（v2.40 新增）："real"（真钩子）/ "pseudo"（伪钩子）
+    ///
+    /// 由 `HookModeResolver::resolve(family).as_str()` 生成。
+    /// 旧版数据无此字段时为空字符串，上层降级为 "pseudo"。
+    #[serde(default)]
+    pub hook_mode: String,
 }
 
 /// 存储后端 trait

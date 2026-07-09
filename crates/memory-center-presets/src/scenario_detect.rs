@@ -519,11 +519,17 @@ pub async fn resolve_effective_scenario(
     // 3. 首次识别
     let result = detector.detect(turns).await;
     if let Some(scenario) = result.scenario {
+        // v2.40：写入 agent_family + hook_mode（由 HookModeResolver 解析）
+        let hook_mode = memory_center_agents::HookModeResolver::resolve(agent_family)
+            .as_str()
+            .to_string();
         let meta = SessionMeta {
             scenario: scenario_to_str(&scenario),
             confidence: result.confidence,
             method: result.method.to_string(),
             detected_at: chrono::Utc::now(),
+            agent_family: agent_family.display_name().to_string(),
+            hook_mode,
         };
         // 写入元数据（失败不阻塞）
         if let Err(e) = storage.write_session_meta(session_id, &meta).await {
@@ -871,6 +877,8 @@ mod tests {
             confidence: 0.85,
             method: "keyword".to_string(),
             detected_at: chrono::Utc::now(),
+            agent_family: "ClaudeCode".to_string(),
+            hook_mode: "real".to_string(),
         };
         storage.write_session_meta("sess-2", &meta).await.unwrap();
 

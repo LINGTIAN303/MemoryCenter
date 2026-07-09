@@ -302,6 +302,27 @@ impl MemoryCenterMcp {
         self.combined_profile.as_ref()
     }
 
+    /// 获取当前 Agent family（v2.40 新增）
+    ///
+    /// 优先从 CombinedProfile 读取；若未识别则返回 `AgentFamily::Custom("unknown")`。
+    /// 用于 prompt 工具展示 "Current Agent" + archive 时写入 SessionMeta。
+    pub fn current_agent_family(&self) -> memory_center_agents::AgentFamily {
+        use memory_center_agents::AgentFamily;
+        if let Some(profile) = self.combined_profile() {
+            if let Some(agent) = profile.agent.as_ref() {
+                return agent.family.clone();
+            }
+        }
+        AgentFamily::Custom("unknown".to_string())
+    }
+
+    /// 获取当前 Agent 的钩子模式（v2.40 新增）
+    ///
+    /// 基于 [`current_agent_family`](Self::current_agent_family) 解析。
+    pub fn current_hook_mode(&self) -> memory_center_agents::HookMode {
+        memory_center_agents::HookModeResolver::resolve(&self.current_agent_family())
+    }
+
     /// 创建 Storage 实例（每次 tool 调用创建，无状态）
     fn create_storage(&self) -> Arc<dyn Storage> {
         Arc::new(LocalStorage::new(self.storage_root.clone()))
@@ -1052,7 +1073,8 @@ impl MemoryCenterMcp {
         Parameters(params): Parameters<PromptParams>,
     ) -> Result<String, McpError> {
         let storage = self.create_storage();
-        let retriever = Retriever::new(storage.clone(), &params.session_id, params.project_id);
+        // v2.40：克隆 project_id 避免 params 部分移动，后续 append_agent_context 仍需借用 &params
+        let retriever = Retriever::new(storage.clone(), &params.session_id, params.project_id.clone());
 
         let prompt = retriever.render_to_system_prompt().await.map_err(|e| {
             McpError::internal_error(format!("渲染 prompt 失败: {e}"), None)
@@ -1116,8 +1138,13 @@ impl MemoryCenterMcp {
             }
         }
 
+        // v2.40 新增：追加 Current Agent Context + Cross-Agent Memory Summary
+        // 让 LLM 知道自己在哪个 Agent 工具工作 + 其他 Agent 的最近记忆
+        append_agent_context(&self, &storage, &params, &mut final_prompt).await;
+
         Ok(final_prompt)
     }
+
 
     /// 触发周期任务（周级合并 / 月级评分淘汰）。
     #[tool(description = "触发周期任务。period=\"weekly\" 执行周级无损去重合并（7天内记忆去重合并为1个），period=\"monthly\" 执行月级4维评分淘汰（保留高价值记忆）。")]
@@ -3197,6 +3224,91 @@ const AGENTS_MD_TEMPLATE: &str = r#"<!-- memory-center-agents begin -->
 | 周级去重合并 | `compaction` period="weekly" |
 | 月级评分淘汰 | `compaction` period="monthly" |
 <!-- memory-center-agents end -->"#;
+
+/// v2.40 新增：为 prompt 工具追加 Current Agent Context + Cross-Agent Summary
+///
+/// 在 prompt 末尾追加两段：
+/// 1. **Current Agent Context**：当前 Agent family + 钩子模式，让 LLM 知道自己在哪个 Agent 工作
+/// 2. **Cross-Agent Summary**：同 project 下其他 Agent 的 session 列表（按 family 分组），
+///    LLM 可据此主动调 retrieve/semantic_search 检索跨 Agent 记忆
+///
+/// 设计：
+/// - 不直接嵌入跨 Agent 的完整摘要（避免 prompt 膨胀）
+/// - 只列出 session_id + family，LLM 按需检索（全量共享策略）
+/// - 最多展示 10 个其他 session，避免列表过长
+async fn append_agent_context(
+    mcp: &MemoryCenterMcp,
+    storage: &Arc<dyn Storage>,
+    params: &PromptParams,
+    final_prompt: &mut String,
+) {
+    let family = mcp.current_agent_family();
+    let hook_mode = mcp.current_hook_mode();
+
+    // 1. Current Agent Context
+    final_prompt.push_str("\n\n--- Current Agent Context ---\n");
+    final_prompt.push_str(&format!("当前 Agent: {}\n", family.display_name()));
+    final_prompt.push_str(&format!(
+        "钩子模式: {}（{}）\n",
+        hook_mode.as_str(),
+        hook_mode.display_name()
+    ));
+    if hook_mode == memory_center_agents::HookMode::Real {
+        final_prompt.push_str("提示：你无需感知 token 消耗——归档由 sidecar 真钩子自动触发。\n");
+    } else {
+        final_prompt.push_str("提示：你需自感知 token，主动调 archive 工具归档（伪钩子模式）。\n");
+    }
+
+    // 2. Cross-Agent Summary：列出同 project 下其他 Agent 的 session
+    // 读取所有 session，过滤当前 session，按 family 前缀分组
+    let sessions = match storage.list_sessions().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "列出 sessions 失败（跳过 Cross-Agent Summary）");
+            return;
+        }
+    };
+
+    // 过滤掉当前 session，按 family 前缀分组
+    use std::collections::BTreeMap;
+    let mut by_family: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for sid in sessions {
+        if sid == params.session_id {
+            continue;
+        }
+        // 从 session_id 前缀反解 family
+        let family_name = match memory_center_agents::HookModeResolver::family_from_session_id(&sid) {
+            Some(f) => f.display_name().to_string(),
+            None => "Unknown".to_string(),
+        };
+        by_family.entry(family_name).or_default().push(sid);
+    }
+
+    if by_family.is_empty() {
+        return;
+    }
+
+    final_prompt.push_str("\n--- Cross-Agent Memory Summary ---\n");
+    final_prompt.push_str("本项目其他 Agent 的会话（按 Agent 分组，最多 10 个）：\n");
+
+    let mut shown = 0usize;
+    'outer: for (fam, sids) in &by_family {
+        final_prompt.push_str(&format!("- [{}]（{} 个会话）\n", fam, sids.len()));
+        for sid in sids {
+            if shown >= 10 {
+                final_prompt.push_str(&format!("  - ... 还有 {} 个会话未列出\n", sids.len()));
+                break 'outer;
+            }
+            final_prompt.push_str(&format!("  - {}\n", sid));
+            shown += 1;
+        }
+    }
+
+    final_prompt.push_str(
+        "\n提示：若需了解上一个 Agent 的具体工作，用 retrieve 工具按 hook_id 拉取详情，\n\
+         或用 semantic_search 跨 session 检索相关记忆。",
+    );
+}
 
 /// 构建远程模式响应（v2.37 新增）
 ///

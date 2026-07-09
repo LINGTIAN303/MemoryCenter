@@ -69,6 +69,26 @@ impl AgentFamily {
         )
     }
 
+    /// 是否支持真钩子（v2.40 新增）
+    ///
+    /// 真钩子 = Agent 源码可适配 / 有压缩事件可被外部监听，
+    /// 由 sidecar 进程自动归档，LLM 无需感知 token 消耗。
+    ///
+    /// - `OpenCode`：✅ 开源，sidecar 监听 session_message compaction 消息
+    /// - `ClaudeCode`：✅ 开源 CLI，有 /compact 命令可适配
+    /// - `Trae`/`Cursor`/`Codex`/其他：❌ 闭源，用伪钩子（LLM 自感知 token）
+    pub fn supports_real_hook(&self) -> bool {
+        matches!(self, Self::OpenCode | Self::ClaudeCode)
+    }
+
+    /// 是否为开源 Agent（源码可适配，v2.40 新增）
+    ///
+    /// 与 [`supports_real_hook`](Self::supports_real_hook) 语义一致，
+    /// 提供语义化方法名供不同上下文使用。
+    pub fn is_opensource(&self) -> bool {
+        self.supports_real_hook()
+    }
+
     /// 是否为内置 family（非 Custom）
     pub fn is_builtin(&self) -> bool {
         !matches!(self, Self::Custom(_))
@@ -318,6 +338,44 @@ mod tests {
         assert!(AgentFamily::Codex.is_mainstream());
         assert!(!AgentFamily::Zcode.is_mainstream());
         assert!(!AgentFamily::Custom("x".into()).is_mainstream());
+    }
+
+    // ========================================================================
+    // v2.40 新增：真钩子 / 开源分类测试
+    // ========================================================================
+
+    #[test]
+    fn test_supports_real_hook() {
+        // 开源 Agent 支持真钩子
+        assert!(AgentFamily::OpenCode.supports_real_hook());
+        assert!(AgentFamily::ClaudeCode.supports_real_hook());
+
+        // 闭源 Agent 不支持真钩子（用伪钩子）
+        assert!(!AgentFamily::Cursor.supports_real_hook());
+        assert!(!AgentFamily::Trae.supports_real_hook());
+        assert!(!AgentFamily::Codex.supports_real_hook());
+        assert!(!AgentFamily::Zcode.supports_real_hook());
+        assert!(!AgentFamily::Qoder.supports_real_hook());
+        assert!(!AgentFamily::Custom("x".into()).supports_real_hook());
+    }
+
+    #[test]
+    fn test_is_opensource() {
+        // 与 supports_real_hook 语义一致
+        assert!(AgentFamily::OpenCode.is_opensource());
+        assert!(AgentFamily::ClaudeCode.is_opensource());
+        assert!(!AgentFamily::Trae.is_opensource());
+        assert!(!AgentFamily::Cursor.is_opensource());
+
+        // 一致性验证
+        for family in AgentFamily::all_builtin() {
+            assert_eq!(
+                family.is_opensource(),
+                family.supports_real_hook(),
+                "{} is_opensource 与 supports_real_hook 不一致",
+                family.display_name()
+            );
+        }
     }
 
     #[test]

@@ -10,6 +10,8 @@ fn make_meta(scenario: &str, confidence: f32, method: &str) -> SessionMeta {
         confidence,
         method: method.to_string(),
         detected_at: Utc::now(),
+        agent_family: "Trae".to_string(),
+        hook_mode: "pseudo".to_string(),
     }
 }
 

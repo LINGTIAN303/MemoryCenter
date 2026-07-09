@@ -112,12 +112,18 @@ CREATE INDEX IF NOT EXISTS idx_hooks_project ON hooks(project_id, period, scope)
 CREATE INDEX IF NOT EXISTS idx_hooks_memory ON hooks(memory_id);
 
 CREATE TABLE IF NOT EXISTS session_meta (
-    session_id  TEXT PRIMARY KEY,
-    scenario    TEXT NOT NULL,
-    confidence  REAL NOT NULL,
-    method      TEXT NOT NULL,
-    detected_at TEXT NOT NULL
+    session_id   TEXT PRIMARY KEY,
+    scenario     TEXT NOT NULL,
+    confidence   REAL NOT NULL,
+    method       TEXT NOT NULL,
+    detected_at  TEXT NOT NULL,
+    agent_family TEXT DEFAULT '',  -- v2.40 新增：产生此 session 的 Agent family
+    hook_mode    TEXT DEFAULT ''   -- v2.40 新增：钩子模式 real/pseudo
 );
+
+-- v2.40 迁移：为旧库补列（ALTER TABLE 幂等失败，用 try 忽略已存在）
+-- 注意：schema 初始化每次启动都会执行，CREATE TABLE 已包含新列，
+-- 此处 ALTER TABLE 仅用于升级旧库（列不存在时添加）。
 
 -- v2.34: raw_contexts 表（pre_compress_hook 持久化完整原始上下文）
 CREATE TABLE IF NOT EXISTS raw_contexts (
@@ -996,11 +1002,13 @@ impl Storage for SqliteStorage {
         let confidence = meta.confidence;
         let method = meta.method.clone();
         let detected_at = meta.detected_at.to_rfc3339();
+        let agent_family = meta.agent_family.clone();
+        let hook_mode = meta.hook_mode.clone();
 
         self.with_conn(move |conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO session_meta (session_id, scenario, confidence, method, detected_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![sid, scenario, confidence, method, detected_at],
+                "INSERT OR REPLACE INTO session_meta (session_id, scenario, confidence, method, detected_at, agent_family, hook_mode) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![sid, scenario, confidence, method, detected_at, agent_family, hook_mode],
             ).map_err(|e| crate::Error::Storage(format!("写入 session_meta 失败: {}", e)))?;
             Ok(())
         })
@@ -1026,16 +1034,16 @@ impl Storage for SqliteStorage {
 
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT scenario, confidence, method, detected_at FROM session_meta WHERE session_id = ?1"
+                "SELECT scenario, confidence, method, detected_at, agent_family, hook_mode FROM session_meta WHERE session_id = ?1"
             ).map_err(|e| crate::Error::Storage(format!("prepare 失败: {}", e)))?;
 
-            let row_result: rusqlite::Result<(String, f64, String, String)> =
+            let row_result: rusqlite::Result<(String, f64, String, String, Option<String>, Option<String>)> =
                 stmt.query_row(rusqlite::params![sid], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
                 });
 
             match row_result {
-                Ok((scenario, confidence, method, detected_at)) => {
+                Ok((scenario, confidence, method, detected_at, agent_family, hook_mode)) => {
                     let dt = DateTime::parse_from_rfc3339(&detected_at)
                         .map_err(|e| crate::Error::Serialize(format!(
                             "解析 detected_at 失败: {}", e
@@ -1046,6 +1054,8 @@ impl Storage for SqliteStorage {
                         confidence: confidence as f32,
                         method,
                         detected_at: dt,
+                        agent_family: agent_family.unwrap_or_default(),
+                        hook_mode: hook_mode.unwrap_or_default(),
                     }))
                 }
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),

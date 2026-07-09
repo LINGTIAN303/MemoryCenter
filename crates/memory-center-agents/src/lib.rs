@@ -50,6 +50,8 @@
 
 pub mod agent_family;
 pub mod agent_profile;
+pub mod hook_mode;
 
 pub use agent_family::{AgentFamily, AgentFingerprint};
 pub use agent_profile::AgentProfile;
+pub use hook_mode::{HookMode, HookModeResolver};
