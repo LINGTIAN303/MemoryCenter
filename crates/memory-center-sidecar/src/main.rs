@@ -133,13 +133,47 @@ async fn main() {
     };
 
     // 加载持久化状态（v2.41 新增）
-    let sidecar_state = match SidecarState::load(&state_path) {
+    let mut sidecar_state = match SidecarState::load(&state_path) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "状态文件加载失败，使用空状态继续");
             SidecarState::default()
         }
     };
+
+    // 风险 3 修复：检测 DB schema 变化，避免 V1/V2 seq 语义冲突
+    // V1 的 seq 是 time_created（毫秒时间戳），V2 的 seq 是整数序列号。
+    // OpenCode 升级后 schema 可能变化，旧 last_archived_seq 不再适用。
+    {
+        let current_tag = db.detect_schema_tag();
+        match &sidecar_state.db_schema_tag {
+            None => {
+                // 首次启动，记录当前 schema tag
+                tracing::info!(
+                    db_schema_tag = %current_tag,
+                    "首次启动，记录 DB schema 标签"
+                );
+                sidecar_state.db_schema_tag = Some(current_tag);
+            }
+            Some(prev_tag) if prev_tag != &current_tag => {
+                // schema 变化，重置增量归档状态
+                tracing::warn!(
+                    prev_schema = %prev_tag,
+                    current_schema = %current_tag,
+                    "DB schema 发生变化（OpenCode 可能已升级），重置增量归档状态"
+                );
+                sidecar_state.reset_archive_state();
+                sidecar_state.db_schema_tag = Some(current_tag);
+            }
+            Some(_) => {
+                // schema 一致，正常继续
+                tracing::debug!(
+                    db_schema_tag = %current_tag,
+                    "DB schema 与上次一致，无需重置"
+                );
+            }
+        }
+    }
 
     // 创建归档客户端
     let archive_client = ArchiveClient::new(&config);

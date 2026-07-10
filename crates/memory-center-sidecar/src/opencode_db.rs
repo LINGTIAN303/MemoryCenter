@@ -125,6 +125,34 @@ impl OpenCodeDb {
         Ok(Self { conn })
     }
 
+    /// 检测 DB 的 schema 标签（风险 3 修复）
+    ///
+    /// 通过检测 V2 `session_message` 表是否有数据来判断 schema 版本：
+    /// - V2 表存在且有数据 → `"v2"`（seq 为整数序列号）
+    /// - V2 表不存在或为空 → `"v1"`（seq 为 time_created 毫秒时间戳）
+    ///
+    /// 启动时与 state 中记录的 `db_schema_tag` 对比，不一致则重置增量归档状态，
+    /// 避免 V1→V2 升级后 `last_archived_seq` 语义冲突导致阈值监控失效。
+    pub fn detect_schema_tag(&self) -> String {
+        // 尝试查询 V2 session_message 表的行数
+        let v2_count: i64 = match self.conn.prepare(
+            "SELECT COUNT(*) FROM session_message",
+        ) {
+            Ok(mut stmt) => stmt.query_row([], |row| row.get(0)).unwrap_or(0),
+            Err(_) => {
+                // session_message 表不存在（老版本 OpenCode 或桌面端）
+                tracing::debug!("session_message 表不存在，DB schema 为 v1");
+                return "v1".to_string();
+            }
+        };
+
+        if v2_count > 0 {
+            "v2".to_string()
+        } else {
+            "v1".to_string()
+        }
+    }
+
     /// 查询所有 session 的压缩状态（v2.39：仅用于日志统计，不再用于检测）
     pub fn query_all_compaction_states(&self) -> Result<Vec<SessionInfo>, DbError> {
         let mut stmt = self.conn.prepare(
@@ -408,7 +436,23 @@ impl OpenCodeDb {
             let data: serde_json::Value =
                 serde_json::from_str(&data_json).unwrap_or_default();
 
-            let tokens_consumed = extract_step_finish_tokens_v2(&data);
+            let mut tokens_consumed = extract_step_finish_tokens_v2(&data);
+
+            // 风险 6 修复：step-finish tokens 缺失时用消息文本长度做 fallback 估算
+            // 某些 LLM provider 不返回 step-finish part 或 tokens 字段，
+            // 此时用 data JSON 文本长度 / 3 粗略估算（与 archive 中的 fallback 一致）
+            if tokens_consumed == 0 {
+                let estimated = data_json.len() / 3;
+                if estimated > 0 {
+                    tokens_consumed = estimated;
+                    tracing::debug!(
+                        session_id = %session_id,
+                        seq,
+                        estimated_tokens = estimated,
+                        "step-finish tokens 缺失，用文本长度估算（fallback）"
+                    );
+                }
+            }
 
             // 更新该 session 的累积值和最新 seq
             let entry = by_session
@@ -458,21 +502,22 @@ impl OpenCodeDb {
             let msg_id: String = row.get(0)?;
             let session_id: String = row.get(1)?;
             let time_created: i64 = row.get(2)?;
-            Ok((msg_id, session_id, time_created))
+            let data_json: String = row.get(3)?;
+            Ok((msg_id, session_id, time_created, data_json))
         })?;
 
-        // 收集所有 assistant 消息的 (session_id, time_created, msg_id)
-        let mut messages: Vec<(String, i64, String)> = Vec::new();
+        // 收集所有 assistant 消息的 (session_id, time_created, msg_id, data_json)
+        let mut messages: Vec<(String, i64, String, String)> = Vec::new();
         for row in rows {
-            let (msg_id, session_id, time_created) = row?;
-            messages.push((session_id, time_created, msg_id));
+            let (msg_id, session_id, time_created, data_json) = row?;
+            messages.push((session_id, time_created, msg_id, data_json));
         }
 
         // 按 session_id 分组，查询每个消息的 part 表提取 step-finish tokens
         let mut by_session: std::collections::HashMap<String, (i64, usize)> =
             std::collections::HashMap::new();
 
-        for (session_id, time_created, msg_id) in &messages {
+        for (session_id, time_created, msg_id, data_json) in &messages {
             let last_archived = last_archived_seqs.get(session_id).copied().unwrap_or(0);
 
             // V1 用 time_created 作为 seq，只统计 > last_archived 的
@@ -481,7 +526,21 @@ impl OpenCodeDb {
             }
 
             // 查询该消息的 part 表，提取 step-finish tokens
-            let tokens = self.query_message_step_finish_tokens_v1(msg_id)?;
+            let mut tokens = self.query_message_step_finish_tokens_v1(msg_id)?;
+
+            // 风险 6 修复：step-finish tokens 缺失时用消息 data 文本长度估算
+            if tokens == 0 {
+                let estimated = data_json.len() / 3;
+                if estimated > 0 {
+                    tokens = estimated;
+                    tracing::debug!(
+                        session_id = %session_id,
+                        msg_id = %msg_id,
+                        estimated_tokens = estimated,
+                        "V1 step-finish tokens 缺失，用文本长度估算（fallback）"
+                    );
+                }
+            }
 
             let entry = by_session
                 .entry(session_id.clone())
@@ -2235,6 +2294,11 @@ impl AgentAdapter for OpenCodeDb {
     ) -> Result<Vec<SessionTokenInfo>, AdapterError> {
         OpenCodeDb::query_active_sessions_tokens(self, last_archived_seqs)
             .map_err(AdapterError::from)
+    }
+
+    /// 风险 3 修复：检测 DB schema 标签
+    fn detect_schema_tag(&self) -> String {
+        OpenCodeDb::detect_schema_tag(self)
     }
 }
 

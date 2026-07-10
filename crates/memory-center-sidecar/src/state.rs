@@ -36,6 +36,14 @@ pub struct SidecarState {
     /// 首次为 0，归档后更新为服务器返回值。
     #[serde(default)]
     pub cached_threshold: usize,
+    /// 上次归档时的 DB schema 标签（风险 3 修复）
+    ///
+    /// 值为 "v2"（session_message 表有数据）或 "v1"（回退 message+part 表）。
+    /// 启动时检测当前 DB schema，若与此记录不一致，说明 OpenCode 升级导致
+    /// seq 语义变化（V1 用 time_created 毫秒时间戳，V2 用整数序列号），
+    /// 需重置 last_archived_seq 避免增量范围计算错误。
+    #[serde(default)]
+    pub db_schema_tag: Option<String>,
 }
 
 impl SidecarState {
@@ -101,6 +109,25 @@ impl SidecarState {
     /// 获取 session 上次归档的 seq
     pub fn get_last_seq(&self, session_id: &str) -> Option<i64> {
         self.last_archived_seq.get(session_id).copied()
+    }
+
+    /// 重置增量归档状态（风险 3 修复）
+    ///
+    /// 当 DB schema 从 V1 升级到 V2（或反向）时，seq 语义变化
+    /// （V1 = time_created 毫秒时间戳，V2 = 整数序列号），
+    /// 旧的 last_archived_seq 值已不适用，需全部清空。
+    /// processed_message_ids 也一并清空，因为 compaction 消息 ID
+    /// 在 schema 变化后可能重复或不兼容。
+    pub fn reset_archive_state(&mut self) {
+        let seq_count = self.last_archived_seq.len();
+        let msg_count = self.processed_message_ids.len();
+        self.last_archived_seq.clear();
+        self.processed_message_ids.clear();
+        tracing::warn!(
+            cleared_seqs = seq_count,
+            cleared_msgs = msg_count,
+            "已重置增量归档状态（DB schema 变化）"
+        );
     }
 }
 

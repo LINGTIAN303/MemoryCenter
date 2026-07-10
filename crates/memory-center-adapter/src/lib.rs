@@ -168,4 +168,15 @@ pub trait AgentAdapter: Send {
         &self,
         last_archived_seqs: &HashMap<String, i64>,
     ) -> Result<Vec<SessionTokenInfo>, AdapterError>;
+
+    /// 检测 DB 的 schema 标签（风险 3 修复）
+    ///
+    /// 返回当前 DB 的 schema 标签（如 "v1"、"v2"），用于启动时检测 schema 变化。
+    /// 当 OpenCode 升级导致 schema 变化时，旧的 `last_archived_seq` 语义可能
+    /// 不再适用（如 V1 用毫秒时间戳，V2 用整数序列号），需重置增量归档状态。
+    ///
+    /// 默认返回 "unknown"，具体 adapter 按实际 DB schema 返回。
+    fn detect_schema_tag(&self) -> String {
+        "unknown".to_string()
+    }
 }
