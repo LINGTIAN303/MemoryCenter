@@ -932,7 +932,7 @@
       TRAE AI 创造力大赛 · 学习工作赛道 · 报名创意提案
     </span>
     <h1>MemoryCenter</h1>
-    <p class="tagline">AI Agent 的时序记忆基础设施 —— 让每个 Agent 拥有跨会话的持久记忆，像人脑一样分级巩固、自动遗忘、按需召回。</p>
+    <p class="tagline">LLM 的时序记忆"档案库" —— 不同 Agentic 下的 LLM 直接获得非本 Agentic 开启的项目完整记忆与脉络，像人类大脑一样分级巩固、自动遗忘、按需召回特定细节记忆信息。</p>
     <div class="hero-cta">
       <a class="btn btn-primary" href="https://github.com/LINGTIAN303/MemoryCenter" target="_blank">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
@@ -1388,50 +1388,51 @@ curl -H <span class="str">"Authorization: Bearer &lt;your-api-key&gt;"</span> \
         </ul>
       </div>
 
-      <div class="roadmap-item done">
-        <span class="phase">已完成 · Day2</span>
-        <h4>LongMemEval 评测基线</h4>
-        <div class="date">2026-07-12</div>
-        <p>跑通 LongMemEval 跨模型验证，对比 baseline 与 memory_center 的准确率与速度。</p>
-        <ul>
-          <li>R@5 命中率 100%（30/30），nDCG@5 = 0.9405</li>
-          <li>memory_center 速度提升 31%（87.6s vs 127.1s）</li>
-          <li>评测脚本开源，可复现</li>
-        </ul>
-      </div>
-
-      <div class="roadmap-item done">
-        <span class="phase">已完成 · Day3</span>
-        <h4>mc-dashboard CLI MVP</h4>
-        <div class="date">2026-07-13</div>
-        <p>新增 dashboard crate，基于 ratatui 的 TUI 4 Tab 界面。</p>
-        <ul>
-          <li>概览 / 记忆列表 / 检索 demo / 评测对比 4 Tab</li>
-          <li>SSH 隧道远程连接服务器端实例</li>
-        </ul>
-      </div>
-
-      <div class="roadmap-item done">
-        <span class="phase">已完成 · Day4</span>
-        <h4>场景预设 + 跨 Agent 演示</h4>
-        <div class="date">2026-07-14</div>
-        <p>新增参赛场景 + 跨 Agent 演示脚本 + 完整公网部署。</p>
-        <ul>
-          <li>AgentCollaboration / KnowledgeBase / LongProject 场景</li>
-          <li>跨 Agent 演示：Trae 归档 → Claude Code 召回</li>
-          <li>公网 Demo 可访问</li>
-        </ul>
-      </div>
-
-      <div class="roadmap-item planned">
-        <span class="phase">计划中 · Day5</span>
+      <div class="roadmap-item future">
+        <span class="phase">待实现 · Day2</span>
         <h4>初赛帖 + 提交</h4>
-        <div class="date">2026-07-15</div>
+        <div class="date">2026-07-12</div>
         <p>整理初赛帖正文，提交到 TRAE 社区初赛专区。</p>
         <ul>
           <li>初赛帖正文（Demo 体验 + 评测数据 + 用户价值）</li>
           <li>Git 提交 + push</li>
           <li>TRAE 社区发帖</li>
+        </ul>
+      </div>
+
+      <div class="roadmap-item future">
+        <span class="phase">待实现 · Day3</span>
+        <h4>性能压测 + 并发基准</h4>
+        <div class="date">2026-07-13</div>
+        <p>完善 mc-bench 压测套件，产出并发能力基准数据。</p>
+        <ul>
+          <li>核心操作压测：归档 / 检索 / 摘要 QPS</li>
+          <li>后端对比：SQLite vs 文件树存储</li>
+          <li>并发压测：多 session 并行归档稳定性</li>
+        </ul>
+      </div>
+
+      <div class="roadmap-item future">
+        <span class="phase">待实现 · Day4</span>
+        <h4>更多 Agent 适配验证</h4>
+        <div class="date">2026-07-14</div>
+        <p>扩展 AgentAdapter trait 实现，验证多 Agent 接入能力。</p>
+        <ul>
+          <li>Claude Code adapter 实现 + 端到端验证</li>
+          <li>Cursor adapter 实现 + 端到端验证</li>
+          <li>跨 Agent 记忆迁移演示脚本</li>
+        </ul>
+      </div>
+
+      <div class="roadmap-item future">
+        <span class="phase">待实现 · Day5</span>
+        <h4>Demo 稳定性加固 + 路演素材</h4>
+        <div class="date">2026-07-15</div>
+        <p>生产环境稳定性加固，准备路演演示素材。</p>
+        <ul>
+          <li>Demo 服务监控 + 告警配置</li>
+          <li>路演 PPT + Demo 录屏备用</li>
+          <li>故障回滚预案 + 应急处理流程</li>
         </ul>
       </div>
 
