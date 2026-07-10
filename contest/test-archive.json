@@ -1,0 +1,1 @@
+{"turns":[{"id":"550e8400-e29b-41d4-a716-446655440001","user_message":{"text":"我叫小明，住在上海，今年25岁，是Rust开发者","attachments":[],"tool_calls":[],"thinking":null},"llm_message":{"text":"你好小明！上海是个好地方，很高兴认识一位Rust开发者","attachments":[],"tool_calls":[],"thinking":null},"tags":[{"kind":"Text"}],"timestamp":"2026-07-10T10:00:00Z","token_count":50}],"project_id":null}
