@@ -2,6 +2,214 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。变更格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## v2.47 - 阈值监控 + 主动清空（2026-07-10）
+
+### 新增
+- **tokens 阈值监控 + 主动清空**：实现 v2.44 总方向的核心闭环——tokens 阈值监控 → sidecar 主动归档 → 插入 compaction 消息对 → OpenCode 无感清空 → LLM 调 prompt 召回记忆
+  - 核心创新：跳过 LLM 压缩步骤，直接清空 LLM 内部会话上下文，用 memory-center 归档摘要替代 LLM 压缩摘要
+
+#### 阶段 1：AgentAdapter trait 扩展（tokens 监控根基）
+- `adapter/src/record.rs`：新增 `SessionTokenInfo` 结构体（session_id / last_seq / accumulated_tokens）
+- `AgentAdapter` trait 新增第 5 个方法 `query_active_sessions_tokens()`，查询活跃 session 从 `last_archived_seq` 到最新 seq 之间的 token 累积值
+- `opencode_db.rs`：实现 V2 优先 V1 回退的 token 查询逻辑（step-finish part 的 input + output + reasoning）
+- 新增 `extract_step_finish_tokens_v2` 辅助函数，兼容 V2 消息 data 和 V1 part data 两种 JSON 结构
+
+#### 阶段 2：主动归档（sidecar watcher 扩展）
+- `watcher.rs`：新增 `poll_tokens()` 方法 + `TokenThresholdEvent` 结构体，阈值解析优先级：CLI 参数 > 服务器缓存 > 默认 120000
+- 触发条件：`accumulated_tokens >= threshold * ratio_percent / 100`（默认 ratio=80%）
+- `config.rs`：新增 3 个参数 `--token-threshold`（默认 0=从服务器获取）/ `--token-trigger-ratio`（默认 80）/ `--tail-turns`（默认 2）
+- `state.rs`：新增 `cached_threshold` 字段，缓存服务器归档响应的 threshold
+- `main.rs`：主循环新增 tokens 阈值监控分支 + `archive_token_event` 函数
+
+#### 阶段 3：插入 compaction 消息对（OpenCode DB 写入）
+- 新建 `opencode_writer.rs` 模块：
+  - `insert_compaction_pair()`：插入 user 触发消息 + assistant 摘要消息，让 OpenCode 下次加载时通过 `completedCompactions()` 将旧消息加入 hidden 集合（无感清空）
+  - `query_tail_start_id()`：查询保留尾部的起始消息 ID（默认保留最近 2 轮）
+  - 使用独立可写连接（`SQLITE_OPEN_READ_WRITE`），与 OpenCodeDb 只读连接分离
+  - 使用事务确保 4 条 INSERT 原子插入
+- compaction 消息对结构（V1 message+part 表）：
+  - 消息 A：part.data 含 `{type:"compaction", auto:false, tail_start_id}`
+  - 消息 B：message.data 含 `{mode:"compaction", summary:true}`，part.data 含 `{type:"text", text:"摘要内容"}`
+
+#### 阶段 4：钩子召回规则
+- `AGENTS.md`：新增第 6.5 节"OpenCode 主动清空后：调 prompt 召回记忆"，引导 LLM 检测 MemoryCenter 主动归档信号时调用 prompt 工具
+
+### 主动归档与 compaction 事件协调
+主动归档先更新 `last_archived_seq`，若 OpenCode 随后也触发 compaction，增量范围为空则跳过（`archive_token_event` 中检查 `turns.is_empty()`）
+
+### 影响
+- 8 个修改文件 + 1 个新文件，+693/-4 行
+- 端到端测试验证通过（2026-07-10）：tokens 阈值监控 → 主动归档 → compaction 消息对插入 → OpenCode 无感清空 → prompt 召回，全链路打通
+- 已部署到服务器（162.211.183.236），systemctl 确认 active running
+
+### 修复
+- `config.opencode_db` 未回填导致 compaction 消息对插入被跳过（commit d310ee7）。用户不传 `--opencode-db` 时走默认路径，config.opencode_db 为 None，主循环中插入分支被跳过。修复：在 `match config.agent` 之前调用 `resolve_db_path()` 并回填到 `config.opencode_db`
+
+## v2.46 - adapter trait 抽象层（2026-07-09）
+
+### 新增
+- **memory-center-adapter crate**（第 19 个 crate）：抽象不同 Agent 工具的数据读取逻辑，让 sidecar 的 watcher/main 不再直接依赖 `OpenCodeDb` 类型
+  - 定义 `AgentAdapter` trait（4 方法：`query_compactions` / `read_turns_between` / `query_session_title` / `family`），只要求 `Send` 不要求 `Sync`
+  - `SidecarTurn` / `SidecarContent` / `SidecarToolCall` / `SidecarFileChange` 4 个类型从 sidecar/archive.rs 迁移到 `adapter/src/types.rs`
+  - `CompactionRecord` 从 opencode_db.rs 迁移到 `adapter/src/record.rs`
+  - `opencode_db.rs` 新增 `impl AgentAdapter for OpenCodeDb` + `From<DbError> for AdapterError`
+  - `watcher.rs` 参数从 `&OpenCodeDb` 改为 `&dyn AgentAdapter`
+  - `main.rs` 用 `Box<dyn AgentAdapter>` 动态分发 + `--agent` 选择逻辑
+  - `config.rs` 新增 `--agent` CLI 参数（默认 `opencode`，env: `MC_SIDECAR_AGENT`）
+
+### 依赖链
+`memory-center-agents` ← `memory-center-adapter` ← `memory-center-sidecar`（单向依赖，无循环）
+
+### 扩展收益
+新增 Agent 支持（如 Claude Code / Cursor）只需：1) 实现 `impl AgentAdapter for XxxDb`；2) main.rs match 分支加一个选项。无需修改 watcher/archive/state
+
+## v2.45 - 信息完整度修复（2026-07-09）
+
+### 改动
+- **服务器端通用模型（model.rs）扩展**，所有新字段 `#[serde(default)]` 向后兼容：
+  - `ToolInvocation` 新增 `status` / `error` / `call_id`
+  - `MessageContent` 新增 `file_changes: Vec<FileChange>`
+  - `MessageTurn` 新增 `stop_reason` / `cost`
+  - `Attachment` 新增 `filename` / `source`
+  - `infer_tags` 新增规则 6：file_changes 非空 → CodeBlock
+  - `estimate_tokens` 计入 file_changes.patch 和 tool error
+- **sidecar 通用结构（archive.rs）与服务器 JSON 兼容**：
+  - `SidecarTurn` 新增 `stop_reason` / `cost`
+  - `SidecarContent` 新增 `file_changes`
+  - `SidecarToolCall` 新增 `status` / `error` / `call_id` / `duration_ms`
+  - 新增 `SidecarFileChange` 结构体
+- **OpenCode adapter 提取逻辑（opencode_db.rs）信息零损失**：
+  - 移除 arguments 1000 字符截断
+  - 移除 result 3000 字符截断
+  - 移除 reasoning 2000 字符截断
+  - `extract_v2_tool_state` 返回 5-tuple（args, result, status, error, duration_ms）
+  - 提取 tool 的 status / error / call_id / time.start / time.end
+  - 提取 patch part → file_changes（hash + files）
+  - 提取 step-finish 的 reason / cost
+  - V1/V2 turn 分组适配 4-tuple 返回值
+  - `merge_sidecar_contents` 合并 file_changes
+
+### 设计决策
+- 所有新增字段采用 `#[serde(default)]` + `#[serde(skip_serializing_if)]` 策略，不同 Agent adapter 按能力填充，缺失字段为 None，不影响序列化/反序列化
+
+### 影响
+- 32 个文件因结构体扩展补充新字段初始化
+- `cargo check --workspace --tests` 通过
+
+## v2.44 - sidecar tokens 传递（2026-07-08）
+
+### 新增
+- **sidecar tokens 传递**：`SidecarTurn` 新增 `token_count` 字段；`V1PartContent` 新增 `tokens_consumed`（input + output + reasoning）
+- V1/V2 路径提取 step-finish 的 tokens
+- `main.rs` 优先用真实值，缺失时回退长度估算，日志新增 `real_tokens` / `fallback_tokens`
+
+### 验证
+backfill 1 条 compaction（8 turns），real_tokens=177632（7 轮真实值），fallback_tokens=1781（仅 summary_turn 估算），归档成功 hook_id=a45439b
+
+### 设计方向
+v2.44 筑牢根基（tokens 传递 + 标签 + 归档 + 钩子注入），后续实现阈值监控 + 主动清空（跳过压缩步骤，直接清空 LLM 上下文）
+
+### 修复
+- 修复 Windows 默认路径（DB + 状态文件）：opencode 在 Windows 上也使用 `~/.local/share/opencode` 路径（非 `%APPDATA%`），state.json 同理使用 `~/.local/share/mc-sidecar/`
+
+## v2.43 - sidecar 结构化 turns + 标签过滤 retrieve + prompt 钩子数限制（2026-07-08）
+
+### 新增
+- **sidecar 传结构化 turns**（P0 标签系统修复）：
+  - sidecar 从 opencode DB 提取 V1/V2 结构化 turns（保留 tool_calls / thinking）
+  - `PreCompressRequest` 新增 `turns` 字段（优先于 `full_context`）
+  - 双路径都调用 `apply_turn_defaults` 推断 tags + 估算 token_count
+  - 修复 sidecar 归档路径标签全部为 Text 的问题
+- **标签过滤 retrieve**（精准提取避免上下文膨胀）：
+  - `Tag::from_name` 支持英文变体名 + 中文显示名解析
+  - `Retriever::retrieve_memory_filtered` 按 tags 过滤 turns
+  - MCP retrieve tool 新增 `tags` 参数
+  - server retrieve 端点新增 `tags` 查询参数（逗号分隔）
+- **prompt 钩子数限制**（防止上下文过度占用）：
+  - `Retriever` 新增 `max_hooks` 字段 + `with_max_hooks` builder
+  - MCP prompt tool 默认返回最近 15 条钩子
+  - server `render_prompt` 默认 15，`get_summaries` 默认不限制
+
+### 修复
+- sidecar 状态持久化 + health_check 鉴权 + summaries 软删除过滤：
+  - 新增 `SidecarState` 持久化（state.rs）解决 backfill 重复归档
+  - `watcher.rs` 持有外部状态；`main.rs` 集成加载/保存
+  - `config.rs` 新增 `--state-file`
+  - `archive.rs` health_check 带 bearer_auth
+  - `opencode_db.rs` V1+V2 双路径适配
+  - core-logic: `retrieve.rs` `get_summaries` 过滤 `FileStatus::Deleted`，避免 summaries/prompt 返回幽灵摘要
+
+## v2.40 - 架构增强：Agent 隔离 + 自动钩子模式（2026-07-08）
+
+### 新增
+- **Agent 工具隔离与自动钩子模式识别**：开源 Agent（OpenCode / ClaudeCode）走真钩子（sidecar 自动归档），闭源 Agent（Trae / Cursor / Codex 等）走伪钩子（LLM 自感知归档），切换 Agent 时 LLM 可看到上一个 Agent 的会话记忆
+
+#### 核心改动
+1. `AgentFamily` 加 `supports_real_hook` / `is_opensource` 分类方法
+   - OpenCode / ClaudeCode 返回 true（开源，可适配源码）
+   - 其他返回 false（闭源，LLM 自感知）
+2. 新建 `hook_mode.rs`：`HookMode` 枚举 + `HookModeResolver`
+   - `HookMode::Real`（真钩子）/ `Pseudo`（伪钩子），serde rename_all=lowercase
+   - `HookModeResolver::resolve(family)` 按 family 决定模式
+   - `family_from_session_id` 从 session_id 前缀反解 family（支持含连字符前缀如 claude-code）
+   - 放在 agents crate 避免 `agents→core→core-logic→agents` 循环依赖
+3. `SessionMeta` 扩展 `agent_family` + `hook_mode` 字段（`#[serde(default)]` 向后兼容旧数据）
+4. `SqliteStorage` session_meta 表迁移：CREATE TABLE 加 `agent_family` / `hook_mode` 两列（DEFAULT ''）
+5. `resolve_effective_scenario` 首次识别时自动写入 `agent_family` + `hook_mode`
+6. prompt 工具扩展：追加 Current Agent Context + Cross-Agent Memory Summary
+   - Current Agent Context：当前 family + 钩子模式 + 提示（真钩子无需感知 token）
+   - Cross-Agent Summary：同 project 下其他 Agent 的 session 列表（按 family 分组，最多 10 个）
+   - 跨 Agent 记忆全量共享：LLM 可据此主动调 retrieve/semantic_search 检索
+
+### 影响
+- agents / core-logic / core / presets / mcp 共 5 个 crate
+- 315 测试全通过（agents 57 + core 106 + presets 96 + mcp 56）
+
+## v2.39 - 重构压缩检测逻辑为 compaction 消息轮询 + 增量归档（2026-07-08）
+
+### 改动
+- **sidecar 检测策略重构**：从 `session.time_compacting` 字段变化改为 `session_message` 表 `type='compaction'` 新消息检测
+  - 原因：`time_compacting` 字段在 OpenCode 源码 `compaction.ts` 中从未被写入
+- **增量归档**：从全量归档改为增量归档（上次 compaction seq 到本次之间的消息）
+- compaction summary 作为高价值标签附加到归档内容末尾
+- `OPENCODE_RULES_TEMPLATE` 改为真钩子说明，不影响其他 Agent 的 LLM 决策
+- `opencode.md` 新增桌面端 mcpServers 配置模板（值模糊 + 注释）+ 修正架构说明
+
+### 涉及文件
+- `crates/memory-center-sidecar/src/opencode_db.rs`：新增 `query_all_compactions` / `read_session_context_between`
+- `crates/memory-center-sidecar/src/watcher.rs`：改为 message_id 去重检测
+- `crates/memory-center-sidecar/src/main.rs`：增量归档函数 `archive_compaction_event`
+- `crates/memory-center-mcp/src/lib.rs`：`OPENCODE_RULES_TEMPLATE` 真钩子说明
+- `docs/onboarding/opencode.md`：架构图 / 流程图 / 桌面端配置模板 / 故障排查修正
+
+## v2.38 - install_rules 支持 opencode 客户端 + sidecar crate + 接入指南（2026-07-08）
+
+### 新增
+- **v2.38 OpenCode 适配——补齐主动召回层，三路径互补架构完整闭环**：
+
+#### 路径一（主动召回）：install_rules 新增 opencode 客户端分支
+- 新增 `OPENCODE_RULES_TEMPLATE` 常量（含 sidecar 双重保障说明、/compact 流程、MCP 配置示例）
+- `install_rules_to_project` 主 match 块添加 opencode 分支（写入 `.opencode/rules/`）
+- `build_remote_template_response` 添加 opencode 分支（远程模式返回模板）
+- `AGENTS_MD_TEMPLATE` 客户端前缀列表添加 OpenCode: opencode
+- 4 处客户端类型描述/错误消息同步更新
+
+#### 路径二（行为规范）：AGENTS.md 协议覆盖 OpenCode
+- 通用 AGENTS.md 自动注入 LLM system prompt
+- OpenCode 通过 `opencode.jsonc` 的 `instructions` 字段加载 `.opencode/rules/`
+
+#### 路径三（被动保存）：memory-center-sidecar crate
+- 新增 `crates/memory-center-sidecar`（第 18 个 crate）
+- 轮询 OpenCode SQLite `session.time_compacting` 字段变化检测压缩事件
+- 自动调 MemoryCenter pre-compress 端点归档完整上下文
+- CLI 参数 + 环境变量双通道配置，支持 backfill 历史回填
+
+### 文档
+- `docs/onboarding/opencode.md`：完整接入指南（三路径架构图 + 实测验证 + 故障排查）
+
+### 清理
+- 移除 lib.rs 第 3608 行 unused import（`async_trait::async_trait`）
+
 ## v2.37 - install_rules 远程模式（2026-07-08）
 
 ### 新增

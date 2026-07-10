@@ -222,7 +222,7 @@ trae-{项目名}-{日期}
 | 月级评分淘汰 | `compaction` | period="monthly" |
 | 批量检索/删除/更新 | `batch_retrieve` / `batch_delete` / `batch_update` | 批量操作 |
 | 查询冲突记录 | `get_conflicts` | 获取已持久化的冲突记录 |
-| **首次接入 MemoryCenter** | `install_rules` | 安装记忆协议规则到项目（支持 catpaw/trae/claude-code 三种客户端） |
+| **首次接入 MemoryCenter** | `install_rules` | 安装记忆协议规则到项目（支持 catpaw/trae/claude-code/opencode 四种客户端） |
 | **上下文被压缩后** | `archive` + `prompt` | 归档断层轮次 + 拉取一手记忆校准 Summary，详见「压缩后行为协议」 |
 | 完成开发阶段/关键决策/风险点 | `update_project_memory` | 更新 project_memory.md 副本指定章节 |
 | 查看 project_memory 副本 | `get_project_memory` | 读取 memory-center 维护的 project_memory.md 完整内容 |
