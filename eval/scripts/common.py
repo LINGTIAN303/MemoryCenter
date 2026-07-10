@@ -36,19 +36,26 @@ if _ENV_PATH.exists():
 # 2. 常量
 # ---------------------------------------------------------------------------
 MC_BASE = os.environ.get("MEMORY_CENTER_BASE_URL", "http://127.0.0.1:8765/api/v1")
+MC_API_KEY = os.environ.get("MEMORY_CENTER_API_KEY", "")
+
+
+def mc_headers() -> dict:
+    """构造 MemoryCenter API 请求头（如有 API Key 则带 Bearer token）。"""
+    return {"Authorization": f"Bearer {MC_API_KEY}"} if MC_API_KEY else {}
 
 # 结果目录
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # 默认评测参数
-DEFAULT_MODELS = ["sensenova", "step"]
+DEFAULT_MODELS = ["siliconflow"]
 DEFAULT_CONDITIONS = ["baseline", "memory_center"]
 
 # 模型简称映射（用于 session_id 命名）
 MODEL_SHORT = {
     "sensenova": "sn",
     "step": "step",
+    "siliconflow": "qw",
 }
 
 
@@ -115,7 +122,15 @@ def get_model_config(name: str) -> ModelConfig:
             model=os.environ["DEEPSEEK_MODEL"],
             gen_max_tokens=4096,
         )
-    raise ValueError(f"未知模型: {name}（支持: sensenova / step / deepseek）")
+    if name == "siliconflow":
+        return ModelConfig(
+            name="siliconflow",
+            base_url=os.environ["SILICONFLOW_BASE_URL"],
+            api_key=os.environ["SILICONFLOW_API_KEY"],
+            model=os.environ["SILICONFLOW_MODEL"],
+            gen_max_tokens=2048,
+        )
+    raise ValueError(f"未知模型: {name}（支持: sensenova / step / deepseek / siliconflow）")
 
 
 def call_llm(
@@ -160,7 +175,7 @@ def call_llm(
 # ---------------------------------------------------------------------------
 # 4. MemoryCenter HTTP API 封装
 # ---------------------------------------------------------------------------
-def mc_archive(session_id: str, turns: list[dict], timeout: int = 60) -> dict:
+def mc_archive(session_id: str, turns: list[dict], timeout: int = 120) -> dict:
     """POST /sessions/{sid}/archive —— 归档会话，生成 daily 记忆文件。
 
     turns: MessageTurn 列表（用 make_message_turn 构造）。
@@ -169,6 +184,7 @@ def mc_archive(session_id: str, turns: list[dict], timeout: int = 60) -> dict:
     r = requests.post(
         f"{MC_BASE}/sessions/{session_id}/archive",
         json={"turns": turns, "project_id": None},
+        headers=mc_headers(),
         timeout=timeout,
     )
     r.raise_for_status()
@@ -177,14 +193,14 @@ def mc_archive(session_id: str, turns: list[dict], timeout: int = 60) -> dict:
 
 def mc_get_summaries(session_id: str, timeout: int = 15) -> list[dict]:
     """GET /sessions/{sid}/summaries —— 返回已归档的摘要列表。"""
-    r = requests.get(f"{MC_BASE}/sessions/{session_id}/summaries", timeout=timeout)
+    r = requests.get(f"{MC_BASE}/sessions/{session_id}/summaries", headers=mc_headers(), timeout=timeout)
     r.raise_for_status()
     return r.json()
 
 
 def mc_get_prompt(session_id: str, timeout: int = 30) -> str:
     """GET /sessions/{sid}/prompt —— 返回可直接注入 system prompt 的记忆摘要文本。"""
-    r = requests.get(f"{MC_BASE}/sessions/{session_id}/prompt", timeout=timeout)
+    r = requests.get(f"{MC_BASE}/sessions/{session_id}/prompt", headers=mc_headers(), timeout=timeout)
     r.raise_for_status()
     return r.json().get("prompt", "")
 
@@ -212,6 +228,7 @@ def mc_retrieve_all_content(session_id: str, timeout: int = 60) -> str:
             continue
         r = requests.get(
             f"{MC_BASE}/sessions/{session_id}/memories/{hook_id}",
+            headers=mc_headers(),
             timeout=timeout,
         )
         r.raise_for_status()
@@ -255,6 +272,7 @@ def mc_semantic_search(session_id: str, query: str, top_k: int = 5, timeout: int
     r = requests.post(
         f"{MC_BASE}/sessions/{session_id}/search",
         json={"query": query, "top_k": top_k},
+        headers=mc_headers(),
         timeout=timeout,
     )
     r.raise_for_status()

@@ -366,8 +366,8 @@ def main() -> int:
     sampled = stratified_sample(data, n_questions, seed=args.seed)
     print(f"[2/4] 抽样 {len(sampled)} 题（覆盖 {len(set(d['question_type'] for d in sampled))} 种 question_type）")
 
-    # judge 配置
-    judge_cfg = get_model_config("deepseek")
+    # judge 配置（参赛评测用 siliconflow Qwen2.5-7B-Instruct 做 judge）
+    judge_cfg = get_model_config("siliconflow")
     print(f"[3/4] judge: {judge_cfg.name} / {judge_cfg.model}")
 
     # 评测循环

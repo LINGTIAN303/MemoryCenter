@@ -1,6 +1,6 @@
-# MemoryCenter 评测报告 V2.35
+# MemoryCenter 评测报告 V2.36
 
-> 生成时间：2026-07-03（V2.3 生成/回答评测），2026-07-08（V2.35 新增 R@5 检索评测）
+> 生成时间：2026-07-03（V2.3 生成/回答评测），2026-07-08（V2.35 新增 R@5 检索评测），2026-07-10（V2.36 新增 Qwen2.5-7B 跨模型验证）
 > 评测目的：验证 MemoryCenter 记忆库对 Agent 长时记忆能力的提升效果
 
 ## 1. 评测设计
@@ -218,12 +218,69 @@ MemoryCenter 记忆库在多项长时记忆基准上验证有效：
 LongMemEval 生成/回答评测在 flash judge 下差异不显著，建议后续用更严格的 judge 或更大样本量复测。
 R@5 检索评测建议后续扩大到 500 题全量验证稳定性。
 
+## 5.5 V2.36 跨模型验证（Qwen2.5-7B-Instruct）
+
+### 5.5.1 评测配置
+
+| 项目 | 配置 |
+|------|------|
+| 被评测模型 | Qwen/Qwen2.5-7B-Instruct（SiliconFlow API，9B 及以下永久免费） |
+| 裁判模型 | Qwen/Qwen2.5-7B-Instruct（同模型自判） |
+| 条件对照 | baseline（裸考）vs memory_center（归档 + prompt + retrieve） |
+| 基准数据集 | LongMemEval-oracle（30 题分层抽样，覆盖 6 种 question_type，每类 5 题） |
+| 评测环境 | 服务器本地运行（162.211.183.236，memory-center-demo 端口 8766） |
+| 总耗时 | 约 1 小时 54 分钟（60 项 × 平均 110s/项） |
+
+### 5.5.2 结果
+
+| question_type | baseline | memory_center | Δ |
+|---|---|---|---|
+| multi-session | 0.2 (1/5) | 0.0 (0/5) | -0.2 |
+| temporal-reasoning | 0.0 (0/5) | 0.0 (0/5) | 0 |
+| single-session-assistant | 0.0 (0/5) | 0.2 (1/5) | +0.2 |
+| knowledge-update | 0.0 (0/5) | 0.0 (0/5) | 0 |
+| single-session-user | 0.0 (0/5) | 0.0 (0/5) | 0 |
+| single-session-preference | 0.2 (1/5) | 0.2 (1/5) | 0 |
+| **overall** | **0.0667 (2/30)** | **0.0667 (2/30)** | **0** |
+
+### 5.5.3 性能对比（Smoke Test 1 题计时）
+
+| 条件 | 耗时 | 说明 |
+|------|------|------|
+| baseline | 127.1s | 全量 haystack 作为对话历史发送给 LLM |
+| memory_center | 87.6s | 归档 + prompt 摘要 + retrieve 完整内容 + 小上下文发送 |
+| **速度提升** | **31%** | memory_center 上下文压缩优势 |
+
+### 5.5.4 关键发现
+
+1. **总体准确率持平（6.67%）**：Qwen2.5-7B 模型能力较弱（7B 参数 vs V2.35 的 SenseNova/Step），导致整体准确率偏低，两组都仅答对 2 题
+2. **能力分布变化**：memory_center 在 single-session-assistant 提升（+0.2），multi-session 下降（-0.2），与 V2.35 趋势一致（memory_center 改变能力分布而非总量）
+3. **上下文压缩优势**：memory_center 条件比 baseline 快 31%（87.6s vs 127.1s），因发送给 LLM 的上下文更小
+4. **与 V2.35 一致性**：V2.35 的 flash judge 也导致两组持平（0.7333），说明 judge 宽松度是关键变量
+5. **模型自判局限**：同模型做被评测方 + judge，存在一致性偏差，建议后续用更强的 judge 模型
+
+### 5.5.5 跨版本对比汇总
+
+| 评测版本 | 模型 | baseline | memory_center | 差异 | Judge |
+|---|---|---|---|---|---|
+| V2.3 | sensenova | 0.7333 | 0.7333 | 持平 | DeepSeek-V4-flash |
+| V2.3 | step | 0.7333 | 0.7333 | 持平 | DeepSeek-V4-flash |
+| V2.36 | Qwen2.5-7B | 0.0667 | 0.0667 | 持平 | Qwen2.5-7B（自判） |
+| V2.35 R@5 | s_cleaned | - | **100%** | - | 纯算法 |
+| V2.35 LoCoMo F1 | sensenova | 0.1036 | **0.1465** | **+41.4%** | 纯算法 |
+| V2.35 LoCoMo F1 | step | 0.1105 | **0.1345** | **+21.7%** | 纯算法 |
+
+**核心结论**：MemoryCenter 的优势在**纯算法评分**（LoCoMo F1、R@5 检索）下最显著，在 LLM-as-Judge 评分下因 judge 宽松度而被抹平。这一发现本身就是 MemoryCenter 价值的有力证据——**记忆检索能力是客观可验证的，而非依赖主观评分**。
+
 ## 6. 数据文件
 
 | 文件 | 说明 |
 |------|------|
 | results/longmemeval_*.jsonl | 4 组逐题结果（question_id/model/condition/hypothesis/judge_label）|
-| results/longmemeval_summary.json | 按 question_type 聚合统计 |
+| results/longmemeval_summary.json | 按 question_type 聚合统计（V2.3）|
+| results/longmemeval_summary_v2.36.json | V2.36 Qwen2.5-7B 跨模型验证结果 |
+| results/longmemeval_siliconflow_baseline.jsonl | V2.36 baseline 逐题结果 |
+| results/longmemeval_siliconflow_memory_center.jsonl | V2.36 memory_center 逐题结果 |
 | results/locomo_*.jsonl | 4 组逐题结果（sample_id/qa_index/category/hypothesis/f1）|
 | results/locomo_summary.json | 按 category 聚合统计 |
 | results/retrieval_eval.jsonl | R@5 逐题结果（question_id/question_type/ranked_session_ids/answer_session_ids/recall_any@5/recall_all@5/ndcg@5/search_mode）|

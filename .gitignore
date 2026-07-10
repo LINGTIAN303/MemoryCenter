@@ -47,6 +47,9 @@ eval/mc_data/
 # MCP 本地测试数据（stdio 模式归档的记忆文件，不提交）
 .mcp-data/
 
+# 评测大数据文件（264MB，从 longmemeval_oracle 清理生成，不提交）
+eval/LongMemEval/data/longmemeval_s_cleaned.json
+
 # 本地记忆数据（运行时产生的 memory_data 目录，不提交）
 memory_data/
 
