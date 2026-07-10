@@ -66,7 +66,7 @@ async fn main() {
         )
         .init();
 
-    let config = SidecarConfig::parse();
+    let mut config = SidecarConfig::parse();
 
     // 解析状态文件路径（v2.41 新增）
     let state_path = match resolve_state_path(config.state_file.as_ref()) {
@@ -77,18 +77,27 @@ async fn main() {
         }
     };
 
+    // v2.47 修复：提前解析 DB 路径并回填到 config.opencode_db
+    // 主循环的 compaction 消息对插入依赖 config.opencode_db，
+    // 但用户通常不传 --opencode-db（走默认路径），导致 None 而跳过插入
+    if config.agent == "opencode" && config.opencode_db.is_none() {
+        match config.resolve_db_path() {
+            Ok(path) => {
+                config.opencode_db = Some(path);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "无法解析 OpenCode SQLite 路径，请通过 --opencode-db 指定");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // v2.46：按 --agent 选择 adapter（动态分发）
     // 当前仅支持 "opencode"，未来加 "claude-code" 等
     let db: Box<dyn AgentAdapter> = match config.agent.as_str() {
         "opencode" => {
-            // 解析 OpenCode SQLite 路径
-            let db_path = match config.resolve_db_path() {
-                Ok(path) => path,
-                Err(e) => {
-                    tracing::error!(error = %e, "无法解析 OpenCode SQLite 路径，请通过 --opencode-db 指定");
-                    std::process::exit(1);
-                }
-            };
+            // v2.47：opencode_db 已在 match 之前回填，这里直接 unwrap
+            let db_path = config.opencode_db.as_ref().expect("opencode_db 已在上方回填");
 
             tracing::info!(
                 db_path = %db_path.display(),
