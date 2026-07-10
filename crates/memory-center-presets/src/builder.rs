@@ -342,6 +342,9 @@ pub fn scenario_to_str(scenario: &memory_center_scenarios::Scenario) -> String {
         Scenario::Finance => "finance".to_string(),
         Scenario::Design => "design".to_string(),
         Scenario::OfficeWork => "officework".to_string(),
+        Scenario::AgentCollaboration => "agentcollaboration".to_string(),
+        Scenario::KnowledgeBase => "knowledgebase".to_string(),
+        Scenario::LongProject => "longproject".to_string(),
         Scenario::Custom(s) => format!("custom:{}", s),
     }
 }
@@ -366,6 +369,13 @@ pub fn scenario_from_str(s: &str) -> memory_center_scenarios::Scenario {
         "finance" => memory_center_scenarios::Scenario::Finance,
         "design" => memory_center_scenarios::Scenario::Design,
         "officework" | "office" | "work" => memory_center_scenarios::Scenario::OfficeWork,
+        "agentcollaboration" | "agent" | "collaboration" => {
+            memory_center_scenarios::Scenario::AgentCollaboration
+        }
+        "knowledgebase" | "knowledge" | "kb" => {
+            memory_center_scenarios::Scenario::KnowledgeBase
+        }
+        "longproject" | "project" | "long" => memory_center_scenarios::Scenario::LongProject,
         _ => memory_center_scenarios::Scenario::Custom(s.to_string()),
     }
 }

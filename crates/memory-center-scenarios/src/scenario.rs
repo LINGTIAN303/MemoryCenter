@@ -31,13 +31,19 @@ pub enum Scenario {
     Design,
     /// 工作场景：会议/文档/项目协作
     OfficeWork,
+    /// Agent 协作场景：多 Agent 共享记忆/跨 session 检索
+    AgentCollaboration,
+    /// 知识库场景：长期知识积累/评分偏向访问频率
+    KnowledgeBase,
+    /// 长项目场景：跨数周/月的项目/评分偏向时效性+用户标记
+    LongProject,
     /// 自定义场景（兜底）
     Custom(String),
 }
 
 impl Scenario {
     /// 返回所有内置场景（不含 Custom）
-    pub fn all_builtin() -> [Self; 7] {
+    pub fn all_builtin() -> [Self; 10] {
         [
             Self::Coding,
             Self::Writing,
@@ -46,6 +52,9 @@ impl Scenario {
             Self::Finance,
             Self::Design,
             Self::OfficeWork,
+            Self::AgentCollaboration,
+            Self::KnowledgeBase,
+            Self::LongProject,
         ]
     }
 
@@ -59,6 +68,9 @@ impl Scenario {
             Self::Finance => "金融场景".to_string(),
             Self::Design => "设计场景".to_string(),
             Self::OfficeWork => "工作场景".to_string(),
+            Self::AgentCollaboration => "Agent协作场景".to_string(),
+            Self::KnowledgeBase => "知识库场景".to_string(),
+            Self::LongProject => "长项目场景".to_string(),
             Self::Custom(s) => s.clone(),
         }
     }
@@ -92,7 +104,7 @@ mod tests {
 
     #[test]
     fn test_all_builtin_count() {
-        assert_eq!(Scenario::all_builtin().len(), 7);
+        assert_eq!(Scenario::all_builtin().len(), 10);
     }
 
     #[test]

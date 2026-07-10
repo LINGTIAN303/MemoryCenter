@@ -95,6 +95,27 @@ impl ScoreWeights {
                 topic_relevance: 0.20,
                 user_marked: 0.20,
             },
+            // Agent 协作：访问频率最高（跨 Agent 频繁访问的记忆重要）+ 主题相关性
+            Scenario::AgentCollaboration => Self {
+                recency: 0.15,
+                access_frequency: 0.40,
+                topic_relevance: 0.30,
+                user_marked: 0.15,
+            },
+            // 知识库：访问频率最高（常用知识重要）+ 用户标记
+            Scenario::KnowledgeBase => Self {
+                recency: 0.10,
+                access_frequency: 0.35,
+                topic_relevance: 0.25,
+                user_marked: 0.30,
+            },
+            // 长项目：时效性 + 用户标记（近期里程碑 + 用户标记的决策重要）
+            Scenario::LongProject => Self {
+                recency: 0.35,
+                access_frequency: 0.15,
+                topic_relevance: 0.20,
+                user_marked: 0.30,
+            },
             // 自定义：均衡
             Scenario::Custom(_) => Self::balanced(),
         }

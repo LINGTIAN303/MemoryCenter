@@ -143,6 +143,12 @@ fn default_archive_threshold(scenario: &Scenario) -> usize {
         Scenario::Finance => 400_000,
         // 工作场景：中等窗口
         Scenario::OfficeWork => 400_000,
+        // Agent 协作：中等窗口（跨 Agent 对话）
+        Scenario::AgentCollaboration => 400_000,
+        // 知识库：大窗口（知识积累）
+        Scenario::KnowledgeBase => 500_000,
+        // 长项目：大窗口（跨数周/月）
+        Scenario::LongProject => 500_000,
         // 自定义：默认 400K（对齐 core 默认值）
         Scenario::Custom(_) => 400_000,
     }

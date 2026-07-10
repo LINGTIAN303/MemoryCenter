@@ -56,6 +56,30 @@ pub fn priority_tags_for(scenario: &Scenario) -> Vec<Tag> {
             Tag::Url,
             Tag::Citation,
         ],
+        // Agent 协作：工具调用 > 思考过程 > 代码块 > 文本 > 计划
+        Scenario::AgentCollaboration => vec![
+            Tag::ToolCall,
+            Tag::Thinking,
+            Tag::CodeBlock,
+            Tag::Text,
+            Tag::Plan,
+        ],
+        // 知识库：引用 > 文本 > URL > 代码块 > 文件附件
+        Scenario::KnowledgeBase => vec![
+            Tag::Citation,
+            Tag::Text,
+            Tag::Url,
+            Tag::CodeBlock,
+            Tag::FileAttachment,
+        ],
+        // 长项目：计划 > 状态 > 文件附件 > 文本 > 代码块
+        Scenario::LongProject => vec![
+            Tag::Plan,
+            Tag::Status,
+            Tag::FileAttachment,
+            Tag::Text,
+            Tag::CodeBlock,
+        ],
         // 自定义：空列表（不优先任何标签）
         Scenario::Custom(_) => Vec::new(),
     }

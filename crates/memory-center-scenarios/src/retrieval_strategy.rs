@@ -62,6 +62,15 @@ impl RetrievalStrategy {
             },
             // 工作场景：混合（文档/会议需要语义 + 关键词）
             Scenario::OfficeWork => Self::default_hybrid(),
+            // Agent 协作：偏语义（跨 Agent 语义理解重要）
+            Scenario::AgentCollaboration => Self::Hybrid {
+                bm25_weight: 0.3,
+                semantic_weight: 0.7,
+            },
+            // 知识库：偏语义（知识检索语义相似性重要）
+            Scenario::KnowledgeBase => Self::Semantic,
+            // 长项目：混合（项目文档需要语义 + 关键词）
+            Scenario::LongProject => Self::default_hybrid(),
             // 自定义：默认混合
             Scenario::Custom(_) => Self::default_hybrid(),
         }

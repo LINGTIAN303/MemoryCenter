@@ -28,6 +28,12 @@ pub enum SummaryFocus {
     Design,
     /// 工作场景：会议决议/待办/文档变更
     OfficeWork,
+    /// Agent 协作场景：Agent 决策/工具调用/上下文迁移/协作流程
+    AgentCollaboration,
+    /// 知识库场景：知识主题/定义/分类/引用/标签
+    KnowledgeBase,
+    /// 长项目场景：项目阶段/里程碑/决策/风险/待办
+    LongProject,
     /// 通用兜底（默认，Custom 场景降级为此）
     General,
 }
@@ -45,6 +51,9 @@ impl SummaryFocus {
             Scenario::Finance => Self::Finance,
             Scenario::Design => Self::Design,
             Scenario::OfficeWork => Self::OfficeWork,
+            Scenario::AgentCollaboration => Self::AgentCollaboration,
+            Scenario::KnowledgeBase => Self::KnowledgeBase,
+            Scenario::LongProject => Self::LongProject,
             Scenario::Custom(_) => Self::General,
         }
     }
@@ -59,6 +68,9 @@ impl SummaryFocus {
             Self::Finance => &["交易明细", "金额", "时间", "风险", "收益", "标的"],
             Self::Design => &["设计决策", "用户反馈", "迭代版本", "视觉要素", "交互流程"],
             Self::OfficeWork => &["会议决议", "待办事项", "文档变更", "责任人", "截止日期"],
+            Self::AgentCollaboration => &["Agent决策", "工具调用", "上下文迁移", "协作流程", "会话边界"],
+            Self::KnowledgeBase => &["知识主题", "定义", "分类", "引用", "标签"],
+            Self::LongProject => &["项目阶段", "里程碑", "决策", "风险", "待办"],
             Self::General => &["主题", "关键事实", "关键实体"],
         }
     }
@@ -73,6 +85,9 @@ impl SummaryFocus {
             Self::Finance => "金融",
             Self::Design => "设计",
             Self::OfficeWork => "工作",
+            Self::AgentCollaboration => "Agent协作",
+            Self::KnowledgeBase => "知识库",
+            Self::LongProject => "长项目",
             Self::General => "通用",
         }
     }
