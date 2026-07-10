@@ -15,6 +15,13 @@
 [![GitHub issues](https://img.shields.io/github/issues/LINGTIAN303/MemoryCenter)](https://github.com/LINGTIAN303/MemoryCenter/issues)
 [![Last Commit](https://img.shields.io/github/last-commit/LINGTIAN303/MemoryCenter)](https://github.com/LINGTIAN303/MemoryCenter/commits/main)
 
+> [!NOTE]
+> **TRAE AI 创造力大赛参赛项目** · 学习工作赛道
+>
+> 本仓库为开发中状态，创意提案以 `contest/creative-proposal.html`（报名帖附件）为准。HTML 内的评测数据、能力指标、迭代路线均为**预期目标**，非已交付状态。
+>
+> 代码仓库将在初赛阶段公开，报名期间暂不接受外部协作。
+
 ## 目录
 
 - [定位](#定位agent-的时序记忆基础设施)
