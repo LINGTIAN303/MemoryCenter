@@ -409,6 +409,16 @@ async fn archive_compaction_event(
         }
     };
 
+    // 空检查（风险 4 修复）：竞态场景下主动归档可能已更新 last_archived_seq，
+    // 导致增量范围为空。此时跳过，避免归档只含 summary_turn 的无价值内容。
+    if turns.is_empty() {
+        tracing::info!(
+            session_id = %compaction.session_id,
+            "增量范围内无 turns，跳过（可能已被主动归档）"
+        );
+        return Ok(());
+    }
+
     // 附加 compaction summary 作为高价值标签（决策点2）
     // v2.43：作为额外的合成 SidecarTurn 追加，让服务器 apply_turn_defaults 推断 tags
     // - user_message：标记这是压缩摘要

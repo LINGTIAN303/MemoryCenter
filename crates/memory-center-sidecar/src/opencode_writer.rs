@@ -104,6 +104,8 @@ pub fn insert_compaction_pair(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    // 设置 busy_timeout，避免与 OpenCode 主进程写入冲突时立即返回 SQLITE_BUSY
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
     // 使用事务确保原子性
     let tx = conn.unchecked_transaction()?;
@@ -155,12 +157,18 @@ pub fn insert_compaction_pair(
     )?;
 
     // === 消息 B：assistant 摘要消息 ===
+    // 补全 OpenCode Assistant schema 必填字段 + finish 字段（风险 1+2 修复）
+    // finish:"stop" 是关键 — completedCompactions() 检查 !msg.info.finish，缺失会导致消息对被跳过
     let assistant_msg_data = serde_json::json!({
         "role": "assistant",
         "parentID": &user_msg_id,
+        "sessionID": session_id,
         "mode": "compaction",
         "agent": "compaction",
+        "variant": "compaction",
         "summary": true,
+        "finish": "stop",
+        "path": { "cwd": "", "root": "" },
         "cost": 0,
         "tokens": {
             "input": 0,
@@ -168,6 +176,8 @@ pub fn insert_compaction_pair(
             "reasoning": 0,
             "cache": { "read": 0, "write": 0 }
         },
+        "modelID": "compaction",
+        "providerID": "compaction",
         "time": { "created": now, "completed": now }
     });
     let assistant_msg_data_str = serde_json::to_string(&assistant_msg_data)?;
@@ -238,9 +248,10 @@ pub fn query_tail_start_id(
 
     // 查询该 session 的所有 user 消息（按时间倒序）
     // tail_turns 轮 = tail_turns 条 user 消息（每轮一条 user）
+    // 使用 json_extract 结构化查询，避免 LIKE 文本匹配的脆弱性（风险 7 修复）
     let mut stmt = conn.prepare(
         "SELECT id FROM message
-         WHERE session_id = ?1 AND data LIKE '%\"role\":\"user\"%'
+         WHERE session_id = ?1 AND json_extract(data, '$.role') = 'user'
          ORDER BY time_created DESC",
     )?;
 
