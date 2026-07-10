@@ -23,6 +23,7 @@ desktop.ini
 *.dylib
 *.lib
 *.exp
+memory-center-server-linux
 
 # 测试覆盖率
 tarpaulin-report.html
@@ -45,6 +46,9 @@ eval/mc_data/
 
 # MCP 本地测试数据（stdio 模式归档的记忆文件，不提交）
 .mcp-data/
+
+# 本地记忆数据（运行时产生的 memory_data 目录，不提交）
+memory_data/
 
 # 本地测试归档数据（capability test 产物，不提交）
 test-data/
