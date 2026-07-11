@@ -6,9 +6,9 @@
 //!
 //! - [`LocalStorage`]：默认实现，本地文件树结构
 //! - [`Storage`] trait（来自 `memory_center_core_logic::storage`）：存储后端接口
-//! - **并发策略**：RwLock 串行化写操作（读可并发）
-//! - **原子写入**：temp + rename，防止崩溃导致文件损坏
-//! - **索引追加**：读-改-写（read → add_hook → write back）
+//! - **并发策略**：RwLock 串行化写操作（读可并发）+ 跨进程文件锁（v2.50 新增）
+//! - **原子写入**：temp + rename，UUID 临时文件名防止跨进程碰撞（v2.50）
+//! - **索引追加**：读-改-写（read → add_hook → write back），跨进程锁保护
 //!
 //! ## 记忆库文件树结构
 //!
@@ -53,14 +53,18 @@ use tokio::sync::RwLock;
 /// 将记忆文件以 JSON 或 MessagePack 格式存储在本地文件系统中。
 /// 文件树结构见模块文档。
 ///
-/// ## 并发（v2.4 升级：细粒度锁）
+/// ## 并发（v2.4 升级：细粒度锁，v2.50 新增跨进程文件锁）
 ///
-/// 内部用 [`DashMap`] + per-scope [`RwLock`] 实现细粒度并发：
+/// 内部用 [`DashMap`] + per-scope [`RwLock`] 实现细粒度进程内并发：
 /// - 不同 session/project 的写操作可并发
 /// - 同一 session/project 的写操作串行化
 /// - 读操作无锁可并发
 ///
-/// 跨进程并发需由调用方保证（如文件锁）。
+/// v2.50 新增跨进程文件锁（[`CrossProcessLockGuard`]）：
+/// - 保护 `append_hook` / `append_project_hook` 的读-改-写操作
+/// - lock file 模式（`.lock` 文件 + PID），无需外部依赖
+/// - 僵尸锁检测：锁文件超过 30s 自动清理
+/// - 指数退避重试（最多 10 次，总计 ~5s）
 ///
 /// ## 双格式支持（v2.4 新增）
 ///
@@ -318,14 +322,18 @@ impl LocalStorage {
 
     /// 原子写入（temp + rename）
     ///
-    /// 流程：写入 `{filename}.tmp` → rename 到目标路径
+    /// 流程：写入 `{filename}.{uuid}.tmp` → rename 到目标路径
     /// rename 在 Windows/Linux/macOS 上均原子替换目标文件
+    ///
+    /// v2.50：临时文件名从确定性 `{filename}.tmp` 改为 UUID-based `{filename}.{uuid}.tmp`，
+    /// 防止跨进程并发写同一文件时的 `.tmp` 碰撞。
     async fn atomic_write(&self, path: &Path, content: &[u8]) -> crate::Result<()> {
         let tmp_name = format!(
-            "{}.tmp",
+            "{}.{}.tmp",
             path.file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("tmp")
+                .unwrap_or("tmp"),
+            uuid::Uuid::new_v4().as_simple()
         );
         let tmp_path = path.with_file_name(tmp_name);
 
@@ -358,6 +366,130 @@ impl LocalStorage {
         self.atomic_write(&abs, &json).await?;
 
         Ok(Self::to_posix_string(&relative))
+    }
+}
+
+// ============================================================================
+// 跨进程文件锁（v2.50 新增）
+// ============================================================================
+
+/// 跨进程文件锁 guard（v2.50 新增）
+///
+/// 保护索引文件的读-改-写操作，防止 sidecar 和 server 并发写同一索引文件
+/// 导致 Lost Update（钩子丢失）。
+///
+/// ## 机制
+///
+/// - lock file 模式：在目标文件旁创建 `{filename}.lock` 文件
+/// - 原子创建：`OpenOptions::create_new(true)` 保证只有一个进程成功
+/// - PID 记录：锁文件内容为持有者 PID（便于调试）
+/// - 僵尸锁清理：锁文件修改时间超过 30s 视为僵尸锁，自动清理
+/// - 指数退避：竞争时 50ms → 100ms → 200ms → 400ms → 500ms（上限），最多 10 次
+/// - 自动释放：Drop 时删除锁文件
+///
+/// ## 使用方式
+///
+/// ```rust,ignore
+/// let _lock = CrossProcessLockGuard::acquire(&index_path).await?;
+/// // 读-改-写操作...
+/// // _lock drop 时自动释放
+/// ```
+struct CrossProcessLockGuard {
+    lock_path: PathBuf,
+}
+
+impl CrossProcessLockGuard {
+    /// 获取跨进程文件锁
+    ///
+    /// 在 `target_path` 旁创建 `.lock` 文件。若锁被占用，指数退避重试。
+    async fn acquire(target_path: &Path) -> crate::Result<Self> {
+        let lock_filename = format!(
+            "{}.lock",
+            target_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("lock")
+        );
+        let lock_path = target_path.with_file_name(lock_filename);
+
+        // 确保锁文件的父目录存在（首次写入索引时 index/ 目录可能尚未创建）
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                crate::Error::Storage(format!("创建锁文件父目录失败 {:?}: {}", parent, e))
+            })?;
+        }
+
+        let max_retries = 10;
+        let mut delay_ms = 50u64;
+
+        for attempt in 0..max_retries {
+            // 尝试原子创建锁文件
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut file) => {
+                    // 写入当前 PID（便于调试和僵尸锁检测）
+                    use std::io::Write;
+                    let _ = writeln!(file, "{}", std::process::id());
+                    tracing::trace!(
+                        lock_path = ?lock_path,
+                        pid = std::process::id(),
+                        attempts = attempt + 1,
+                        "跨进程文件锁获取成功"
+                    );
+                    return Ok(Self { lock_path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // 锁文件已存在，检查是否为僵尸锁（>30s）
+                    if let Ok(metadata) = std::fs::metadata(&lock_path) {
+                        if let Ok(modified) = metadata.modified() {
+                            let age = modified.elapsed().unwrap_or_default();
+                            if age.as_secs() > 30 {
+                                tracing::warn!(
+                                    lock_path = ?lock_path,
+                                    age_secs = age.as_secs(),
+                                    "发现僵尸锁文件，清理后重试"
+                                );
+                                let _ = std::fs::remove_file(&lock_path);
+                                continue;
+                            }
+                        }
+                    }
+
+                    if attempt == max_retries - 1 {
+                        return Err(crate::Error::Storage(format!(
+                            "获取跨进程文件锁超时 {:?}: 重试 {} 次后仍被占用",
+                            lock_path, max_retries
+                        )));
+                    }
+
+                    tracing::debug!(
+                        lock_path = ?lock_path,
+                        attempt = attempt + 1,
+                        delay_ms,
+                        "锁被占用，等待重试"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    delay_ms = (delay_ms * 2).min(500); // 指数退避，上限 500ms
+                }
+                Err(e) => {
+                    return Err(crate::Error::Storage(format!(
+                        "创建锁文件失败 {:?}: {}",
+                        lock_path, e
+                    )));
+                }
+            }
+        }
+
+        unreachable!("循环必定在 return 或 Err 处退出")
+    }
+}
+
+impl Drop for CrossProcessLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_path);
     }
 }
 
@@ -877,6 +1009,9 @@ impl Storage for LocalStorage {
         let relative = self.session_index_path(session_id, period);
         let abs = self.abs_path(&relative);
 
+        // v2.50: 跨进程文件锁（保护读-改-写，防止 sidecar/server 并发写丢失钩子）
+        let _cross_lock = CrossProcessLockGuard::acquire(&abs).await?;
+
         // 读-改-写
         let mut doc: IndexDocument = match tokio::fs::read(&abs).await {
             Ok(content) => serde_json::from_slice(&content).map_err(|e| {
@@ -990,6 +1125,9 @@ impl Storage for LocalStorage {
 
         let relative = self.project_index_path(project_id, period);
         let abs = self.abs_path(&relative);
+
+        // v2.50: 跨进程文件锁（保护读-改-写，防止 sidecar/server 并发写丢失钩子）
+        let _cross_lock = CrossProcessLockGuard::acquire(&abs).await?;
 
         // 读-改-写
         let mut doc: IndexDocument = match tokio::fs::read(&abs).await {

@@ -25,6 +25,7 @@ members = [
     "crates/memory-center-sidecar",
     "crates/memory-center-adapter",
     "crates/memory-center-dashboard",
+    "crates/memory-center-archive-core",
 ]
 
 [workspace.package]

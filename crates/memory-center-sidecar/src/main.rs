@@ -41,17 +41,19 @@
 //! ```
 
 mod config;
+mod engine;
 mod opencode_db;
 // v2.48：方案 B 回退 — opencode_writer 暂不启用（方案 A/C 探索时恢复）
 // mod opencode_writer;
-mod archive;
 mod state;
 mod watcher;
 
 use clap::Parser;
 use config::SidecarConfig;
+use engine::SidecarArchiveEngine;
 use opencode_db::OpenCodeDb;
-use archive::{ArchiveClient, SidecarContent, SidecarTurn};
+// v2.50：SidecarContent / SidecarTurn 从 adapter 直接导入（archive.rs 已删除）
+use memory_center_adapter::{SidecarContent, SidecarTurn};
 use state::{resolve_state_path, SidecarState};
 use watcher::{CompactionChangeEvent, CompactionWatcher};
 // v2.46：AgentAdapter trait 用于动态分发
@@ -103,12 +105,12 @@ async fn main() {
             tracing::info!(
                 db_path = %db_path.display(),
                 state_path = %state_path.display(),
-                memorycenter_url = %config.memorycenter_url,
+                storage_root = %config.storage_root.display(),
                 poll_interval_secs = config.poll_interval,
                 project_id = %config.project_id,
                 backfill = config.backfill,
                 agent = %config.agent,
-                "mc-sidecar 启动（v2.46 多 Agent adapter + 状态持久化）"
+                "mc-sidecar 启动（v2.50 直写存储 + 多 Agent adapter + 状态持久化）"
             );
 
             // 检查 db 文件是否存在
@@ -176,18 +178,21 @@ async fn main() {
         }
     }
 
-    // 创建归档客户端
-    let archive_client = ArchiveClient::new(&config);
+    // v2.50：创建归档引擎（直写存储，不再经 HTTP 中转）
+    let archive_engine = SidecarArchiveEngine::from_storage_root(config.storage_root.clone());
 
-    // 健康检查
-    let healthy = archive_client.health_check().await.unwrap_or(false);
+    // 健康检查（v2.50：同步检查存储目录可写，不再 async HTTP 请求）
+    let healthy = archive_engine.health_check().unwrap_or(false);
     if !healthy {
         tracing::warn!(
-            url = %config.memorycenter_url,
-            "MemoryCenter 服务不可达，sidecar 将继续运行并在检测到压缩时重试"
+            storage_root = %config.storage_root.display(),
+            "存储目录不可写，sidecar 将继续运行并在检测到压缩时重试"
         );
     } else {
-        tracing::info!(url = %config.memorycenter_url, "MemoryCenter 服务连接正常");
+        tracing::info!(
+            storage_root = %config.storage_root.display(),
+            "存储目录可写，归档引擎就绪"
+        );
     }
 
     // 创建压缩事件检测器（v2.41：传入持久化状态）
@@ -200,7 +205,7 @@ async fn main() {
             Ok(events) => {
                 tracing::info!(count = events.len(), "发现未归档的历史 compaction 事件");
                 for event in events {
-                    match archive_compaction_event(db.as_ref(), &archive_client, &event, &config).await {
+                    match archive_compaction_event(db.as_ref(), &archive_engine, &event, &config).await {
                         Ok(()) => {
                             // 归档成功后标记为已处理（避免主循环 poll 重复归档）
                             watcher.mark_archived(&event);
@@ -277,7 +282,7 @@ async fn main() {
         // 处理新检测到的 compaction 事件
         let mut had_new = false;
         for event in poll_result.new_compactions {
-            match archive_compaction_event(db.as_ref(), &archive_client, &event, &config).await {
+            match archive_compaction_event(db.as_ref(), &archive_engine, &event, &config).await {
                 Ok(()) => {
                     // 归档成功后标记为已处理
                     watcher.mark_archived(&event);
@@ -309,10 +314,15 @@ async fn main() {
     }
 }
 
-/// 归档单个 compaction 事件（v2.39 新增，v2.43 改为结构化 turns）
+/// 归档单个 compaction 事件（v2.39 新增，v2.43 改为结构化 turns，v2.50 改为直写存储）
 ///
 /// 增量归档：读取 (from_seq, compaction.seq) 之间的消息，
-/// 附加 compaction summary 作为合成 turn，调用 MemoryCenter pre-compress 端点。
+/// 附加 compaction summary 作为合成 turn，调用 ArchiveEngine pre_compress。
+///
+/// v2.50 改动：
+/// - 参数从 `archive_client: &ArchiveClient` 改为 `engine: &SidecarArchiveEngine`
+/// - 不再经 HTTP POST 中转，直接通过 ArchiveEngine 写 LocalStorage
+/// - 返回的 PreCompressResult 字段与旧 PreCompressResponse 一致
 ///
 /// v2.43 改动：
 /// - 读取结构化 turns（保留 tool_calls/thinking），替代拼接字符串
@@ -320,7 +330,7 @@ async fn main() {
 /// - token 估算基于各 turn 的文本/tool 内容长度总和
 async fn archive_compaction_event(
     db: &dyn AgentAdapter,
-    archive_client: &ArchiveClient,
+    engine: &SidecarArchiveEngine,
     event: &CompactionChangeEvent,
     config: &SidecarConfig,
 ) -> Result<(), String> {
@@ -420,11 +430,11 @@ async fn archive_compaction_event(
         fallback_tokens = fallback_count,
         from_seq = ?event.from_seq,
         to_seq = compaction.seq,
-        "读取增量 turns 完成，调用 MemoryCenter pre-compress"
+        "读取增量 turns 完成，调用 ArchiveEngine 直写归档"
     );
 
-    // 调用 MemoryCenter 归档（v2.43 传结构化 turns）
-    match archive_client
+    // v2.50：调用 ArchiveEngine 直写存储（不再经 HTTP 中转）
+    match engine
         .pre_compress(&compaction.session_id, turns, estimated_tokens, &config.project_id)
         .await
     {
@@ -439,7 +449,7 @@ async fn archive_compaction_event(
                 threshold = resp.threshold,
                 ratio_percent = resp.threshold_ratio_percent,
                 suggestion = %resp.suggestion,
-                "归档成功"
+                "归档成功（v2.50 直写存储）"
             );
             Ok(())
         }

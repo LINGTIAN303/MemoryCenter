@@ -22,6 +22,10 @@ path = "src/main.rs"
 memory-center-adapter = { path = "../memory-center-adapter" }
 # v2.46：AgentFamily（adapter::family() 返回值）
 memory-center-agents = { path = "../memory-center-agents" }
+# v2.50：归档核心引擎（sidecar 直写存储，不再经 HTTP 中转）
+memory-center-archive-core = { path = "../memory-center-archive-core" }
+# v2.50：MessageTurn 类型（SidecarTurn → MessageTurn 转换用）
+memory-center-core = { path = "../memory-center-core" }
 # 序列化
 serde.workspace = true
 serde_json.workspace = true
@@ -36,8 +40,6 @@ tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["full"] }
 # SQLite（读 OpenCode 会话库）
 rusqlite = { workspace = true }
-# HTTP 客户端（调用 MemoryCenter REST API）
-reqwest = { workspace = true }
 # CLI 参数解析
 clap = { workspace = true }
 # 错误处理

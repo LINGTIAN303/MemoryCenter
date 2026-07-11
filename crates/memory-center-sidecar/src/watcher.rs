@@ -191,6 +191,9 @@ impl Default for CompactionWatcher {
 ///
 /// 当某 session 的累积 tokens 达到阈值 * 触发比例时产生此事件，
 /// 主循环据此执行主动归档 + 插入 compaction 消息对。
+///
+/// v2.48：主动清空逻辑已回退，此结构体暂时未使用，保留供未来方案探索复用。
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TokenThresholdEvent {
     /// 触发的 session ID
@@ -228,6 +231,9 @@ impl CompactionWatcher {
     /// - `db`：Agent 数据源适配器
     /// - `cli_threshold`：CLI 参数 `--token-threshold`（0 表示未配置）
     /// - `ratio_percent`：触发比例（默认 80）
+    ///
+    /// v2.48：主动清空逻辑已回退，此方法暂时未使用，保留供未来方案探索复用。
+    #[allow(dead_code)]
     pub fn poll_tokens(
         &self,
         db: &dyn AgentAdapter,
@@ -293,6 +299,9 @@ impl CompactionWatcher {
     /// 更新 `last_archived_seq` 为 `last_seq`，让下次 poll_tokens 不重复计算已归档部分。
     ///
     /// 注意：不更新 `processed_message_ids`（那是 compaction 消息 ID 去重用的）。
+    ///
+    /// v2.48：主动清空逻辑已回退，此方法暂时未使用，保留供未来方案探索复用。
+    #[allow(dead_code)]
     pub fn mark_proactive_archived(&mut self, session_id: &str, last_seq: i64) {
         self.state
             .last_archived_seq
@@ -303,6 +312,9 @@ impl CompactionWatcher {
     ///
     /// 归档响应中含 `threshold` 字段时，缓存到 state，
     /// 后续 poll_tokens 在 CLI 未配置阈值时使用此缓存。
+    ///
+    /// v2.48：主动清空逻辑已回退，此方法暂时未使用，保留供未来方案探索复用。
+    #[allow(dead_code)]
     pub fn update_cached_threshold(&mut self, threshold: usize) {
         if threshold > 0 && self.state.cached_threshold != threshold {
             tracing::debug!(

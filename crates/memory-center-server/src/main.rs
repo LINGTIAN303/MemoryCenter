@@ -107,8 +107,19 @@ async fn main() {
     let (summary_generator, _) = build_summary_generator();
     let scenario_detector = build_scenario_detector();
 
+    // v2.50：构建归档引擎（复用 bootstrap 构造的组件，避免重复初始化）
+    let mut archive_engine = memory_center_archive_core::ArchiveEngine::new(config.storage_root.clone());
+    if let Some(gen) = &summary_generator {
+        archive_engine = archive_engine.with_summary_generator(gen.clone());
+    }
+    archive_engine = archive_engine.with_scenario_detector(scenario_detector.clone());
+    if let Some(router) = &session_search {
+        archive_engine = archive_engine.with_session_search(router.clone());
+    }
+
     let state = AppState {
         storage_root: config.storage_root.clone(),
+        archive_engine: std::sync::Arc::new(archive_engine),
         session_search,
         conflict_detector: Some(conflict_detector),
         summary_generator,

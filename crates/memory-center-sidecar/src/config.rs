@@ -1,4 +1,4 @@
-//! # Sidecar 配置（v2.36 新增）
+//! # Sidecar 配置（v2.36 新增，v2.50 改为直写存储）
 //!
 //! 通过 CLI 参数 + 环境变量配置 sidecar 行为。
 //!
@@ -7,10 +7,12 @@
 //! | 环境变量 | 说明 | 默认值 |
 //! |---------|------|--------|
 //! | `OPENCODE_DB_PATH` | OpenCode SQLite 路径 | 平台默认路径 |
-//! | `MEMORYCENTER_URL` | MemoryCenter HTTP 地址 | `http://127.0.0.1:8080` |
-//! | `MEMORYCENTER_API_KEY` | MemoryCenter API Key | 空（不鉴权） |
+//! | `MEMORY_CENTER_ROOT` | MemoryCenter 存储根目录 | `./data` |
 //! | `OPENCODE_SIDECAR_POLL_INTERVAL` | 轮询间隔（秒） | `5` |
 //! | `OPENCODE_SIDECAR_PROJECT_ID` | 项目 ID | `opencode` |
+//!
+//! v2.50：移除 `MEMORYCENTER_URL` / `MEMORYCENTER_API_KEY`（不再依赖 HTTP server），
+//! 新增 `MEMORY_CENTER_ROOT`（直写存储目录，与 mc-server / mc-mcp 共用）。
 
 use std::path::PathBuf;
 use clap::Parser;
@@ -21,6 +23,7 @@ use clap::Parser;
 /// OpenCode 端零源码改动，完全在 MemoryCenter 侧实现。
 ///
 /// v2.46：支持多 Agent adapter，通过 --agent 选择。
+/// v2.50：直写存储，不再依赖 HTTP server。
 #[derive(Parser, Debug, Clone)]
 #[command(name = "mc-sidecar", version, about)]
 pub struct SidecarConfig {
@@ -44,13 +47,12 @@ pub struct SidecarConfig {
     #[arg(long, env = "OPENCODE_DB_PATH")]
     pub opencode_db: Option<PathBuf>,
 
-    /// MemoryCenter HTTP 服务地址
-    #[arg(long, env = "MEMORYCENTER_URL", default_value = "http://127.0.0.1:8080")]
-    pub memorycenter_url: String,
-
-    /// MemoryCenter API Key（若服务端配置了鉴权）
-    #[arg(long, env = "MEMORYCENTER_API_KEY")]
-    pub memorycenter_api_key: Option<String>,
+    /// MemoryCenter 存储根目录（v2.50 新增，替代 memorycenter_url）
+    ///
+    /// sidecar 直接写入此目录（与 mc-server / mc-mcp 共用同一存储）。
+    /// 应与 `MEMORY_CENTER_ROOT` 环境变量保持一致。
+    #[arg(long, env = "MEMORY_CENTER_ROOT", default_value = "./data")]
+    pub storage_root: PathBuf,
 
     /// 轮询间隔（秒）
     #[arg(long, env = "OPENCODE_SIDECAR_POLL_INTERVAL", default_value = "5")]

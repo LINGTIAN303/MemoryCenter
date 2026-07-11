@@ -2,6 +2,88 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。变更格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## v2.50 - sidecar 直写存储 + 跨进程并发安全（2026-07-11）
+
+### 重大变更
+
+- **sidecar 直写存储**：移除 sidecar 对 HTTP server 的依赖，改为直接写入 MemoryCenter 存储目录
+  - 新增 `memory-center-archive-core` crate（workspace 第 21 个成员），抽取 server `pre_compress` + `archive` 核心逻辑为共享 `ArchiveEngine`
+  - sidecar 新增 `engine.rs`（`SidecarArchiveEngine` 封装 `ArchiveEngine`），移除 `archive.rs`（HTTP 客户端 + `ArchiveClient`）
+  - sidecar `config.rs`：移除 `memorycenter_url` / `memorycenter_api_key` 字段，新增 `storage_root: PathBuf`（env `MEMORY_CENTER_ROOT`，默认 `./data`）
+  - sidecar 健康检查：从 async HTTP GET 改为同步存储目录可写检查
+  - sidecar `archive_compaction_event` 函数签名：`&ArchiveClient` → `&SidecarArchiveEngine`
+  - server `AppState` 新增 `archive_engine: Arc<ArchiveEngine>` 字段，archive/pre_compress handler 委托给 engine
+  - `SidecarTurn → MessageTurn` 转换通过 JSON Value roundtrip 实现（SidecarTurn 只 Serialize，MessageTurn 用 `#[serde(default)]` 反序列化）
+
+- **跨进程文件锁**（`CrossProcessLockGuard`）：保护索引文件并发安全
+  - lock file 模式（`.lock` 文件 + PID），无外部依赖
+  - 僵尸锁检测：锁文件修改时间超过 30s 自动清理
+  - 指数退避重试：50ms → 100ms → 200ms → 400ms → 500ms（上限），最多 10 次
+  - `append_hook` / `append_project_hook` 读-改-写操作加跨进程锁保护
+  - `atomic_write` 临时文件名从确定性 `{filename}.tmp` 改为 UUID-based `{filename}.{uuid}.tmp`，防止跨进程碰撞
+  - `memory-center-core` 新增 tokio "time" feature（供 `tokio::time::sleep` 异步退避）
+
+### 降级兼容
+
+- sidecar 未配置 LLM API 时，`ArchiveEngine` 的 `summary_generator` / `scenario_detector` / `session_search` 均为 `None`，归档仍可工作（降级为启发式摘要 + BM25 检索）
+- server 和 sidecar 共享 `build_engine_from_env` 构造逻辑，组件初始化一致
+
+### 文档更新
+
+- `docs/onboarding/opencode.md`：
+  - 架构图说明 sidecar 直写存储目录（不再经 HTTP server 中转）
+  - sidecar 启动命令移除 `--memorycenter-url` / `--memorycenter-api-key`，新增 `--storage-root`
+  - 参数说明表更新（环境变量名 + 默认值）
+  - systemd / NSSM 服务配置更新
+  - 故障排查 7.3 从"HTTP 401"改为"存储写入错误"
+
+### 受影响文件
+
+**新增**：
+- `crates/memory-center-archive-core/Cargo.toml` + `src/lib.rs`（ArchiveEngine + PreCompressResult + ArchiveError + build_engine_from_env + 4 单元测试）
+
+**修改**：
+- `Cargo.toml`（workspace members +21）
+- `crates/memory-center-core/Cargo.toml`（tokio +time feature）
+- `crates/memory-center-core/src/storage.rs`（CrossProcessLockGuard + atomic_write UUID + append_hook/append_project_hook 加锁）
+- `crates/memory-center-server/Cargo.toml`（+ archive-core 依赖）
+- `crates/memory-center-server/src/lib.rs`（AppState + archive_engine）
+- `crates/memory-center-server/src/main.rs`（构造 ArchiveEngine 注入）
+- `crates/memory-center-server/src/handlers.rs`（archive/pre_compress 委托 engine + 清理 unused imports）
+- `crates/memory-center-sidecar/Cargo.toml`（- reqwest，+ archive-core + core）
+- `crates/memory-center-sidecar/src/main.rs`（mod engine，启动日志 + 健康检查 + 归档调用）
+- `crates/memory-center-sidecar/src/config.rs`（- url/api_key，+ storage_root）
+- `crates/memory-center-sidecar/src/opencode_db.rs`（crate::archive → memory_center_adapter）
+
+**删除**：
+- `crates/memory-center-sidecar/src/archive.rs`（HTTP 客户端）
+
+### 架构价值
+
+- **消除 sidecar 对 server 进程的硬依赖**：v2.49 诊断的"sidecar 归档失效根因"（server 未运行导致 HTTP 请求失败）从架构层面解决
+- **归档逻辑单一来源**：server 和 sidecar 共用 `ArchiveEngine`，消除重复实现
+- **并发安全**：跨进程文件锁保护索引文件，sidecar 和 server 可安全共用同一存储目录
+
+## v2.49 - DeepSeek 网页端适配文档 + 架构问题诊断（2026-07-11）
+
+### 新增
+- **DeepSeek 网页端接入指南**（[docs/onboarding/deepseek-web.md](docs/onboarding/deepseek-web.md)）：
+  - 适用于 DeepSeek 网页端 + DeepSeek++ 浏览器扩展场景
+  - Streamable HTTP 模式部署 + SSL 反向代理配置
+  - 跨 Agent 记忆共享机制说明（DeepSeek 网页端 ↔ 本地 IDE）
+  - 安全注意事项（API Key 保护 / 数据隐私 / 访问控制）
+  - 与本地 IDE 接入的区别对比表
+
+### 文档更新
+- `README.md`：MCP Server 章节客户端列表加入 DeepSeek 网页端
+- `AGENTS.md`：客户端列表加入 DeepSeek 网页端 + 参考文档链接补充 DeepSeek 接入指南
+- `AGENTS.md`：MCP 传输模式表格 stdio 列加入 OpenCode，Streamable HTTP 列明确 DeepSeek++ 扩展
+
+### 架构问题诊断
+- **发现 sidecar 归档失效根因**：sidecar 通过 HTTP 连接 `memory-center-server`，但 server 未运行导致所有归档请求失败
+- **临时修复**：启动 `memory-center-server` 在 8766 端口，sidecar 自动归档积压的 compaction 事件
+- **待解决**：sidecar 当前依赖 HTTP server 中转，而非直接写入存储目录（架构层面需优化）
+
 ## v2.48 - 方案 B 回退：compaction 事件监听为稳定基线（2026-07-11）
 
 ### 变更

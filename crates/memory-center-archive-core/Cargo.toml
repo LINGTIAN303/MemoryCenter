@@ -1,0 +1,44 @@
+# memory-center-archive-core
+# 归档核心引擎（v2.50 新增）
+# 抽取 server pre_compress + archive 核心逻辑，供 server 和 sidecar 共享
+# 消除归档逻辑重复，支持 sidecar 直写存储
+
+[package]
+name = "memory-center-archive-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MemoryCenter 归档核心引擎 - server/sidecar 共享归档逻辑"
+
+[dependencies]
+# 核心层
+memory-center-core = { path = "../memory-center-core" }
+memory-center-core-logic = { path = "../memory-center-core-logic" }
+# LLM 组件（SummaryGenerator / ScenarioDetector / Embedder）
+memory-center-llm = { path = "../memory-center-llm" }
+# 预设 + 场景识别
+memory-center-presets = { path = "../memory-center-presets" }
+memory-center-agents = { path = "../memory-center-agents" }
+# 搜索索引（归档后触发）
+memory-center-search = { path = "../memory-center-search" }
+# 序列化
+serde.workspace = true
+serde_json.workspace = true
+# 时间
+chrono.workspace = true
+# 唯一 ID
+uuid = { workspace = true }
+# 日志
+tracing.workspace = true
+# 异步运行时
+tokio = { workspace = true }
+# 错误处理
+thiserror.workspace = true
+# 异步 trait
+async-trait.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -9,9 +9,8 @@ use std::sync::Arc;
 
 use crate::error::AppError;
 use crate::AppState;
-use memory_center_core::archive::Archiver;
 use memory_center_core::compact::Compactor;
-use memory_center_core::model::{apply_turn_defaults, ArchiveConfig, MemoryFile, MessageTurn, Tag};
+use memory_center_core::model::{MemoryFile, MessageTurn, Tag};
 use memory_center_core::retrieve::{Retriever, SummaryView};
 use memory_center_core::score::DefaultScorer;
 use memory_center_core::storage::{LocalStorage, Storage};
@@ -182,6 +181,8 @@ fn create_storage(state: &AppState) -> Arc<dyn Storage> {
 /// v2.29：支持 `preset` 字段（内联预设），传入后：
 /// - 用 `archive_threshold` 覆盖默认 ArchiveConfig.token_threshold
 /// - 用 `summary_template` 通过 `with_summary_template_override` 注入
+///
+/// v2.50：委托给 `ArchiveEngine::archive`，与 sidecar 共用归档逻辑。
 pub async fn archive(
     State(state): State<AppState>,
     Path(sid): Path<String>,
@@ -191,117 +192,27 @@ pub async fn archive(
         return Err(AppError::BadRequest("turns 不能为空".to_string()));
     }
 
-    // v2.33：场景识别（仅首次 archive 时识别，后续读 session_meta 跳过）
-    // 优先级：用户显式 preset.scenario > session_meta > 识别 > Agent 默认
-    // 识别失败不阻塞 archive，降级到 Agent 默认场景
-    let effective_scenario_name: Option<String> = if let Some(detector) = &state.scenario_detector {
-        // 推导 Agent family（preset.agent 解析 + Custom 兜底）
-        let family = req.preset.as_ref()
-            .and_then(|p| p.agent.as_deref())
-            .and_then(memory_center_agents::AgentFamily::from_str)
-            .unwrap_or_else(|| memory_center_agents::AgentFamily::Custom("unknown".to_string()));
+    // v2.50：委托给 ArchiveEngine
+    let preset_ref = req.preset.as_ref().map(|p| memory_center_archive_core::PresetRequest {
+        agent: p.agent.clone(),
+        scenario: p.scenario.clone(),
+        model: p.model.clone(),
+        archive_threshold: p.archive_threshold,
+        summary_template: p.summary_template.clone(),
+    });
 
-        // 提取 preset.scenario 作为用户显式（若存在）
-        let user_explicit = req.preset.as_ref()
-            .and_then(|p| p.scenario.as_deref());
+    let result = state
+        .archive_engine
+        .archive(&sid, req.turns, req.project_id.as_deref(), preset_ref.as_ref())
+        .await
+        .map_err(|e| match e {
+            memory_center_archive_core::ArchiveError::BadRequest(msg) => AppError::BadRequest(msg),
+            memory_center_archive_core::ArchiveError::Preset(msg) => AppError::BadRequest(msg),
+            memory_center_archive_core::ArchiveError::Storage(msg) => AppError::Internal(msg),
+            memory_center_archive_core::ArchiveError::Archive(msg) => AppError::Internal(msg),
+        })?;
 
-        let storage_for_detect = create_storage(&state);
-        let scenario = memory_center_presets::resolve_effective_scenario(
-            storage_for_detect.as_ref(),
-            &sid,
-            user_explicit,
-            &family,
-            detector.as_ref(),
-            &req.turns,
-        ).await;
-
-        Some(memory_center_presets::scenario_to_str(&scenario))
-    } else {
-        // 未注入识别器：保留原行为（preset.scenario 或 None）
-        req.preset.as_ref().and_then(|p| p.scenario.clone())
-    };
-
-    // v2.33：若识别到场景（且 preset 未显式指定），用识别的场景重新 build CombinedProfile
-    // 以应用对应场景的 summary_template / archive_threshold / priority_tags 等
-    let (archive_threshold, summary_template) = if let Some(preset_req) = &req.preset {
-        // 用户传了 preset，按 preset build（识别结果仅作记录已写入 session_meta）
-        let combined = crate::presets::build_combined_from_request(preset_req)
-            .map_err(AppError::BadRequest)?;
-        (
-            Some(combined.archive_threshold()),
-            Some(combined.summary_template().to_string()),
-        )
-    } else if let Some(scenario_name) = effective_scenario_name {
-        // 无 preset 但识别到场景 → 用识别的场景 build
-        let combined = memory_center_presets::build_from_strings(
-            None,
-            Some(&scenario_name),
-            None,
-            None,
-            None,
-        ).map_err(|e| AppError::Internal(format!("识别场景构建预设失败: {e}")))?;
-        (
-            Some(combined.archive_threshold()),
-            Some(combined.summary_template().to_string()),
-        )
-    } else {
-        (None, None)
-    };
-
-    let storage = create_storage(&state);
-    // v2.29：archive_threshold 覆盖默认 token_threshold（force_truncate_limit 按比例放大）
-    let config = if let Some(threshold) = archive_threshold {
-        ArchiveConfig {
-            token_threshold: threshold,
-            force_truncate_limit: threshold * 3 / 2,
-            wait_for_turn_completion: true,
-        }
-    } else {
-        ArchiveConfig::default()
-    };
-    let mut archiver = Archiver::new(config, storage, &sid, req.project_id);
-
-    // v2.21 批次 8b: 若注入了 summary_generator，注入到 Archiver
-    // 注入后 archive() 时调用 LLM 生成结构化摘要，失败时降级为启发式
-    if let Some(gen) = &state.summary_generator {
-        archiver = archiver.with_summary_generator(gen.clone());
-    }
-
-    // v2.29：若构建出 summary_template，注入到 Archiver
-    // 通过 with_summary_template_override 覆盖 HttpSummaryGenerator 的内部模板
-    if let Some(tpl) = summary_template {
-        archiver = archiver.with_summary_template_override(tpl);
-    }
-
-    // v2.35：提取 turns 文本用于索引（在 move 消费前 borrow）
-    let turns_text = crate::extract_turns_text(&req.turns);
-
-    // v2.43：对每个 turn 应用默认值补全（推断 tags + 估算 token_count）
-    // 与 MCP 端 archive tool 行为一致（lib.rs:837）
-    for mut turn in req.turns {
-        apply_turn_defaults(&mut turn);
-        archiver.push_turn(turn);
-    }
-
-    let (_, hook) = archiver.archive().await?;
-    let summary = SummaryView::from(&hook);
-
-    // v2.31：归档后触发搜索索引（按 session 隔离）
-    // v2.8 起由 session_search 替代全局 search_indexer，未配置时跳过（向后兼容）
-    // v2.35：传入 turns_text 提升检索召回率
-    if let Some(router) = &state.session_search {
-        router.index_hook(&sid, &hook, &turns_text).await;
-    }
-
-    tracing::info!(
-        session = %sid,
-        hook_id = %summary.hook_id,
-        tokens = summary.token_count,
-        has_preset = archive_threshold.is_some(),
-        "归档成功"
-    );
-
-    Ok(Json(summary))
+    Ok(Json(result.summary))
 }
 
 // ============================================================================
@@ -321,6 +232,11 @@ pub async fn archive(
 /// 2. 尝试解析 turns：成功复用 Archiver 归档；失败仅存 raw_context（parse_success=false）
 ///
 /// 与 MCP 端 `pre_compress_hook` tool 行为一致。
+///
+/// v2.50：委托给 `ArchiveEngine::pre_compress`，与 sidecar 共用归档逻辑。
+/// 注意：ArchiveEngine.pre_compress 只接受结构化 turns（sidecar 场景），
+/// server 端仍需支持 full_context 字符串输入（向后兼容），因此这里保留
+/// full_context → context_parser 解析的回退路径。
 pub async fn pre_compress(
     State(state): State<AppState>,
     Path(sid): Path<String>,
@@ -338,325 +254,91 @@ pub async fn pre_compress(
         ));
     }
 
-    // 1. 生成 hook_id（提前生成，用于 raw_context 文件命名）
-    let hook_id = uuid::Uuid::new_v4().to_string();
+    // v2.50：路径 A（优先）— 有结构化 turns 时直接委托给 ArchiveEngine
+    if let Some(turns) = req.turns {
+        if !turns.is_empty() {
+            let preset_ref = req.preset.as_ref().map(|p| memory_center_archive_core::PresetRequest {
+                agent: p.agent.clone(),
+                scenario: p.scenario.clone(),
+                model: p.model.clone(),
+                archive_threshold: p.archive_threshold,
+                summary_template: p.summary_template.clone(),
+            });
+            let snap_ref = req.task_state_snapshot.as_ref().map(|s| {
+                memory_center_archive_core::TaskStateSnapshotRequest {
+                    current_task: s.current_task.clone(),
+                    completed_steps: s.completed_steps.clone(),
+                    in_progress_step: s.in_progress_step.clone(),
+                    next_step: s.next_step.clone(),
+                }
+            });
 
-    // 2. 确定 raw_context 内容：优先 full_context，否则用 turns 的 JSON 序列化
-    //    raw_context 是完整原始上下文备份，无论哪条路径都要写
-    let raw_context_content = if let Some(fc) = &req.full_context {
-        if !fc.trim().is_empty() {
-            fc.clone()
-        } else {
-            // full_context 为空，用 turns 序列化
-            serde_json::to_string_pretty(
-                req.turns.as_ref().expect("前面已校验至少一个非空"),
-            )
-            .unwrap_or_else(|_| "<turns 序列化失败>".to_string())
+            let result = state
+                .archive_engine
+                .pre_compress(
+                    &sid,
+                    turns,
+                    req.estimated_tokens,
+                    req.project_id.as_deref(),
+                    preset_ref.as_ref(),
+                    snap_ref.as_ref(),
+                )
+                .await
+                .map_err(|e| match e {
+                    memory_center_archive_core::ArchiveError::BadRequest(msg) => AppError::BadRequest(msg),
+                    memory_center_archive_core::ArchiveError::Preset(msg) => AppError::BadRequest(msg),
+                    memory_center_archive_core::ArchiveError::Storage(msg) => AppError::Internal(msg),
+                    memory_center_archive_core::ArchiveError::Archive(msg) => AppError::Internal(msg),
+                })?;
+
+            return Ok(Json(serde_json::to_value(result).unwrap_or_default()));
         }
-    } else {
-        // 未传 full_context，用 turns 序列化
-        serde_json::to_string_pretty(
-            req.turns.as_ref().expect("前面已校验至少一个非空"),
-        )
-        .unwrap_or_else(|_| "<turns 序列化失败>".to_string())
+    }
+
+    // v2.50：路径 B（回退）— full_context 字符串输入（向后兼容）
+    // 这种场景 sidecar 不会用到，但 server 需保留支持（MCP pre_compress_hook tool 可能传字符串）
+    let full_context = req.full_context.as_ref().expect("前面已校验至少一个非空");
+    let parsed = memory_center_core::context_parser::parse_context(full_context);
+    let turns = match &parsed {
+        Some(p) => p.turns.clone(),
+        None => Vec::new(),
     };
 
-    // 3. 写 raw_context（spec 第七章：永远先存，失败才阻塞返回错误）
-    let storage = create_storage(&state);
-    let raw_context_path = storage
-        .write_raw_context(&sid, &hook_id, &raw_context_content)
-        .await
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "写 raw_context 失败: {e}\n\n\
-                 raw_context 是 pre_compress 的核心兜底，失败则阻塞返回。\
-                 后续解析/归档步骤不会执行。"
-            ))
-        })?;
-
-    // 4. 估算 token（用内容长度 / 3，或客户端传入的 estimated_tokens）
-    let estimated_total_tokens = req
-        .estimated_tokens
-        .unwrap_or_else(|| raw_context_content.len() / 3);
-
-    // 5. v2.43：双路径解析 turns
-    //    路径 A（优先）：req.turns 直接用（结构化，保留 tool_calls/thinking）
-    //    路径 B（回退）：req.full_context 经 context_parser 解析（向后兼容）
-    let (parsed_turns, parse_source) = if let Some(turns) = req.turns {
-        (turns, "structured")
-    } else {
-        let fc = req.full_context.as_ref().expect("前面已校验至少一个非空");
-        match memory_center_core::context_parser::parse_context(fc) {
-            Some(parsed) => (parsed.turns, "string"),
-            None => (Vec::new(), "failed"),
+    let preset_ref = req.preset.as_ref().map(|p| memory_center_archive_core::PresetRequest {
+        agent: p.agent.clone(),
+        scenario: p.scenario.clone(),
+        model: p.model.clone(),
+        archive_threshold: p.archive_threshold,
+        summary_template: p.summary_template.clone(),
+    });
+    let snap_ref = req.task_state_snapshot.as_ref().map(|s| {
+        memory_center_archive_core::TaskStateSnapshotRequest {
+            current_task: s.current_task.clone(),
+            completed_steps: s.completed_steps.clone(),
+            in_progress_step: s.in_progress_step.clone(),
+            next_step: s.next_step.clone(),
         }
-    };
-
-    // 6. 根据解析结果走不同分支
-    let (archived_tokens, parsed_turns_count, parse_success) = if parse_source == "failed" {
-        // 路径 B 解析失败：仅存 raw_context（不阻塞）
-        tracing::info!(
-            session = %sid,
-            hook_id = %hook_id,
-            "full_context 解析失败（非 JSON 数组、无 User:/Assistant: 标记），仅存 raw_context"
-        );
-        (estimated_total_tokens, 0, false)
-    } else if parsed_turns.is_empty() {
-        tracing::info!(
-            session = %sid,
-            hook_id = %hook_id,
-            parse_source,
-            "解析得到空 turns，仅存 raw_context"
-        );
-        (estimated_total_tokens, 0, false)
-    } else {
-        let turns_count = parsed_turns.len();
-        match archive_parsed_turns_in_pre_compress(
-            &state,
-            &sid,
-            req.project_id.as_deref(),
-            parsed_turns,
-            &req.preset,
-            &req.task_state_snapshot,
-            &hook_id,
-            &raw_context_path,
-        )
-        .await
-        {
-            Ok(tokens) => (tokens, turns_count, true),
-            Err(e) => {
-                tracing::warn!(
-                    session = %sid,
-                    hook_id = %hook_id,
-                    error = %e,
-                    "Archiver 归档失败，降级为仅 raw_context（parse_success=false）"
-                );
-                (estimated_total_tokens, 0, false)
-            }
-        }
-    };
-
-    // 6. 计算 threshold / ratio / suggestion（与 archive 反馈循环一致）
-    let threshold = get_archive_threshold_for_pre_compress(&req.preset);
-    let ratio = if threshold > 0 {
-        (archived_tokens as f64 / threshold as f64 * 100.0).round() as u64
-    } else {
-        0
-    };
-    let suggestion = if parse_success {
-        format!(
-            "压缩前归档完成，共 {} 轮，原始 ~{} tokens（阈值 {}，当前 {}%）。可安全压缩。",
-            parsed_turns_count, estimated_total_tokens, threshold, ratio
-        )
-    } else {
-        format!(
-            "压缩前归档完成（仅 raw_context，解析失败），原始 ~{} tokens（阈值 {}，当前 {}%）。可安全压缩。",
-            estimated_total_tokens, threshold, ratio
-        )
-    };
-
-    tracing::info!(
-        session = %sid,
-        hook_id = %hook_id,
-        parse_success,
-        parsed_turns_count,
-        archived_tokens,
-        threshold,
-        ratio_percent = ratio,
-        "pre_compress 完成"
-    );
-
-    // 7. 构建响应 JSON（与 MCP 端 PreCompressResult 字段一致）
-    let response = serde_json::json!({
-        "hook_id": hook_id,
-        "raw_context_path": raw_context_path,
-        "parse_success": parse_success,
-        "parsed_turns_count": parsed_turns_count,
-        "archived_tokens": archived_tokens,
-        "estimated_total_tokens": estimated_total_tokens,
-        "threshold": threshold,
-        "threshold_ratio_percent": ratio,
-        "suggestion": suggestion,
-        "archived_at": chrono::Utc::now().to_rfc3339(),
     });
 
-    Ok(Json(response))
-}
-
-/// pre_compress 内部辅助函数：解析成功后复用 Archiver 归档 turns（v2.34 新增）
-///
-/// 提取 archive handler 的公共逻辑：场景识别 + 构建 Archiver + 应用 preset + 注入 summary_generator
-/// + 写 task_state_snapshot + 触发搜索索引。失败时调用方应降级为仅 raw_context（parse_success=false）。
-///
-/// 返回值为归档后的 token_count（IndexHook.token_count），用于反馈循环。
-async fn archive_parsed_turns_in_pre_compress(
-    state: &AppState,
-    session_id: &str,
-    project_id: Option<&str>,
-    turns: Vec<MessageTurn>,
-    preset: &Option<PresetRequest>,
-    task_state_snapshot: &Option<TaskStateSnapshotRequest>,
-    hook_id: &str,
-    raw_context_path: &str,
-) -> Result<usize, String> {
-    // v2.33：场景识别（仅首次 archive 时识别，后续读 session_meta 跳过）
-    // 优先级：用户显式 preset.scenario > session_meta > 识别 > Agent 默认
-    // 识别失败不阻塞，降级到 Agent 默认场景（与 archive 一致）
-    let effective_scenario_name: Option<String> = if let Some(detector) = &state.scenario_detector
-    {
-        let family = preset
-            .as_ref()
-            .and_then(|p| p.agent.as_deref())
-            .and_then(memory_center_agents::AgentFamily::from_str)
-            .unwrap_or_else(|| memory_center_agents::AgentFamily::Custom("unknown".to_string()));
-
-        let user_explicit = preset.as_ref().and_then(|p| p.scenario.as_deref());
-
-        let storage_for_detect = create_storage(state);
-        let scenario = memory_center_presets::resolve_effective_scenario(
-            storage_for_detect.as_ref(),
-            session_id,
-            user_explicit,
-            &family,
-            detector.as_ref(),
-            &turns,
+    let result = state
+        .archive_engine
+        .pre_compress(
+            &sid,
+            turns,
+            req.estimated_tokens,
+            req.project_id.as_deref(),
+            preset_ref.as_ref(),
+            snap_ref.as_ref(),
         )
-        .await;
-        Some(memory_center_presets::scenario_to_str(&scenario))
-    } else {
-        // 未注入识别器：保留原行为（preset.scenario 或 None）
-        preset.as_ref().and_then(|p| p.scenario.clone())
-    };
-
-    // 构建 preset（与 archive 一致：preset > 识别场景 > 默认）
-    let (archive_threshold, summary_template) = if let Some(preset_req) = preset {
-        let combined = crate::presets::build_combined_from_request(preset_req)
-            .map_err(|e| format!("预设构建失败: {e}"))?;
-        (
-            Some(combined.archive_threshold()),
-            Some(combined.summary_template().to_string()),
-        )
-    } else if let Some(scenario_name) = effective_scenario_name {
-        // 无 preset 但识别到场景 → 用识别的场景 build
-        let combined = memory_center_presets::build_from_strings(
-            None,
-            Some(&scenario_name),
-            None,
-            None,
-            None,
-        )
-        .map_err(|e| format!("识别场景构建预设失败: {e}"))?;
-        (
-            Some(combined.archive_threshold()),
-            Some(combined.summary_template().to_string()),
-        )
-    } else {
-        (None, None)
-    };
-
-    let storage = create_storage(state);
-    let config = if let Some(threshold) = archive_threshold {
-        ArchiveConfig {
-            token_threshold: threshold,
-            force_truncate_limit: threshold * 3 / 2,
-            wait_for_turn_completion: true,
-        }
-    } else {
-        ArchiveConfig::default()
-    };
-    let storage_for_snapshot = storage.clone();
-    let mut archiver = Archiver::new(
-        config,
-        storage,
-        session_id,
-        project_id.map(|s| s.to_string()),
-    );
-
-    // 注入 summary_generator（若注入）
-    if let Some(gen) = &state.summary_generator {
-        archiver = archiver.with_summary_generator(gen.clone());
-    }
-
-    // 注入 summary_template（若构建出）
-    if let Some(tpl) = summary_template {
-        archiver = archiver.with_summary_template_override(tpl);
-    }
-
-    // v2.34：注入覆盖（hook_id 一致性 + archive_reason + raw_context_path）
-    // 用于 pre_compress：预生成 hook_id 与 IndexHook.id 对齐
-    archiver = archiver
-        .with_override_hook_id(hook_id)
-        .with_archive_reason("pre_compress")
-        .with_raw_context_path(raw_context_path);
-
-    // v2.35：提取 turns 文本用于索引（在 move 消费前 borrow）
-    let turns_text = crate::extract_turns_text(&turns);
-
-    // v2.43：对每个 turn 应用默认值补全（推断 tags + 估算 token_count）
-    // 无论 turns 来自结构化输入还是 full_context 解析，都需要补全
-    for mut turn in turns {
-        apply_turn_defaults(&mut turn);
-        archiver.push_turn(turn);
-    }
-
-    let (_, hook) = archiver
-        .archive()
         .await
-        .map_err(|e| format!("归档失败: {e}"))?;
+        .map_err(|e| match e {
+            memory_center_archive_core::ArchiveError::BadRequest(msg) => AppError::BadRequest(msg),
+            memory_center_archive_core::ArchiveError::Preset(msg) => AppError::BadRequest(msg),
+            memory_center_archive_core::ArchiveError::Storage(msg) => AppError::Internal(msg),
+            memory_center_archive_core::ArchiveError::Archive(msg) => AppError::Internal(msg),
+        })?;
 
-    // v2.31：归档后触发搜索索引（按 session 隔离）
-    // v2.35：传入 turns_text 提升检索召回率
-    if let Some(router) = &state.session_search {
-        router.index_hook(session_id, &hook, &turns_text).await;
-    }
-
-    // 写 task_state_snapshot（若有，与 MCP 端一致：失败不影响归档结果）
-    if let Some(snap) = task_state_snapshot {
-        let snapshot = memory_center_core::model::TaskStateSnapshot {
-            current_task: snap.current_task.clone(),
-            completed_steps: snap.completed_steps.clone(),
-            in_progress_step: snap.in_progress_step.clone(),
-            next_step: snap.next_step.clone(),
-            snapshot_at: chrono::Utc::now(),
-        };
-        if let Err(e) = storage_for_snapshot
-            .write_session_state(session_id, &snapshot)
-            .await
-        {
-            tracing::warn!(
-                session = %session_id,
-                error = %e,
-                "task_state_snapshot 持久化失败（不影响归档结果）"
-            );
-        }
-    }
-
-    // 返回归档后的 token_count（IndexHook.token_count，供反馈循环）
-    Ok(hook.token_count)
-}
-
-/// 获取当前 archive 阈值（v2.34 新增）
-///
-/// 优先级（与 archive 一致）：
-/// 1. preset.archive_threshold（用户显式覆盖，最高优先级）
-/// 2. preset 构建的 CombinedProfile.archive_threshold()
-/// 3. 默认 120000
-///
-/// 注意：server 端 AppState 没有 `combined_profile` 字段（只 MCP 端有），
-///      所以不支持 MCP 端的第3优先级（`self.combined_profile()`），直接降级到默认 120000。
-fn get_archive_threshold_for_pre_compress(preset: &Option<PresetRequest>) -> usize {
-    if let Some(preset_req) = preset {
-        // 用户显式 archive_threshold 最高优先级
-        if let Some(t) = preset_req.archive_threshold {
-            return t;
-        }
-        // 用 preset 构建 CombinedProfile（仅取 archive_threshold，不传 user_override）
-        if let Ok(combined) = crate::presets::build_combined_from_request(preset_req) {
-            return combined.archive_threshold();
-        }
-    }
-    // 默认阈值（与 ArchiveConfig::default().token_threshold 一致）
-    120000
+    Ok(Json(serde_json::to_value(result).unwrap_or_default()))
 }
 
 /// GET /api/v1/sessions/{sid}/memories/{hook_id}

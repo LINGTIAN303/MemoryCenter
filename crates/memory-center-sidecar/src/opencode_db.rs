@@ -35,9 +35,9 @@
 
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use crate::archive::{SidecarContent, SidecarFileChange, SidecarToolCall, SidecarTurn};
+use memory_center_adapter::{SidecarContent, SidecarFileChange, SidecarToolCall, SidecarTurn};
 // v2.46：CompactionRecord + AgentAdapter trait 从 adapter crate 导入
 // v2.47：SessionTokenInfo 用于阈值监控
 use memory_center_adapter::{AgentAdapter, AdapterError, CompactionRecord, SessionTokenInfo};
@@ -64,8 +64,6 @@ struct V1PartContent {
     tool_input: Option<String>,
     /// 工具输出（tool 类型，已完成时的 output 字段）
     tool_output: Option<String>,
-    /// token 总数（step-finish 类型，从 tokens.total 提取，累计值含 cache read）
-    tokens_total: Option<i64>,
     /// 单轮实际 token 消耗（v2.44 新增，step-finish 的 input + output + reasoning）
     tokens_consumed: Option<usize>,
     // v2.45 新增：tool part 完整字段
@@ -89,28 +87,6 @@ struct V1PartContent {
     step_finish_reason: Option<String>,
     /// 单轮成本（cost 字段，单位：美元）
     step_finish_cost: Option<f64>,
-}
-
-/// Session 基本信息
-#[derive(Debug, Clone)]
-pub struct SessionInfo {
-    pub id: String,
-    pub title: String,
-    pub time_compacting: Option<i64>,
-}
-
-/// compaction 消息记录（v2.39 新增）
-///
-/// v2.46：类型定义已迁移到 `memory-center-adapter` crate，这里通过 `use` 导入。
-/// `CompactionRecord` 不再是 OpenCode 专属类型，而是所有 Agent adapter 共用的通用类型。
-
-/// 压缩状态变化检测结果（v2.39 重构）
-#[derive(Debug)]
-pub struct CompactionChange {
-    pub session_id: String,
-    pub session_title: String,
-    /// 触发归档的 compaction 消息
-    pub compaction: CompactionRecord,
 }
 
 impl OpenCodeDb {
@@ -151,25 +127,6 @@ impl OpenCodeDb {
         } else {
             "v1".to_string()
         }
-    }
-
-    /// 查询所有 session 的压缩状态（v2.39：仅用于日志统计，不再用于检测）
-    pub fn query_all_compaction_states(&self) -> Result<Vec<SessionInfo>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, title, time_compacting FROM session",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(SessionInfo {
-                id: row.get::<_, String>(0)?,
-                title: row.get::<_, String>(1)?,
-                time_compacting: row.get::<_, Option<i64>>(2)?,
-            })
-        })?;
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
-        }
-        Ok(result)
     }
 
     /// 查询 session 标题（v2.39 新增）
@@ -600,6 +557,10 @@ impl OpenCodeDb {
     /// **V2 路径**：查 `session_message` 表，按 `seq` 范围过滤
     /// **V1 路径**（桌面端）：查 `message` 表，按 `time_created` 范围过滤
     /// （V1 的 CompactionRecord.seq 实际存的是 time_created，所以范围语义一致）
+    ///
+    /// v2.48：返回字符串格式的旧方法，sidecar 主流程已改用 `read_session_turns_between`
+    /// （返回 `SidecarTurn`），此方法及其辅助方法保留供未来复用。
+    #[allow(dead_code)]
     pub fn read_session_context_between(
         &self,
         session_id: &str,
@@ -653,6 +614,7 @@ impl OpenCodeDb {
     }
 
     /// V2 版本：从 session_message 表读取 (from_seq, to_seq) 范围内的消息
+    #[allow(dead_code)]
     fn read_session_context_between_v2(
         &self,
         session_id: &str,
@@ -831,7 +793,6 @@ impl OpenCodeDb {
                         if turns.len() >= max_turns {
                             return Ok(turns);
                         }
-                        current_user = None;
                         current_assistant_parts.clear();
                         current_turn_tokens = 0;
                         has_tokens = false;
@@ -872,7 +833,6 @@ impl OpenCodeDb {
                         if turns.len() >= max_turns {
                             return Ok(turns);
                         }
-                        current_user = None;
                         current_assistant_parts.clear();
                         current_turn_tokens = 0;
                         has_tokens = false;
@@ -913,6 +873,7 @@ impl OpenCodeDb {
     /// 新版（v2.42）使用 `read_v1_parts_structured` 提取所有 part 类型，
     /// 将 reasoning 放入 `<thinking>` 标记，tool 放入 `<tool_call>` 标记，
     /// 生成包含完整信息的 `User:`/`Assistant:` 格式。
+    #[allow(dead_code)]
     fn read_session_context_between_v1(
         &self,
         session_id: &str,
@@ -1236,7 +1197,6 @@ impl OpenCodeDb {
                         if turns.len() >= max_turns {
                             return Ok(turns);
                         }
-                        current_user = None;
                         current_assistant_parts.clear();
                         current_turn_tokens = 0;
                         has_tokens = false;
@@ -1280,7 +1240,6 @@ impl OpenCodeDb {
                         if turns.len() >= max_turns {
                             return Ok(turns);
                         }
-                        current_user = None;
                         current_assistant_parts.clear();
                         current_turn_tokens = 0;
                         has_tokens = false;
@@ -1309,6 +1268,10 @@ impl OpenCodeDb {
     /// 优先从 V2 `session_message` 表读取，回退到 V1 `message`+`part` 表。
     /// 输出格式：`User: ...\n\nAssistant: ...\n\nUser: ...\n...`
     /// （MemoryCenter context_parser 支持 `User:`/`Assistant:` 分隔符格式）
+    ///
+    /// v2.48：返回字符串格式的旧方法，sidecar 主流程已改用 `read_session_turns_between`
+    /// （返回 `SidecarTurn`），此方法保留供未来复用。
+    #[allow(dead_code)]
     pub fn read_session_context(
         &self,
         session_id: &str,
@@ -1329,6 +1292,7 @@ impl OpenCodeDb {
     ///
     /// 消息类型：user / assistant / system / synthetic / shell / compaction
     /// 按 seq 排序，跳过 compaction 类型（压缩产物不归档）。
+    #[allow(dead_code)]
     fn read_v2_messages(
         &self,
         session_id: &str,
@@ -1379,6 +1343,7 @@ impl OpenCodeDb {
     /// 从 V1 `message` + `part` 表读取消息
     ///
     /// V1 结构：message 表存消息元数据，part 表存消息内容片段。
+    #[allow(dead_code)]
     fn read_v1_messages(
         &self,
         session_id: &str,
@@ -1447,6 +1412,10 @@ impl OpenCodeDb {
     }
 
     /// 读取 V1 part 表中某消息的所有片段
+    ///
+    /// v2.48：返回字符串格式的旧方法，sidecar 主流程已改用 `read_v1_parts_structured`，
+    /// 此方法仅被 `read_v1_messages`（同为旧版字符串路径）调用，保留供未来复用。
+    #[allow(dead_code)]
     fn read_v1_parts(&self, message_id: &str) -> Result<Vec<String>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT data FROM part
@@ -1586,12 +1555,9 @@ impl OpenCodeDb {
             };
 
             // step-finish 类型提取 token 统计 + v2.45 新增 reason/cost
-            let (tokens_total, tokens_consumed, step_finish_reason, step_finish_cost) =
+            let (tokens_consumed, step_finish_reason, step_finish_cost) =
                 if part_type == "step-finish" {
                     let tokens = data.get("tokens");
-                    let total = tokens
-                        .and_then(|t| t.get("total"))
-                        .and_then(|v| v.as_i64());
                     // v2.44：单轮实际消耗 = input + output + reasoning
                     let consumed = tokens.and_then(|t| {
                         let input = t.get("input").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -1606,9 +1572,9 @@ impl OpenCodeDb {
                         .map(|s| s.to_string());
                     // v2.45 新增：单轮成本
                     let cost = data.get("cost").and_then(|v| v.as_f64());
-                    (total, consumed, reason, cost)
+                    (consumed, reason, cost)
                 } else {
-                    (None, None, None, None)
+                    (None, None, None)
                 };
 
             parts.push(V1PartContent {
@@ -1617,7 +1583,6 @@ impl OpenCodeDb {
                 tool_name,
                 tool_input,
                 tool_output,
-                tokens_total,
                 tokens_consumed,
                 tool_status,
                 tool_error,
@@ -1632,58 +1597,16 @@ impl OpenCodeDb {
         }
         Ok(parts)
     }
-
-    /// 获取已归档过的 session 集合（v2.39 新增，v2.40 加 V1 回退）
-    ///
-    /// 用于 backfill 模式：启动时找出所有曾经压缩过的 session。
-    ///
-    /// **V2 路径**：`SELECT DISTINCT session_id FROM session_message WHERE type='compaction'`
-    /// **V1 路径**（桌面端）：`SELECT DISTINCT session_id FROM message WHERE data LIKE '%"mode":"compaction"%'`
-    pub fn query_ever_compacted_sessions(&self) -> Result<HashSet<String>, DbError> {
-        // 先试 V2 session_message 表
-        if let Ok(mut stmt) = self.conn.prepare(
-            "SELECT DISTINCT session_id FROM session_message WHERE type = 'compaction'",
-        ) {
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            let mut result = HashSet::new();
-            for row in rows {
-                if let Ok(sid) = row {
-                    result.insert(sid);
-                }
-            }
-            if !result.is_empty() {
-                return Ok(result);
-            }
-            tracing::debug!("V2 session_message 表无 compaction 数据，回退 V1 message 表");
-        }
-
-        // 回退 V1 message 表（桌面端）
-        let mut stmt = match self.conn.prepare(
-            "SELECT DISTINCT session_id FROM message
-             WHERE data LIKE '%\"mode\":\"compaction\"%'
-               AND data LIKE '%\"summary\":true%'",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "V1 message 表查询失败");
-                return Ok(HashSet::new());
-            }
-        };
-
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut result = HashSet::new();
-        for row in rows {
-            if let Ok(sid) = row {
-                result.insert(sid);
-            }
-        }
-        Ok(result)
-    }
 }
 
 /// 序列化 V2 消息为 `Role: text` 格式
 ///
 /// 对应 OpenCode compaction.ts 中的 `serialize()` 函数（简化版）。
+///
+/// v2.48：返回字符串格式的旧函数，sidecar 主流程已改用返回 `SidecarTurn` 的路径，
+/// 此函数仅被 `read_session_context_between_v2` / `read_v2_messages`（同为旧版字符串路径）调用，
+/// 保留供未来复用。
+#[allow(dead_code)]
 fn serialize_v2_message(msg_type: &str, data: &serde_json::Value) -> String {
     match msg_type {
         "user" => {
@@ -1763,6 +1686,10 @@ fn serialize_v2_message(msg_type: &str, data: &serde_json::Value) -> String {
 }
 
 /// 截断字符串到指定字符数
+///
+/// v2.48：仅被 `serialize_v2_message` / `format_v1_assistant_parts`（同为旧版字符串路径）调用，
+/// 保留供未来复用。
+#[allow(dead_code)]
 fn truncate_str(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
@@ -1782,6 +1709,10 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 ///
 /// 生成的字符串会被拼接到 `Assistant: ` 后面，作为 full_context 的一部分。
 /// context_parser 的 `parse_separators` 会将其作为 llm_message.text 保留。
+///
+/// v2.48：返回字符串格式的旧函数，sidecar 主流程已改用返回 `SidecarTurn` 的路径，
+/// 此函数仅被 `read_session_context_between_v1`（同为旧版字符串路径）调用，保留供未来复用。
+#[allow(dead_code)]
 fn format_v1_assistant_parts(parts: &[V1PartContent]) -> String {
     let mut segments = Vec::new();
 
@@ -2074,7 +2005,7 @@ fn merge_sidecar_contents(contents: &[SidecarContent]) -> SidecarContent {
     let mut text_parts: Vec<String> = Vec::new();
     let mut thinking_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<SidecarToolCall> = Vec::new();
-    let mut file_changes: Vec<crate::archive::SidecarFileChange> = Vec::new();
+    let mut file_changes: Vec<memory_center_adapter::SidecarFileChange> = Vec::new();
 
     for c in contents {
         if let Some(t) = &c.text {

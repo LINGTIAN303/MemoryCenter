@@ -75,6 +75,12 @@ impl Default for Config {
 pub struct AppState {
     /// 存储根目录（每次请求创建 LocalStorage 时使用）
     pub storage_root: PathBuf,
+    /// v2.50：归档核心引擎（共享 archive/pre_compress 逻辑）
+    ///
+    /// server 的 archive/pre_compress handler 委托给此引擎，
+    /// 与 sidecar 共用同一套归档链路。其他 handler（retrieve/summaries/prompt/compaction）
+    /// 仍直接用 storage_root 创建 LocalStorage。
+    pub archive_engine: std::sync::Arc<memory_center_archive_core::ArchiveEngine>,
     /// v2.8：Session 级索引隔离路由器
     ///
     /// 按 session_id 路由到独立的子索引器，实现 session 间完全隔离。
@@ -106,6 +112,9 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             storage_root: PathBuf::from("./data"),
+            archive_engine: std::sync::Arc::new(
+                memory_center_archive_core::ArchiveEngine::new(PathBuf::from("./data")),
+            ),
             session_search: None,
             conflict_detector: None,
             summary_generator: None,

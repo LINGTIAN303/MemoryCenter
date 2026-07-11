@@ -1,6 +1,6 @@
 # OpenCode 接入 MemoryCenter 记忆库 Onboarding 指南
 
-> 适用版本：MemoryCenter v2.39+ / OpenCode（dev 分支，`packages/core` schema）
+> 适用版本：MemoryCenter v2.50+ / OpenCode（dev 分支，`packages/core` schema）
 >
 > 本指南教你如何在 OpenCode 中接入 memory-center，让 LLM 自动获得长期记忆能力。
 > OpenCode 适配采用**三路径互补架构**，覆盖完整的记忆保存与召回闭环。
@@ -26,7 +26,8 @@
                    ▼
          ┌─────────────────┐
          │  MemoryCenter   │
-         │  (MCP + REST)   │
+         │  存储目录       │
+         │  (.mcp-data/)   │
          └─────────────────┘
 ```
 
@@ -34,7 +35,13 @@
 |------|------|------|-----------|
 | 路径一 | 主动召回层 | OpenCode 配置 MemoryCenter 为 MCP server，LLM 主动调工具 | LLM 自主决策 |
 | 路径二 | 行为规范层 | install_rules 写入 `.opencode/rules/` + AGENTS.md | 协议约束 |
-| 路径三 | 被动保存层 | sidecar 进程轮询 SQLite，检测压缩事件 | 全自动 |
+| 路径三 | 被动保存层 | sidecar 进程轮询 SQLite，检测压缩事件，**直写存储目录**（v2.50） | 全自动 |
+
+> **v2.50 架构变更**：路径三 sidecar 不再通过 HTTP server 中转归档，改为直接写入
+> MemoryCenter 存储目录（`--storage-root`）。sidecar 与 server 共享
+> `memory-center-archive-core` crate 的 `ArchiveEngine`，归档逻辑完全一致，
+> 但 sidecar 无需 server 进程在线即可工作。跨进程并发安全由
+> `CrossProcessLockGuard`（lock file + PID + 僵尸锁检测）保障。
 
 **核心原则**：三条路径互不依赖，任一路径独立可用，组合使用效果最佳。
 
@@ -272,18 +279,20 @@ type='compaction' 消息        消息（message_id 去重）     (上次 compac
 
 ### 4.2 启动 sidecar
 
+> **v2.50 变更**：sidecar 不再需要 `--memorycenter-url` 和 `--memorycenter-api-key` 参数，
+> 改为通过 `--storage-root` 直写存储目录。sidecar 可独立运行，无需 server 进程在线。
+
 ```bash
 # 基本启动
 mc-sidecar \
   --opencode-db "D:/path/to/opencode.db" \
-  --memorycenter-url "http://127.0.0.1:8765" \
+  --storage-root "D:/memory-center-data" \
   --project-id "myproject"
 
 # 完整参数
 mc-sidecar \
   --opencode-db "D:/path/to/opencode.db" \
-  --memorycenter-url "http://127.0.0.1:8765" \
-  --memorycenter-api-key "your-secret-key" \
+  --storage-root "D:/memory-center-data" \
   --project-id "myproject" \
   --poll-interval 5 \
   --backfill
@@ -296,13 +305,13 @@ mc-sidecar --help
 
 | 参数 | 环境变量 | 默认值 | 说明 |
 |------|---------|--------|------|
-| `--opencode-db` | `OPENCODE_DB` | 平台默认路径 | OpenCode SQLite 数据库路径 |
-| `--memorycenter-url` | `MEMORYCENTER_URL` | `http://127.0.0.1:8765` | MemoryCenter 服务地址 |
-| `--memorycenter-api-key` | `MEMORYCENTER_API_KEY` | （无） | API Key（若服务端配置了鉴权） |
-| `--project-id` | `PROJECT_ID` | `default` | 项目 ID（影响存储路径） |
-| `--poll-interval` | `POLL_INTERVAL` | `5` | 轮询间隔（秒） |
-| `--backfill` | - | `false` | 启动时回填历史已压缩 session |
-| `--max-turns` | `MAX_TURNS` | `100` | 读取每个 session 的最大轮次数 |
+| `--opencode-db` | `OPENCODE_DB_PATH` | 平台默认路径 | OpenCode SQLite 数据库路径 |
+| `--storage-root` | `MEMORY_CENTER_ROOT` | `./data` | MemoryCenter 存储根目录（v2.50 替代 `--memorycenter-url`） |
+| `--agent` | `MC_SIDECAR_AGENT` | `opencode` | Agent 类型标识 |
+| `--project-id` | `OPENCODE_SIDECAR_PROJECT_ID` | `opencode` | 项目 ID（影响存储路径） |
+| `--poll-interval` | `OPENCODE_SIDECAR_POLL_INTERVAL` | `5` | 轮询间隔（秒） |
+| `--backfill` | `OPENCODE_SIDECAR_BACKFILL` | `false` | 启动时回填历史已压缩 session |
+| `--max-turns` | `OPENCODE_SIDECAR_MAX_TURNS` | `100` | 读取每个 session 的最大轮次数 |
 
 ### 4.4 OpenCode SQLite 默认路径
 
@@ -325,7 +334,7 @@ After=network.target
 [Service]
 ExecStart=/usr/local/bin/mc-sidecar \
   --opencode-db /home/user/.local/share/opencode/opencode.db \
-  --memorycenter-url http://127.0.0.1:8765 \
+  --storage-root /home/user/memory-center-data \
   --project-id myproject
 Restart=always
 RestartSec=3
@@ -341,7 +350,7 @@ WantedBy=multi-user.target
 # 使用 NSSM 安装为服务
 nssm install mc-sidecar "D:\path\to\mc-sidecar.exe" `
   --opencode-db "$env:USERPROFILE\.local\share\opencode\opencode.db" `
-  --memorycenter-url http://127.0.0.1:8765 `
+  --storage-root "D:\memory-center-data" `
   --project-id myproject
 nssm start mc-sidecar
 ```
@@ -391,11 +400,11 @@ LLM 获得钩子（高价值记忆摘要）+ 短记忆（OpenCode 摘要）
 
 ### 6.3 验证 sidecar（路径三）
 
-1. 启动 MemoryCenter 服务：`cargo run -p memory-center-server`
-2. 启动 sidecar：`mc-sidecar --opencode-db <path> --memorycenter-url http://127.0.0.1:8765`
-3. 在 OpenCode 中触发压缩（输入 `/compact`）
-4. 观察 sidecar 日志：应显示 `检测到压缩事件` + `归档成功`
-5. 访问 `GET http://127.0.0.1:8765/api/v1/sessions/opencode-<project>-<date>/summaries` 确认记忆已保存
+1. 启动 sidecar：`mc-sidecar --opencode-db <path> --storage-root <memory-center-data>`
+2. 在 OpenCode 中触发压缩（输入 `/compact`）
+3. 观察 sidecar 日志：应显示 `检测到压缩事件` + `归档成功`
+4. 检查存储目录：`ls <memory-center-data>/sessions/opencode-*/daily/` 应出现新的 JSON 文件
+5. （可选）启动 MemoryCenter server 后访问 `GET /api/v1/sessions/opencode-<project>-<date>/summaries` 确认记忆可被检索
 
 ---
 
@@ -416,13 +425,16 @@ LLM 获得钩子（高价值记忆摘要）+ 短记忆（OpenCode 摘要）
   ```
 - 确认 OpenCode 版本支持 V2 `session_message` 表（老版本只有 V1 `message`+`part` 表）
 - 检查 sidecar 是否有读权限（sidecar 以只读模式打开 SQLite）
-- 确认 MemoryCenter 服务已启动且 URL 可达
 - **注意**：v2.36 旧策略监控 `session.time_compacting` 字段，但该字段在 OpenCode 源码中从未被写入，v2.39 已改为监控 compaction 消息
 
-### 7.3 归档失败（HTTP 401）
+### 7.3 归档失败（存储写入错误）
 
-- 若 MemoryCenter 配置了 `MEMORY_CENTER_API_KEY`，sidecar 需传 `--memorycenter-api-key`
-- 检查 API Key 是否匹配
+> **v2.50 变更**：sidecar 不再通过 HTTP 归档，原 HTTP 401 错误不再适用。改为存储目录写入错误。
+
+- 确认 `--storage-root` 指向的目录存在且可写
+- 检查 sidecar 进程对存储目录的读写权限
+- 若 sidecar 与 MemoryCenter server 共用同一存储目录，确认跨进程文件锁工作正常（检查 `.lock` 文件是否堆积）
+- 查看 sidecar 日志中的具体错误信息（`Storage` / `Archive` 类错误）
 
 ### 7.4 install_rules 返回 remote_template
 

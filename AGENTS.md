@@ -1,6 +1,6 @@
 # AGENTS.md — 本项目已接入 memory-center 记忆库
 
-> 本文件由 Trae / Cursor / Claude Code 等 IDE 自动读取并注入 LLM 的 system prompt。
+> 本文件由 Trae / Cursor / Claude Code / OpenCode / DeepSeek 网页端（+ DeepSeek++ 扩展）等 Agent 客户端自动读取并注入 LLM 的 system prompt。
 >
 > MemoryCenter 启动时会自动识别 Agent 客户端并注入 `usage_protocol.instructions`
 > 到 MCP `server_info.instructions` 字段。本文件作为补充，提供项目级硬性规则。
@@ -237,8 +237,8 @@ MemoryCenter MCP Server 支持两种传输模式：
 
 | 模式 | 版本 | 适用场景 | 配置方式 |
 |------|------|----------|----------|
-| **stdio** | v2.3 | 本地 IDE（Claude Code / Cursor / Trae） | `command` + `env` |
-| **Streamable HTTP** | v2.36 | 远程客户端（DeepSeek 网页端等） | `url` + `transport: "streamable-http"` |
+| **stdio** | v2.3 | 本地 IDE（Claude Code / Cursor / Trae / OpenCode） | `command` + `env` |
+| **Streamable HTTP** | v2.36 | 远程客户端（DeepSeek 网页端 + DeepSeek++ 扩展等） | `url` + `transport: "streamable-http"` |
 
 ### stdio 模式配置
 
@@ -317,5 +317,7 @@ memory-center 在以下情况会降级，但仍保持核心功能可用：
 ## 参考文档
 
 - [Trae 接入指南](docs/onboarding/trae.md)
+- [OpenCode 接入指南](docs/onboarding/opencode.md)
+- [DeepSeek 网页端接入指南](docs/onboarding/deepseek-web.md)
 - [架构文档](docs/ARCHITECTURE.md)
 - [部署文档](docs/DEPLOY.md)
