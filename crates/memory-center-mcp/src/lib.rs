@@ -734,6 +734,41 @@ struct SemanticSearchParams {
     project_id: Option<String>,
 }
 
+/// search_global tool 的 scope 枚举（v2.51 新增）
+#[derive(Deserialize, schemars::JsonSchema, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum McpSearchScope {
+    /// 仅搜索指定 session（需传 session_id）
+    Session,
+    /// 跨 session 搜索指定 project（需传 project_id）
+    Project,
+    /// 跨 Agentic 搜索多个 project（需传 project_ids）
+    MultiProject,
+}
+
+/// search_global tool 参数（v2.51 新增）
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SearchGlobalParams {
+    /// 查询文本
+    #[schemars(description = "查询文本（自然语言，用于关键词 + 向量混合检索）")]
+    query: String,
+    /// 搜索范围（默认 session）
+    #[schemars(description = "搜索范围：session=仅当前会话 / project=跨会话同项目 / multi_project=跨Agent多项目聚合。默认 session")]
+    scope: Option<McpSearchScope>,
+    /// scope=session 时必填
+    #[schemars(description = "会话 ID（scope=session 时必填）")]
+    session_id: Option<String>,
+    /// scope=project 时必填
+    #[schemars(description = "项目 ID（scope=project 时必填，跨 session 检索该 project 下所有记忆）")]
+    project_id: Option<String>,
+    /// scope=multi_project 时必填
+    #[schemars(description = "项目 ID 列表（scope=multi_project 时必填，跨 Agentic 聚合搜索多个 project）")]
+    project_ids: Option<Vec<String>>,
+    /// 返回 top-K 结果数
+    #[schemars(description = "返回 top-K 结果数（默认 5）")]
+    top_k: Option<usize>,
+}
+
 /// preset_build tool 参数（v2.29）
 ///
 /// 所有字段可选，与 archive tool 的 PresetParams 结构一致，
@@ -1808,6 +1843,87 @@ impl MemoryCenterMcp {
         let result = serde_json::json!({
             "total": hits.len(),
             "hits": hits,
+        });
+        Ok(result.to_string())
+    }
+
+    // ========================================================================
+    // v2.51 新增：search_global tool（跨 session/跨 Agent 检索）
+    // ========================================================================
+
+    /// 全局跨 session 检索（v2.51 新增）。
+    ///
+    /// 比 `semantic_search` 更强大的检索工具，支持 3 种 scope：
+    ///
+    /// - `session`：仅搜索指定 session（等同 semantic_search 不传 project_id）
+    /// - `project`：跨 session 搜索同一 project_id 的所有记忆
+    /// - `multi_project`：跨 Agentic 聚合搜索多个 project_id 的记忆
+    ///
+    /// ## 何时使用
+    ///
+    /// - **跨 session 搜索**：用户换了新 session，但想搜索旧 session 的记忆
+    /// - **跨 Agent 搜索**：Trae 的 Agent 想搜索 OpenCode 归档的记忆（不同 project_id）
+    /// - `semantic_search` 已支持单 project_id 跨 session，本工具额外支持多 project 聚合
+    #[tool(description = "全局跨 session/跨 Agent 检索记忆。支持 3 种 scope：(1) session=仅当前会话（需传 session_id）；(2) project=跨会话同项目（需传 project_id）；(3) multi_project=跨 Agent 聚合多项目（需传 project_ids 数组）。【跨 Agent 场景】不同 Agent（如 Trae/OpenCode/Claude Code）归档时用不同 project_id，传 project_ids 数组即可跨 Agent 检索。返回 top-K 相关记忆的 hook_id 列表。")]
+    async fn search_global(
+        &self,
+        Parameters(params): Parameters<SearchGlobalParams>,
+    ) -> Result<String, McpError> {
+        let session_search = match &self.session_search {
+            Some(s) => s,
+            None => {
+                return Err(McpError::internal_error(
+                    "search_global 工具未启用：未注入 SessionSearchRouter",
+                    None,
+                ));
+            }
+        };
+
+        let top_k = params.top_k.unwrap_or(5);
+        let scope = params.scope.unwrap_or(McpSearchScope::Session);
+
+        let hits = match scope {
+            McpSearchScope::Session => {
+                let sid = params.session_id.ok_or_else(|| {
+                    McpError::invalid_params("scope=session 需传 session_id", None)
+                })?;
+                session_search
+                    .search_with_rebuild(&sid, None, &params.query, top_k)
+                    .await
+            }
+            McpSearchScope::Project => {
+                let pid = params.project_id.ok_or_else(|| {
+                    McpError::invalid_params("scope=project 需传 project_id", None)
+                })?;
+                session_search
+                    .search_project(&pid, &params.query, top_k)
+                    .await
+            }
+            McpSearchScope::MultiProject => {
+                let pids = params.project_ids.ok_or_else(|| {
+                    McpError::invalid_params(
+                        "scope=multi_project 需传 project_ids 数组",
+                        None,
+                    )
+                })?;
+                if pids.is_empty() {
+                    return Err(McpError::invalid_params(
+                        "project_ids 不能为空",
+                        None,
+                    ));
+                }
+                let pid_refs: Vec<&str> = pids.iter().map(|s| s.as_str()).collect();
+                session_search
+                    .search_multi_project(&pid_refs, &params.query, top_k)
+                    .await
+            }
+        }
+        .map_err(|e| McpError::internal_error(format!("检索失败: {e}"), None))?;
+
+        let result = serde_json::json!({
+            "total": hits.len(),
+            "hits": hits,
+            "scope": format!("{:?}", scope),
         });
         Ok(result.to_string())
     }
