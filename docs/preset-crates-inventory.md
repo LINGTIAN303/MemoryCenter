@@ -404,8 +404,8 @@ v2.53 P8 起两种模式均支持。
 
 | 扩展方向 | 说明 |
 |---|---|
-| Cooperative 协作模式实现 | 主动通知 MemoryCenter 压缩事件 + MemoryCenter 建议保留记忆 + 双向通信触发压缩 |
-| 清理冗余依赖 | `Cargo.toml` 声明 `memory-center-core` / `thiserror` / `tracing` 但源码未实际使用 |
+| ✅ Cooperative 协作模式实现 | 已于 v2.53 P8 实现（cooperative.rs trait + 6 状态有限状态机 + retention.rs RetentionBuilder + CooperativeService + MCP 2 工具 + HTTP 2 端点 + windows is_supported() → true；详见 [cooperative-design.md](cooperative-design.md)） |
+| ✅ 清理冗余依赖 | 已于 v2.52 阶段 1 清理（`Cargo.toml` 声明的 `memory-center-core` / `thiserror` / `tracing` 冗余依赖已删除） |
 | 动态探测触发阈值 | 当前阈值静态硬编码，未来可根据 Agent 工具窗口大小动态调整 |
 
 ---
@@ -573,11 +573,11 @@ v2.53 P8 起两种模式均支持。
 | agents | 7 个 generic family 补 HookMode 分类 | 全部走 Pseudo 默认，OpenCode 已支持 Real 但未体现 | 中 |
 | skills | 完善 validate() 校验逻辑 | ✅ 已于 v2.52 阶段 3 实现（destructive 强制 AttachedToTurn） | 中 |
 | skills | MemoryLink v2 扩展 | ✅ 已于 v2.52 阶段 4 P7 Phase 1+2 实现（Phase 1 enum 扩展 + 校验升级；Phase 2 Storage trait 4 方法 + LocalStorage + Retriever + MCP/Server/Python/Node retrieve 工具 link_type 参数，10 单测通过）。Phase 3（阶段 6）4 个入口层新增 write_standalone/linked_memory 主动写入工具 + AGENTS.md 第 8 章触发协议，workspace 全量测试通过 | 中 |
-| windows | Cooperative 协作模式实现 | validate 会拒绝 Cooperative（设计文档已完成：[cooperative-design.md](cooperative-design.md)） | 中（v2 路线） |
+| windows | Cooperative 协作模式实现 | ✅ 已于 v2.53 P8 Phase 1-6 实现（cooperative.rs trait + 6 状态有限状态机 + retention.rs RetentionBuilder + CooperativeService + MCP 2 工具 + HTTP 2 端点 + windows is_supported() → true，workspace 221+ 测试通过，详见 [cooperative-design.md](cooperative-design.md)） | 中（已完成） |
 | models | 集成 sentencepiece | ✅ 已于 v2.53 P9 实现（feature gating + spm_or_char() helper + 环境变量驱动降级链，详见 [sentencepiece-guide.md](sentencepiece-guide.md)） | 中（已完成） |
 | scenarios | 场景自动识别能力 | ✅ 已于 v2.50 archive-core 接入主链路（pre_compress + archive 两处调用 `resolve_effective_scenario`，server/mcp 3 处初始化点注入 `scenario_detector`） | 低（已部分由 HybridScenarioDetector 实现） |
-| scenarios | 清理冗余依赖 | thiserror / tracing 声明但未使用 | 低 |
-| windows | 清理冗余依赖 | memory-center-core / thiserror / tracing 声明但未使用 | 低 |
+| scenarios | 清理冗余依赖 | ✅ 已于 v2.52 阶段 1 清理（thiserror / tracing 声明但未使用，已删除） | 低 |
+| windows | 清理冗余依赖 | ✅ 已于 v2.52 阶段 1 清理（memory-center-core / thiserror / tracing 声明但未使用，已删除） | 低 |
 | models | Custom Tokenizer 序列化保留 | 反序列化回退为 CharacterBased | 低 |
 
 ### 表 7.2 潜在扩展点（v2+）
@@ -585,7 +585,7 @@ v2.53 P8 起两种模式均支持。
 | crate | 扩展点 | 说明 |
 |---|---|---|
 | skills | MemoryLink v2 扩展 | ✅ 已于 v2.52 阶段 4 P7 Phase 1+2 实现（Phase 1 enum 扩展 + 校验升级；Phase 2 Storage trait 4 方法 + LocalStorage 实现 + Retriever retrieve_standalone/linked + MCP/Server/Python/Node link_type 参数，10 单测通过）。Phase 3（阶段 6）4 个入口层新增 write_standalone/linked_memory 主动写入工具 + AGENTS.md 第 8 章触发协议，workspace 全量测试通过 |
-| windows | Cooperative 模式实现 | 主动通知 MemoryCenter 压缩事件 + MemoryCenter 建议保留记忆 + 双向通信触发压缩。**设计文档已完成**：[cooperative-design.md](cooperative-design.md) |
+| windows | Cooperative 模式实现 | ✅ 已于 v2.53 P8 Phase 1-6 实现（cooperative.rs trait + 6 状态有限状态机 + retention.rs RetentionBuilder + CooperativeService + MCP 2 工具 pre_compress_hint/post_compress_ack + HTTP 2 端点 /api/v1/cooperative/* + windows is_supported() → true；详见 [cooperative-design.md](cooperative-design.md)） |
 | models | Tokenizer 接入主链路 | ✅ 已于 v2.52 阶段 4 实现（`ArchiveEngine::with_token_estimator` 闭包注入 + `build_token_estimator_from_env` 环境变量驱动） |
 | agents | 6 个 generic 预设补专属配置 | 为 Qoder/Zcode 等待补 Agent 补 AgentProfile + Fingerprint（OpenCode 已于 v2.52 阶段 2 补 AgentProfile，HookMode 已通过 supports_real_hook 自动分类） |
 | agents | AgentProfile 增加 variant 约束 | 对 5 专属预设的版本格式做枚举或正则约束 |
