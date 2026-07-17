@@ -1396,7 +1396,7 @@ cargo build --release -p memory-center-mcp
     }
   }
 }
-<span class="com"># 注意：需支持 Streamable HTTP 协议的客户端（Trae 当前建议使用 stdio 模式）</span></pre>
+<span class="com"># Trae / DeepSeek 网页端等支持 Streamable HTTP 的客户端可直接使用</span></pre>
     </div>
 
     <div class="demo-card">
@@ -1414,27 +1414,24 @@ cargo build --release -p memory-center-mcp
         <summary>评委快速验证命令（点击展开，复制即用）</summary>
         <div class="code-wrap">
           <button class="copy-btn" onclick="copyCode(this)">复制</button>
-<pre><span class="com"># 1. 健康检查</span>
-curl http://<span class="str">162.211.183.236.sslip.io</span>/healthz
-
-<span class="com"># 2. 查看归档记忆列表  → 验证能力：自动归档（Agent 压缩上下文后，记忆被持久化）</span>
+<pre><span class="com"># 1. 查看归档记忆列表  → 验证能力：自动归档（Agent 压缩上下文后，记忆被持久化）</span>
 <span class="com"># 预期返回：HTTP 200 + JSON 数组，含 1 条预置记忆（summary_title = "我在开发 MemoryCenter 项目..."）</span>
 curl -H <span class="str">"Authorization: Bearer trae-contest-demo-key-2026"</span> \
   http://<span class="str">162.211.183.236.sslip.io</span>/api/v1/sessions/<span class="str">cross-agent-demo-20260711</span>/summaries
 
-<span class="com"># 3. 语义检索（验证记忆召回能力）</span>
+<span class="com"># 2. 语义检索（验证记忆召回能力）</span>
 <span class="com"># 预期返回：HTTP 200 + JSON，含 results 数组，至少 1 条结果，source="keyword"（未配 Embedder 时降级 BM25）</span>
 curl -X POST -H <span class="str">"Authorization: Bearer trae-contest-demo-key-2026"</span> \
   -H <span class="str">"Content-Type: application/json"</span> \
   -d <span class="str">'{"query":"MemoryCenter 技术栈","top_k":5}'</span> \
   http://<span class="str">162.211.183.236.sslip.io</span>/api/v1/sessions/<span class="str">cross-agent-demo-20260711</span>/search
 
-<span class="com"># 4. 获取记忆摘要（模拟 Agent 新会话拉取历史记忆）</span>
+<span class="com"># 3. 获取记忆摘要（模拟 Agent 新会话拉取历史记忆）</span>
 <span class="com"># 预期返回：HTTP 200 + JSON，prompt 字段含"# 可用记忆索引"标题 + 预置记忆条目</span>
 curl -H <span class="str">"Authorization: Bearer trae-contest-demo-key-2026"</span> \
   http://<span class="str">162.211.183.236.sslip.io</span>/api/v1/sessions/<span class="str">cross-agent-demo-20260711</span>/prompt
 
-<span class="com"># 5. 跨 Agent 全局检索  → 验证能力：多项目聚合检索（scope=session/project/multi_project）</span>
+<span class="com"># 4. 跨 Agent 全局检索  → 验证能力：多项目聚合检索（scope=session/project/multi_project）</span>
 <span class="com"># 预期返回：HTTP 200 + JSON，results 数组含跨 session/project 的记忆，mode="keyword"</span>
 curl -X POST -H <span class="str">"Authorization: Bearer trae-contest-demo-key-2026"</span> \
   -H <span class="str">"Content-Type: application/json"</span> \
